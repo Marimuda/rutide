@@ -41,3 +41,9 @@ as the analysis time vector.
 `multiprocessing` uses a Linux `fork` process pool and limits BLAS threads in each
 worker. Both modes digest the same canonical result schema, allowing their outputs
 to be compared without storing every coefficient in raw benchmark artifacts.
+
+The `fixed-raw` solver profile is the first Rust parity target. It fits M2, S2,
+N2, K1, and O1 with ordinary least squares, a mean and trend, raw phase, no nodal
+corrections, and no confidence intervals. This deliberately isolates harmonic
+basis construction and least squares before the Greenwich/nodal machinery is
+ported.

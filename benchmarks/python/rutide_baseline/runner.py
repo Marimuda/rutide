@@ -93,6 +93,11 @@ def _profile_options(profile: str) -> dict[str, Any]:
     elif profile == "fixed-constituents":
         options["conf_int"] = "none"
         options["constit"] = list(FIXED_CONSTITUENTS)
+    elif profile == "fixed-raw":
+        options["conf_int"] = "none"
+        options["constit"] = list(FIXED_CONSTITUENTS)
+        options["nodal"] = False
+        options["phase"] = "raw"
     elif profile != "full-compatible":
         raise ValueError(f"unknown profile: {profile}")
     return options
@@ -430,7 +435,7 @@ def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--profile",
-        choices=("full-compatible", "core-ols", "fixed-constituents"),
+        choices=("full-compatible", "core-ols", "fixed-constituents", "fixed-raw"),
         default="full-compatible",
     )
     parser.add_argument(
