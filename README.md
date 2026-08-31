@@ -30,11 +30,13 @@ parallelizes the latitude-specific factorizations across spatial series. Both
 paths have real-FVCOM parity tests against the pinned Python oracle.
 
 Percent-energy diagnostics, linearized 95% amplitude/phase confidence intervals,
-CI-derived signal-to-noise ratio, and per-solution PE/SNR ranking are available.
-Missing observations, vector currents, and reconstruction are not implemented
-yet. The command-line application can analyze a complete, finite FVCOM
-`zeta(time, node)` field with an explicit or Rayleigh-selected constituent list
-and serialize its coefficients and diagnostics to NetCDF.
+CI-derived signal-to-noise ratio, per-solution PE/SNR ranking, and exact scalar
+reconstruction are available. Reconstruction supports arbitrary target times in
+the core API and an opt-in complete original-time series in the FVCOM command.
+Missing observations and vector currents are not implemented yet. The
+command-line application can analyze a complete, finite FVCOM `zeta(time, node)`
+field with an explicit or Rayleigh-selected constituent list and serialize its
+coefficients, diagnostics, and optional reconstruction to NetCDF.
 
 ## Repository layout
 
@@ -99,6 +101,28 @@ Add `--confidence linear` for UTide-compatible colored-noise linear confidence
 intervals and SNR. `--white-noise` selects the white residual-noise alternative.
 Colored confidence currently requires equidistant timestamps; the white model
 also supports irregular timestamps.
+
+Add `--reconstruct` to write `reconstruction(time, series)` at every original
+FVCOM timestamp. With no filter it includes every fitted constituent. Use
+`--reconstruct-constituents M2,S2,K1` for an explicit subset, or diagnostic
+thresholds such as `--min-pe 1 --min-snr 2`. PE and SNR thresholds are inclusive
+and combine with logical AND; explicit names are the alternative selection mode,
+matching Python UTide. `--min-snr` requires `--confidence linear`, while PE-only
+filtering does not. For example:
+
+```console
+cargo run --release --bin rutide -- analyze-scalar \
+  --input /path/to/fvcom.nc \
+  --output coefficients-and-tide.nc \
+  --constituents auto \
+  --confidence linear \
+  --reconstruct --min-pe 1 --min-snr 2 \
+  --workers 64
+```
+
+The library-level `GreenwichNodalReconstructor` and model convenience method
+accept arbitrary finite Modified Julian Days, including held-out and forecast
+times, and always retain the fitted mean and trend.
 
 Use `--node-count N` for a prefix or `--nodes 0,10,20` for an explicit
 correctness sample. Existing destinations are preserved unless `--overwrite`

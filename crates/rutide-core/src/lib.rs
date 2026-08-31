@@ -15,7 +15,9 @@ pub use catalog::{
     CATALOG_ORACLE_REVISION, CATALOG_SOURCE_SHA256, CONSTITUENT_COUNT, TidalConstituent,
     UnknownTidalConstituent,
 };
-pub use corrected::{GreenwichNodalBatch, GreenwichNodalOls};
+pub use corrected::{
+    GreenwichNodalBatch, GreenwichNodalOls, GreenwichNodalReconstructor, ReconstructionFilter,
+};
 pub use error::AnalysisError;
 pub use scalar::{Constituent, FixedRawOls, LinearConfidence, ScalarSolution};
 pub use selection::{RayleighSelection, select_constituents_by_rayleigh};

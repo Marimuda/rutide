@@ -23,6 +23,9 @@ use crate::{
 pub struct GreenwichNodalOls {
     tidal_constituents: Vec<TidalConstituent>,
     latitude_degrees_north: f64,
+    reference_time_modified_julian_day: f64,
+    base_constituents: Vec<TidalConstituent>,
+    recipes: Vec<CorrectionRecipe>,
     model: FixedRawOls,
 }
 
@@ -46,6 +49,9 @@ impl GreenwichNodalOls {
         Ok(Self {
             tidal_constituents: constituents.to_vec(),
             latitude_degrees_north,
+            reference_time_modified_julian_day: basis.reference_time_modified_julian_day,
+            base_constituents: basis.base_constituents,
+            recipes: basis.recipes,
             model,
         })
     }
@@ -66,6 +72,12 @@ impl GreenwichNodalOls {
     #[must_use]
     pub const fn latitude_degrees_north(&self) -> f64 {
         self.latitude_degrees_north
+    }
+
+    /// Return the midpoint epoch used for the fitted trend, as an MJD.
+    #[must_use]
+    pub const fn reference_time_modified_julian_day(&self) -> f64 {
+        self.reference_time_modified_julian_day
     }
 
     /// Return the number of observations expected in each spatial series.
@@ -127,6 +139,225 @@ impl GreenwichNodalOls {
         self.model
             .solve_many_time_major_with_linear_confidence(observations, series_count, noise)
     }
+
+    /// Reconstruct one solution at arbitrary Modified Julian Days.
+    ///
+    /// Exact Greenwich phase and nodal corrections are evaluated at each target
+    /// timestamp. The fitted mean and trend are always retained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid target times, coefficient shapes,
+    /// latitude, thresholds, or constituent filters.
+    pub fn reconstruct_modified_julian_days(
+        &self,
+        modified_julian_days: &[f64],
+        solution: &ScalarSolution,
+        filter: &ReconstructionFilter,
+    ) -> Result<Vec<f64>, AnalysisError> {
+        GreenwichNodalReconstructor::from_parts(
+            modified_julian_days,
+            self.reference_time_modified_julian_day,
+            self.tidal_constituents.clone(),
+            &self.base_constituents,
+            self.recipes.clone(),
+        )?
+        .reconstruct_at_latitude(solution, self.latitude_degrees_north, filter)
+    }
+}
+
+/// Constituent selection applied during reconstruction.
+///
+/// Explicit names are an alternative to diagnostics, matching Python `UTide`.
+/// PE-only filtering remains available without confidence intervals by setting
+/// `minimum_signal_to_noise` to `None`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum ReconstructionFilter {
+    /// Include every fitted constituent.
+    #[default]
+    All,
+    /// Include exactly these fitted constituents, retaining fitted-model order.
+    Constituents(Vec<TidalConstituent>),
+    /// Include constituents satisfying every supplied diagnostic threshold.
+    Diagnostics {
+        /// Minimum percent energy, inclusive.
+        minimum_percent_energy: f64,
+        /// Optional minimum signal-to-noise ratio, inclusive.
+        minimum_signal_to_noise: Option<f64>,
+    },
+}
+
+/// A reusable exact Greenwich/nodal basis for arbitrary reconstruction times.
+///
+/// Astronomy is prepared once and can then reconstruct many scalar solutions at
+/// different latitudes. Multi-series output is series-major: one complete target
+/// time series per input solution.
+#[derive(Debug)]
+pub struct GreenwichNodalReconstructor {
+    tidal_constituents: Vec<TidalConstituent>,
+    recipes: Vec<CorrectionRecipe>,
+    reference_time_modified_julian_day: f64,
+    time_terms: Vec<ReconstructionTimeTerms>,
+}
+
+impl GreenwichNodalReconstructor {
+    /// Prepare an exact reconstruction basis from a fit epoch and target MJDs.
+    ///
+    /// Target times may be unordered or repeated, but must be finite and nonempty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for an invalid reference time, target time, or
+    /// constituent list.
+    pub fn prepare_modified_julian_days(
+        modified_julian_days: &[f64],
+        reference_time_modified_julian_day: f64,
+        constituents: &[TidalConstituent],
+    ) -> Result<Self, AnalysisError> {
+        validate_tidal_constituents(constituents)?;
+        let (base_constituents, recipes) = dependency_recipes(constituents);
+        Self::from_parts(
+            modified_julian_days,
+            reference_time_modified_julian_day,
+            constituents.to_vec(),
+            &base_constituents,
+            recipes,
+        )
+    }
+
+    fn from_parts(
+        modified_julian_days: &[f64],
+        reference_time_modified_julian_day: f64,
+        tidal_constituents: Vec<TidalConstituent>,
+        base_constituents: &[TidalConstituent],
+        recipes: Vec<CorrectionRecipe>,
+    ) -> Result<Self, AnalysisError> {
+        validate_reconstruction_times(modified_julian_days, reference_time_modified_julian_day)?;
+        let time_terms = modified_julian_days
+            .iter()
+            .copied()
+            .map(|time| {
+                let astronomy = at_modified_julian_day(time);
+                let base_greenwich_phase = base_constituents
+                    .iter()
+                    .copied()
+                    .map(|constituent| base_greenwich_phase(constituent, astronomy.cycles))
+                    .collect::<Vec<_>>();
+                ReconstructionTimeTerms {
+                    greenwich_phase: recipes
+                        .iter()
+                        .map(|recipe| recipe.combine_phase(&base_greenwich_phase))
+                        .collect(),
+                    base_nodal_terms: base_constituents
+                        .iter()
+                        .copied()
+                        .map(|constituent| {
+                            precompute_nodal_terms(constituent.metadata(), astronomy.cycles)
+                        })
+                        .collect(),
+                    days_from_reference: time - reference_time_modified_julian_day,
+                }
+            })
+            .collect();
+        Ok(Self {
+            tidal_constituents,
+            recipes,
+            reference_time_modified_julian_day,
+            time_terms,
+        })
+    }
+
+    /// Return the midpoint epoch used for the reconstructed trend, as an MJD.
+    #[must_use]
+    pub const fn reference_time_modified_julian_day(&self) -> f64 {
+        self.reference_time_modified_julian_day
+    }
+
+    /// Return the number of prepared reconstruction timestamps.
+    #[must_use]
+    pub fn time_count(&self) -> usize {
+        self.time_terms.len()
+    }
+
+    /// Return fitted catalog constituents in coefficient order.
+    #[must_use]
+    pub fn tidal_constituents(&self) -> &[TidalConstituent] {
+        &self.tidal_constituents
+    }
+
+    /// Reconstruct one scalar solution at a specified latitude.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for an invalid latitude, coefficient shape, or
+    /// filter.
+    pub fn reconstruct_at_latitude(
+        &self,
+        solution: &ScalarSolution,
+        latitude_degrees_north: f64,
+        filter: &ReconstructionFilter,
+    ) -> Result<Vec<f64>, AnalysisError> {
+        validate_latitude(latitude_degrees_north)?;
+        let selected = reconstruction_indices(&self.tidal_constituents, solution, filter)?;
+        let latitude_factors = latitude_factors(latitude_degrees_north);
+        let base_count = self
+            .time_terms
+            .first()
+            .map_or(0, |terms| terms.base_nodal_terms.len());
+        let mut base_corrections = vec![(0.0, 0.0); base_count];
+        let mut reconstruction = Vec::with_capacity(self.time_terms.len());
+        for terms in &self.time_terms {
+            for (correction, nodal_terms) in base_corrections
+                .iter_mut()
+                .zip(terms.base_nodal_terms.iter().copied())
+            {
+                *correction = nodal_correction(nodal_terms, latitude_factors);
+            }
+            let harmonics = selected
+                .iter()
+                .copied()
+                .map(|constituent| {
+                    let (nodal_amplitude, nodal_phase) =
+                        self.recipes[constituent].combine_nodal(&base_corrections);
+                    let angle = TAU * (nodal_phase + terms.greenwich_phase[constituent])
+                        - solution.phase_degrees[constituent].to_radians();
+                    nodal_amplitude * solution.amplitude[constituent] * angle.cos()
+                })
+                .sum::<f64>();
+            reconstruction.push(
+                solution.mean + solution.slope_per_day * terms.days_from_reference + harmonics,
+            );
+        }
+        Ok(reconstruction)
+    }
+
+    /// Reconstruct varying-latitude solutions in parallel, in series-major order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] when no series are supplied, the latitude count
+    /// differs from the solution count, or any solution/filter input is invalid.
+    pub fn reconstruct_many_series_major(
+        &self,
+        solutions: &[ScalarSolution],
+        latitudes: &[f64],
+        filter: &ReconstructionFilter,
+    ) -> Result<Vec<Vec<f64>>, AnalysisError> {
+        if solutions.is_empty() {
+            return Err(AnalysisError::EmptySeries);
+        }
+        if solutions.len() != latitudes.len() {
+            return Err(AnalysisError::ObservationShape {
+                actual: latitudes.len(),
+                expected: solutions.len(),
+            });
+        }
+        solutions
+            .par_iter()
+            .zip(latitudes.par_iter().copied())
+            .map(|(solution, latitude)| self.reconstruct_at_latitude(solution, latitude, filter))
+            .collect()
+    }
 }
 
 /// Shared exact astronomy for fitting many series at different latitudes.
@@ -172,6 +403,30 @@ impl GreenwichNodalBatch {
     #[must_use]
     pub fn constituents(&self) -> &[Constituent] {
         &self.basis.scalar_constituents
+    }
+
+    /// Return the midpoint epoch used for fitted trends, as an MJD.
+    #[must_use]
+    pub const fn reference_time_modified_julian_day(&self) -> f64 {
+        self.basis.reference_time_modified_julian_day
+    }
+
+    /// Prepare a reusable exact basis at arbitrary reconstruction MJDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] when target timestamps are empty or non-finite.
+    pub fn reconstructor_modified_julian_days(
+        &self,
+        modified_julian_days: &[f64],
+    ) -> Result<GreenwichNodalReconstructor, AnalysisError> {
+        GreenwichNodalReconstructor::from_parts(
+            modified_julian_days,
+            self.basis.reference_time_modified_julian_day,
+            self.basis.tidal_constituents.clone(),
+            &self.basis.base_constituents,
+            self.basis.recipes.clone(),
+        )
     }
 
     /// Fit varying-latitude scalar series stored in time-major order.
@@ -257,13 +512,15 @@ impl GreenwichNodalBatch {
 struct CorrectionBasis {
     tidal_constituents: Vec<TidalConstituent>,
     scalar_constituents: Vec<Constituent>,
+    base_constituents: Vec<TidalConstituent>,
     recipes: Vec<CorrectionRecipe>,
     time_terms: Vec<TimeTerms>,
+    reference_time_modified_julian_day: f64,
     time_span_days: f64,
     sample_interval_hours: Option<f64>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum CorrectionRecipe {
     Base { base_index: usize },
     Shallow { terms: Vec<ShallowRecipeTerm> },
@@ -318,18 +575,7 @@ impl CorrectionBasis {
                 let base_greenwich_phase = base_constituents
                     .iter()
                     .copied()
-                    .map(|constituent| {
-                        let metadata = constituent.metadata();
-                        (dot6(
-                            metadata
-                                .doodson
-                                .expect("base catalog constituent has Doodson multipliers"),
-                            astronomy.cycles,
-                        ) + metadata
-                            .semi
-                            .expect("base catalog constituent has a phase offset"))
-                            % 1.0
-                    })
+                    .map(|constituent| base_greenwich_phase(constituent, astronomy.cycles))
                     .collect::<Vec<_>>();
                 TimeTerms {
                     greenwich_phase: recipes
@@ -350,8 +596,10 @@ impl CorrectionBasis {
         Ok(Self {
             tidal_constituents: constituents.to_vec(),
             scalar_constituents,
+            base_constituents,
             recipes,
             time_terms,
+            reference_time_modified_julian_day: reference_time,
             time_span_days,
             sample_interval_hours: equidistant_sample_interval_hours(modified_julian_days),
         })
@@ -394,6 +642,13 @@ struct TimeTerms {
     greenwich_phase: Vec<f64>,
     base_nodal_terms: Vec<NodalTerms>,
     normalized_trend: f64,
+}
+
+#[derive(Debug)]
+struct ReconstructionTimeTerms {
+    greenwich_phase: Vec<f64>,
+    base_nodal_terms: Vec<NodalTerms>,
+    days_from_reference: f64,
 }
 
 impl CorrectionRecipe {
@@ -495,6 +750,119 @@ fn validate_derived_frequencies(constituents: &[Constituent]) -> Result<(), Anal
         }
     }
     Ok(())
+}
+
+fn validate_reconstruction_times(
+    modified_julian_days: &[f64],
+    reference_time_modified_julian_day: f64,
+) -> Result<(), AnalysisError> {
+    if !reference_time_modified_julian_day.is_finite() {
+        return Err(AnalysisError::NonFiniteReferenceTime);
+    }
+    if modified_julian_days.is_empty() {
+        return Err(AnalysisError::EmptyTime);
+    }
+    for (index, time) in modified_julian_days.iter().copied().enumerate() {
+        if !time.is_finite() {
+            return Err(AnalysisError::NonFiniteTime { index });
+        }
+    }
+    Ok(())
+}
+
+fn reconstruction_indices(
+    constituents: &[TidalConstituent],
+    solution: &ScalarSolution,
+    filter: &ReconstructionFilter,
+) -> Result<Vec<usize>, AnalysisError> {
+    let expected = constituents.len();
+    for (field, actual) in [
+        ("amplitude", solution.amplitude.len()),
+        ("phase_degrees", solution.phase_degrees.len()),
+        ("percent_energy", solution.percent_energy.len()),
+    ] {
+        if actual != expected {
+            return Err(AnalysisError::InvalidSolutionShape {
+                field,
+                actual,
+                expected,
+            });
+        }
+    }
+
+    match filter {
+        ReconstructionFilter::All => Ok((0..expected).collect()),
+        ReconstructionFilter::Constituents(requested) => {
+            for (index, constituent) in requested.iter().copied().enumerate() {
+                if requested[..index].contains(&constituent) {
+                    return Err(AnalysisError::DuplicateReconstructionConstituent { index });
+                }
+                if !constituents.contains(&constituent) {
+                    return Err(AnalysisError::UnpreparedReconstructionConstituent {
+                        name: constituent.name(),
+                    });
+                }
+            }
+            Ok(constituents
+                .iter()
+                .enumerate()
+                .filter_map(|(index, constituent)| requested.contains(constituent).then_some(index))
+                .collect())
+        }
+        ReconstructionFilter::Diagnostics {
+            minimum_percent_energy,
+            minimum_signal_to_noise,
+        } => {
+            validate_reconstruction_threshold("percent-energy", *minimum_percent_energy)?;
+            let signal_to_noise = match minimum_signal_to_noise {
+                Some(minimum) => {
+                    validate_reconstruction_threshold("signal-to-noise", *minimum)?;
+                    let values = solution
+                        .signal_to_noise
+                        .as_deref()
+                        .ok_or(AnalysisError::MissingSignalToNoise)?;
+                    if values.len() != expected {
+                        return Err(AnalysisError::InvalidSolutionShape {
+                            field: "signal_to_noise",
+                            actual: values.len(),
+                            expected,
+                        });
+                    }
+                    Some((*minimum, values))
+                }
+                None => None,
+            };
+            Ok((0..expected)
+                .filter(|index| {
+                    solution.percent_energy[*index] >= *minimum_percent_energy
+                        && signal_to_noise.is_none_or(|(minimum, values)| values[*index] >= minimum)
+                })
+                .collect())
+        }
+    }
+}
+
+fn validate_reconstruction_threshold(
+    diagnostic: &'static str,
+    threshold: f64,
+) -> Result<(), AnalysisError> {
+    if !threshold.is_finite() || threshold < 0.0 {
+        return Err(AnalysisError::InvalidReconstructionThreshold { diagnostic });
+    }
+    Ok(())
+}
+
+fn base_greenwich_phase(constituent: TidalConstituent, astronomy: [f64; 6]) -> f64 {
+    let metadata = constituent.metadata();
+    (dot6(
+        metadata
+            .doodson
+            .expect("base catalog constituent has Doodson multipliers"),
+        astronomy,
+    ) + metadata
+        .semi
+        .expect("base catalog constituent has a phase offset"))
+        % 1.0
 }
 
 fn validate_latitude(latitude: f64) -> Result<(), AnalysisError> {

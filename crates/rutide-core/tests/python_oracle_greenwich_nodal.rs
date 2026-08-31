@@ -1,6 +1,9 @@
 //! Exact corrected-basis parity against the pinned Python `UTide` oracle.
 
-use rutide_core::{GreenwichNodalBatch, GreenwichNodalOls, LinearConfidence, TidalConstituent};
+use rutide_core::{
+    AnalysisError, GreenwichNodalBatch, GreenwichNodalOls, GreenwichNodalReconstructor,
+    LinearConfidence, ReconstructionFilter, TidalConstituent,
+};
 
 const CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -68,6 +71,38 @@ const EXPECTED_WHITE_PHASE_CI: [f64; 5] = [
 ];
 const EXPECTED_MEAN: f64 = 0.091_040_690_255_747_43;
 const EXPECTED_SLOPE_PER_DAY: f64 = 0.001_734_852_911_719_784_6;
+const RECONSTRUCTION_TIMES: [f64; 6] = [
+    58_113.0,
+    58_113.0 + 0.5 / 24.0,
+    58_120.25,
+    58_144.0,
+    58_144.5,
+    58_150.125,
+];
+const EXPECTED_RECONSTRUCTION_ALL: [f64; 6] = [
+    0.390_104_863_158_723_7,
+    0.343_246_939_718_997_2,
+    1.119_821_622_320_454_7,
+    0.472_351_041_373_717,
+    0.470_951_167_466_406_86,
+    -0.294_077_952_460_847_2,
+];
+const EXPECTED_RECONSTRUCTION_M2_K1: [f64; 6] = [
+    0.614_214_411_844_286_9,
+    0.647_585_514_494_066_5,
+    0.784_133_854_208_182_3,
+    0.467_730_422_346_794_96,
+    0.468_482_583_980_166_84,
+    -0.092_424_856_881_404_75,
+];
+const EXPECTED_RECONSTRUCTION_DIAGNOSTIC: [f64; 6] = [
+    0.560_571_894_280_522_9,
+    0.548_679_775_063_807,
+    0.879_754_392_912_107,
+    0.380_275_915_277_449_97,
+    0.259_596_331_751_810_85,
+    -0.289_606_411_866_790_26,
+];
 const EXPANDED_NAMES: [&str; 10] = ["Q1", "O1", "P1", "K1", "N2", "M2", "S2", "K2", "MK3", "M4"];
 const EXPANDED_FREQUENCY_CPH: [f64; 10] = [
     0.037_218_502_477_472_055,
@@ -261,6 +296,93 @@ fn matches_python_utide_linear_confidence_and_derived_snr() {
     assert_eq!(
         colored.constituent_indices_by_signal_to_noise(),
         Some(vec![0, 1, 3, 2, 4])
+    );
+}
+
+#[test]
+fn matches_python_utide_reconstruction_and_filters_at_original_and_held_out_times() {
+    let time = oracle_times();
+    let observations = oracle_observations();
+    let model = GreenwichNodalOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE_DEGREES_NORTH,
+        &CONSTITUENTS,
+    )
+    .expect("valid corrected oracle model");
+    let solution = model
+        .solve_with_linear_confidence(&observations, LinearConfidence::Colored)
+        .expect("valid colored solution");
+
+    for (label, filter, expected) in [
+        (
+            "all",
+            ReconstructionFilter::All,
+            &EXPECTED_RECONSTRUCTION_ALL,
+        ),
+        (
+            "M2,K1",
+            ReconstructionFilter::Constituents(vec![TidalConstituent::M2, TidalConstituent::K1]),
+            &EXPECTED_RECONSTRUCTION_M2_K1,
+        ),
+        (
+            "PE and SNR",
+            ReconstructionFilter::Diagnostics {
+                minimum_percent_energy: 5.0,
+                minimum_signal_to_noise: Some(500.0),
+            },
+            &EXPECTED_RECONSTRUCTION_DIAGNOSTIC,
+        ),
+    ] {
+        let actual = model
+            .reconstruct_modified_julian_days(&RECONSTRUCTION_TIMES, &solution, &filter)
+            .expect("valid reconstruction");
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(
+                &format!("{label} reconstruction[{index}]"),
+                *actual,
+                *expected,
+                5e-10,
+            );
+        }
+    }
+
+    let batch = GreenwichNodalBatch::prepare_modified_julian_days(&time, &CONSTITUENTS)
+        .expect("valid corrected oracle batch");
+    let reconstructor = batch
+        .reconstructor_modified_julian_days(&RECONSTRUCTION_TIMES)
+        .expect("valid batch reconstruction basis");
+    let batch_values = reconstructor
+        .reconstruct_many_series_major(
+            std::slice::from_ref(&solution),
+            &[LATITUDE_DEGREES_NORTH],
+            &ReconstructionFilter::All,
+        )
+        .expect("valid batch reconstruction");
+    let standalone = GreenwichNodalReconstructor::prepare_modified_julian_days(
+        &RECONSTRUCTION_TIMES,
+        model.reference_time_modified_julian_day(),
+        &CONSTITUENTS,
+    )
+    .expect("valid standalone reconstruction basis")
+    .reconstruct_at_latitude(
+        &solution,
+        LATITUDE_DEGREES_NORTH,
+        &ReconstructionFilter::All,
+    )
+    .expect("valid standalone reconstruction");
+    assert_eq!(batch_values, [standalone]);
+
+    let no_confidence = model.solve(&observations).expect("valid solution");
+    assert_eq!(
+        model.reconstruct_modified_julian_days(
+            &RECONSTRUCTION_TIMES,
+            &no_confidence,
+            &ReconstructionFilter::Diagnostics {
+                minimum_percent_energy: 0.0,
+                minimum_signal_to_noise: Some(2.0),
+            },
+        ),
+        Err(AnalysisError::MissingSignalToNoise)
     );
 }
 

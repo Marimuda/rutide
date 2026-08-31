@@ -19,6 +19,8 @@ pub enum AnalysisError {
         /// Position of the invalid timestamp.
         index: usize,
     },
+    /// A reconstruction fit-reference epoch is NaN or infinite.
+    NonFiniteReferenceTime,
     /// Timestamps are not strictly increasing.
     NonIncreasingTime {
         /// Position of the latter timestamp in the invalid pair.
@@ -34,6 +36,32 @@ pub enum AnalysisError {
     InvalidRayleighMinimum,
     /// Colored confidence intervals currently require equidistant timestamps.
     UnevenTimeForColoredConfidence,
+    /// A reconstruction threshold is negative or non-finite.
+    InvalidReconstructionThreshold {
+        /// Diagnostic whose threshold is invalid.
+        diagnostic: &'static str,
+    },
+    /// A coefficient array does not match the prepared constituent count.
+    InvalidSolutionShape {
+        /// Coefficient or diagnostic field with the invalid length.
+        field: &'static str,
+        /// Number of values received.
+        actual: usize,
+        /// Number of values required by the reconstruction basis.
+        expected: usize,
+    },
+    /// SNR filtering was requested for coefficients without confidence intervals.
+    MissingSignalToNoise,
+    /// An explicit reconstruction constituent was not part of the fitted model.
+    UnpreparedReconstructionConstituent {
+        /// Conventional catalog name.
+        name: &'static str,
+    },
+    /// An explicit reconstruction constituent occurs more than once.
+    DuplicateReconstructionConstituent {
+        /// Position of the latter duplicate.
+        index: usize,
+    },
     /// A constituent name is empty.
     EmptyConstituentName {
         /// Position of the invalid constituent.
@@ -78,6 +106,9 @@ impl fmt::Display for AnalysisError {
             Self::NonFiniteTime { index } => {
                 write!(formatter, "timestamp at index {index} is not finite")
             }
+            Self::NonFiniteReferenceTime => {
+                formatter.write_str("reconstruction reference time must be finite")
+            }
             Self::NonIncreasingTime { index } => write!(
                 formatter,
                 "timestamps must be strictly increasing; violation at index {index}"
@@ -93,6 +124,29 @@ impl fmt::Display for AnalysisError {
             }
             Self::UnevenTimeForColoredConfidence => formatter
                 .write_str("colored linear confidence intervals require equidistant timestamps"),
+            Self::InvalidReconstructionThreshold { diagnostic } => write!(
+                formatter,
+                "{diagnostic} reconstruction threshold must be finite and non-negative"
+            ),
+            Self::InvalidSolutionShape {
+                field,
+                actual,
+                expected,
+            } => write!(
+                formatter,
+                "solution field {field:?} contains {actual} values; expected {expected}"
+            ),
+            Self::MissingSignalToNoise => formatter.write_str(
+                "SNR reconstruction filtering requires a solution with confidence intervals",
+            ),
+            Self::UnpreparedReconstructionConstituent { name } => write!(
+                formatter,
+                "constituent {name} was not included in the fitted model"
+            ),
+            Self::DuplicateReconstructionConstituent { index } => write!(
+                formatter,
+                "reconstruction constituent at index {index} duplicates an earlier entry"
+            ),
             Self::EmptyConstituentName { index } => {
                 write!(formatter, "constituent at index {index} has an empty name")
             }

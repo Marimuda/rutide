@@ -14,13 +14,13 @@ use netcdf::{FileMut, Variable, VariableMut};
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
     AnalysisError, Constituent, GreenwichNodalBatch, LinearConfidence, RayleighSelection,
-    ScalarSolution, TidalConstituent, select_constituents_by_rayleigh,
+    ReconstructionFilter, ScalarSolution, TidalConstituent, select_constituents_by_rayleigh,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
-const OUTPUT_SCHEMA_VERSION: u32 = 3;
+const OUTPUT_SCHEMA_VERSION: u32 = 4;
 /// Backward-compatible benchmark constituent set used when none is specified.
 pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -94,6 +94,8 @@ pub struct AnalyzeConfig {
     pub constituent_selection: ConstituentSelection,
     /// Optional linearized confidence intervals and their noise model.
     pub confidence_interval: ConfidenceInterval,
+    /// Optional complete-series reconstruction and its constituent filter.
+    pub reconstruction: Option<ReconstructionFilter>,
     /// Number of outer spatial worker threads.
     pub workers: usize,
     /// Permit replacing existing output and report files.
@@ -109,6 +111,8 @@ pub struct StageTimings {
     pub preparation_seconds: f64,
     /// Construct latitude-specific designs and solve all series.
     pub solve_seconds: f64,
+    /// Reconstruct every requested series; zero when reconstruction is disabled.
+    pub reconstruction_seconds: f64,
     /// Canonicalize results and compute their SHA-256 identity.
     pub result_processing_seconds: f64,
     /// Create, populate, close, and atomically install the output `NetCDF` file.
@@ -158,6 +162,21 @@ pub struct ConstituentSelectionReport {
     pub record_span_days: Option<f64>,
 }
 
+/// Reconstruction selection retained in a completed run report.
+#[derive(Clone, Debug, Serialize)]
+pub struct ReconstructionReport {
+    /// Selection algorithm: `all`, `constituents`, or `diagnostics`.
+    pub filter: &'static str,
+    /// Explicit names when constituent filtering is selected.
+    pub constituents: Option<Vec<&'static str>>,
+    /// Inclusive PE threshold for diagnostic filtering.
+    pub minimum_percent_energy: Option<f64>,
+    /// Inclusive SNR threshold for diagnostic filtering.
+    pub minimum_signal_to_noise: Option<f64>,
+    /// Number of reconstructed timestamps per series.
+    pub time_count: usize,
+}
+
 /// Machine-readable summary of one completed application run.
 #[derive(Clone, Debug, Serialize)]
 pub struct RunReport {
@@ -191,6 +210,8 @@ pub struct RunReport {
     pub confidence_interval: &'static str,
     /// Residual-noise model when confidence intervals are enabled.
     pub confidence_noise: Option<&'static str>,
+    /// Complete-series reconstruction configuration, when enabled.
+    pub reconstruction: Option<ReconstructionReport>,
     /// Constituent names in coefficient order.
     pub constituents: Vec<String>,
     /// Reference-time frequencies in cycles per hour.
@@ -313,6 +334,10 @@ impl ResolvedConstituentSelection {
 ///
 /// Returns [`AppError`] when configuration, source schema, observations,
 /// numerical analysis, or output serialization fails.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the top-level orchestration keeps all separately timed application stages visible"
+)]
 pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
     validate_config(config)?;
     faer::set_global_parallelism(faer::Par::Seq);
@@ -329,21 +354,27 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         &input.modified_julian_days,
         &selection.constituents,
     )?;
+    if let Some(filter) = &config.reconstruction {
+        validate_reconstruction_filter(filter, &selection.constituents)?;
+    }
     let preparation_seconds = preparation_start.elapsed().as_secs_f64();
 
     let worker_pool = ThreadPoolBuilder::new()
         .num_threads(config.workers)
         .build()?;
     let solve_start = Instant::now();
-    let solutions = worker_pool.install(|| match config.confidence_interval {
-        ConfidenceInterval::None => batch.solve_time_major(&input.observations, &input.latitudes),
-        ConfidenceInterval::Linear(noise) => batch.solve_time_major_with_linear_confidence(
-            &input.observations,
-            &input.latitudes,
-            noise,
-        ),
-    })?;
+    let solutions = solve_input(&worker_pool, &batch, &input, config.confidence_interval)?;
     let solve_seconds = solve_start.elapsed().as_secs_f64();
+
+    let reconstruction_start = Instant::now();
+    let reconstruction = reconstruct_input(
+        &worker_pool,
+        &batch,
+        &input,
+        &solutions,
+        config.reconstruction.as_ref(),
+    )?;
+    let reconstruction_seconds = reconstruction_start.elapsed().as_secs_f64();
 
     let result_start = Instant::now();
     let result_sha256 = result_digest(
@@ -352,6 +383,10 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         batch.constituents(),
         &solutions,
         config.confidence_interval,
+        config
+            .reconstruction
+            .as_ref()
+            .zip(reconstruction.as_deref()),
     )?;
     let sample_results = retained_samples(&input.node_indices, &input.latitudes, &solutions);
     let result_processing_seconds = result_start.elapsed().as_secs_f64();
@@ -368,6 +403,12 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             result_sha256: &result_sha256,
             selection: &selection,
             confidence_interval: config.confidence_interval,
+            modified_julian_days: &input.modified_julian_days,
+            reference_time_modified_julian_day: batch.reference_time_modified_julian_day(),
+            reconstruction: config
+                .reconstruction
+                .as_ref()
+                .zip(reconstruction.as_deref()),
         },
     )?;
     let output_seconds = output_start.elapsed().as_secs_f64();
@@ -394,6 +435,10 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         constituent_selection: selection.report,
         confidence_interval: config.confidence_interval.method(),
         confidence_noise: config.confidence_interval.noise(),
+        reconstruction: config
+            .reconstruction
+            .as_ref()
+            .map(|filter| reconstruction_report(filter, input.modified_julian_days.len())),
         constituents: batch
             .constituents()
             .iter()
@@ -409,6 +454,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             input_seconds,
             preparation_seconds,
             solve_seconds,
+            reconstruction_seconds,
             result_processing_seconds,
             output_seconds,
             total_seconds,
@@ -420,6 +466,40 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         write_json_report(path, config.overwrite, &report)?;
     }
     Ok(report)
+}
+
+fn solve_input(
+    worker_pool: &rayon::ThreadPool,
+    batch: &GreenwichNodalBatch,
+    input: &InputData,
+    confidence_interval: ConfidenceInterval,
+) -> Result<Vec<ScalarSolution>, AnalysisError> {
+    worker_pool.install(|| match confidence_interval {
+        ConfidenceInterval::None => batch.solve_time_major(&input.observations, &input.latitudes),
+        ConfidenceInterval::Linear(noise) => batch.solve_time_major_with_linear_confidence(
+            &input.observations,
+            &input.latitudes,
+            noise,
+        ),
+    })
+}
+
+fn reconstruct_input(
+    worker_pool: &rayon::ThreadPool,
+    batch: &GreenwichNodalBatch,
+    input: &InputData,
+    solutions: &[ScalarSolution],
+    filter: Option<&ReconstructionFilter>,
+) -> Result<Option<Vec<Vec<f64>>>, AnalysisError> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+    let reconstructor = batch.reconstructor_modified_julian_days(&input.modified_julian_days)?;
+    worker_pool
+        .install(|| {
+            reconstructor.reconstruct_many_series_major(solutions, &input.latitudes, filter)
+        })
+        .map(Some)
 }
 
 fn validate_config(config: &AnalyzeConfig) -> Result<(), AppError> {
@@ -448,6 +528,9 @@ fn validate_config(config: &AnalyzeConfig) -> Result<(), AppError> {
             }
         }
     }
+    if let Some(filter) = &config.reconstruction {
+        validate_reconstruction_filter_thresholds(filter)?;
+    }
     if config.output.exists() && !config.overwrite {
         return Err(AppError::DestinationExists(config.output.clone()));
     }
@@ -462,6 +545,91 @@ fn validate_config(config: &AnalyzeConfig) -> Result<(), AppError> {
         }
     }
     Ok(())
+}
+
+fn validate_reconstruction_filter_thresholds(
+    filter: &ReconstructionFilter,
+) -> Result<(), AppError> {
+    if let ReconstructionFilter::Diagnostics {
+        minimum_percent_energy,
+        minimum_signal_to_noise,
+    } = filter
+    {
+        for (name, threshold) in [
+            ("percent-energy", Some(*minimum_percent_energy)),
+            ("signal-to-noise", *minimum_signal_to_noise),
+        ] {
+            if threshold.is_some_and(|value| !value.is_finite() || value < 0.0) {
+                return Err(AppError::Invalid(format!(
+                    "{name} reconstruction threshold must be finite and non-negative"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_reconstruction_filter(
+    filter: &ReconstructionFilter,
+    prepared: &[TidalConstituent],
+) -> Result<(), AppError> {
+    validate_reconstruction_filter_thresholds(filter)?;
+    if let ReconstructionFilter::Constituents(requested) = filter {
+        if requested.is_empty() {
+            return Err(AppError::Invalid(
+                "reconstruction constituent list must not be empty".to_owned(),
+            ));
+        }
+        let mut unique = BTreeSet::new();
+        for constituent in requested.iter().copied() {
+            if !unique.insert(constituent) {
+                return Err(AppError::Invalid(format!(
+                    "reconstruction constituent {constituent} appears more than once"
+                )));
+            }
+            if !prepared.contains(&constituent) {
+                return Err(AppError::Invalid(format!(
+                    "reconstruction constituent {constituent} was not selected for analysis"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reconstruction_report(filter: &ReconstructionFilter, time_count: usize) -> ReconstructionReport {
+    match filter {
+        ReconstructionFilter::All => ReconstructionReport {
+            filter: "all",
+            constituents: None,
+            minimum_percent_energy: None,
+            minimum_signal_to_noise: None,
+            time_count,
+        },
+        ReconstructionFilter::Constituents(constituents) => ReconstructionReport {
+            filter: "constituents",
+            constituents: Some(
+                constituents
+                    .iter()
+                    .copied()
+                    .map(TidalConstituent::name)
+                    .collect(),
+            ),
+            minimum_percent_energy: None,
+            minimum_signal_to_noise: None,
+            time_count,
+        },
+        ReconstructionFilter::Diagnostics {
+            minimum_percent_energy,
+            minimum_signal_to_noise,
+        } => ReconstructionReport {
+            filter: "diagnostics",
+            constituents: None,
+            minimum_percent_energy: Some(*minimum_percent_energy),
+            minimum_signal_to_noise: *minimum_signal_to_noise,
+            time_count,
+        },
+    }
 }
 
 fn resolve_constituent_selection(
@@ -698,9 +866,10 @@ fn result_digest(
     constituents: &[Constituent],
     solutions: &[ScalarSolution],
     confidence_interval: ConfidenceInterval,
+    reconstruction: Option<(&ReconstructionFilter, &[Vec<f64>])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-scalar-greenwich-nodal-v3\0");
+    digest.update(b"rutide-scalar-greenwich-nodal-v4\0");
     digest.update(confidence_interval.method().as_bytes());
     digest.update([0]);
     if let Some(noise) = confidence_interval.noise() {
@@ -743,7 +912,42 @@ fn result_digest(
         digest.update(solution.mean.to_bits().to_le_bytes());
         digest.update(solution.slope_per_day.to_bits().to_le_bytes());
     }
+    match reconstruction {
+        Some((filter, values)) => {
+            update_reconstruction_filter_digest(&mut digest, filter);
+            for series in values {
+                for value in series {
+                    digest.update(value.to_bits().to_le_bytes());
+                }
+            }
+        }
+        None => digest.update(b"no-reconstruction\0"),
+    }
     Ok(encode_hex(&digest.finalize()))
+}
+
+fn update_reconstruction_filter_digest(digest: &mut Sha256, filter: &ReconstructionFilter) {
+    match filter {
+        ReconstructionFilter::All => digest.update(b"reconstruction:all\0"),
+        ReconstructionFilter::Constituents(constituents) => {
+            digest.update(b"reconstruction:constituents\0");
+            for constituent in constituents {
+                digest.update(constituent.name().as_bytes());
+                digest.update([0]);
+            }
+        }
+        ReconstructionFilter::Diagnostics {
+            minimum_percent_energy,
+            minimum_signal_to_noise,
+        } => {
+            digest.update(b"reconstruction:diagnostics\0");
+            digest.update(minimum_percent_energy.to_bits().to_le_bytes());
+            match minimum_signal_to_noise {
+                Some(value) => digest.update(value.to_bits().to_le_bytes()),
+                None => digest.update(b"no-snr\0"),
+            }
+        }
+    }
 }
 
 type ConfidenceValues<'solution> = (&'solution [f64], &'solution [f64], &'solution [f64]);
@@ -814,6 +1018,9 @@ struct OutputData<'data> {
     result_sha256: &'data str,
     selection: &'data ResolvedConstituentSelection,
     confidence_interval: ConfidenceInterval,
+    modified_julian_days: &'data [f64],
+    reference_time_modified_julian_day: f64,
+    reconstruction: Option<(&'data ReconstructionFilter, &'data [Vec<f64>])>,
 }
 
 fn write_output(path: &Path, overwrite: bool, data: &OutputData<'_>) -> Result<(), AppError> {
@@ -840,11 +1047,18 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         result_sha256,
         selection,
         confidence_interval,
+        modified_julian_days,
+        reference_time_modified_julian_day,
+        reconstruction,
     } = *data;
     let mut output = netcdf::create(path)?;
     output.add_dimension("series", node_indices.len())?;
     output.add_dimension("constituent", constituents.len())?;
+    if reconstruction.is_some() {
+        output.add_dimension("time", modified_julian_days.len())?;
+    }
     output.add_attribute("title", "RUTide scalar harmonic coefficients")?;
+    output.add_attribute("rutide_schema_version", i64::from(OUTPUT_SCHEMA_VERSION))?;
     output.add_attribute("rutide_version", rutide_core::VERSION)?;
     output.add_attribute("profile", selection.profile())?;
     output.add_attribute("confidence_interval", confidence_interval.method())?;
@@ -867,6 +1081,10 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         .collect::<Vec<_>>()
         .join(",");
     output.add_attribute("constituent_names", constituent_names)?;
+    output.add_attribute(
+        "reference_time_modified_julian_day",
+        reference_time_modified_julian_day,
+    )?;
     output.add_attribute("result_sha256", result_sha256)?;
 
     let node_indices = node_indices
@@ -897,7 +1115,57 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
     )?;
 
     write_solution_variables(&mut output, constituents, solutions, confidence_interval)?;
+    if let Some((filter, values)) = reconstruction {
+        write_reconstruction_variables(
+            &mut output,
+            modified_julian_days,
+            node_indices.len(),
+            filter,
+            values,
+        )?;
+    }
     output.close()?;
+    Ok(())
+}
+
+fn write_reconstruction_variables(
+    output: &mut FileMut,
+    modified_julian_days: &[f64],
+    series_count: usize,
+    filter: &ReconstructionFilter,
+    values: &[Vec<f64>],
+) -> Result<(), AppError> {
+    if values.len() != series_count
+        || values
+            .iter()
+            .any(|series| series.len() != modified_julian_days.len())
+    {
+        return Err(AppError::Invalid(
+            "reconstruction result shape does not match output dimensions".to_owned(),
+        ));
+    }
+    let report = reconstruction_report(filter, modified_julian_days.len());
+    output.add_attribute("reconstruction_filter", report.filter)?;
+    if let Some(constituents) = report.constituents {
+        output.add_attribute("reconstruction_constituents", constituents.join(","))?;
+    }
+    if let Some(minimum) = report.minimum_percent_energy {
+        output.add_attribute("reconstruction_minimum_percent_energy", minimum)?;
+    }
+    if let Some(minimum) = report.minimum_signal_to_noise {
+        output.add_attribute("reconstruction_minimum_signal_to_noise", minimum)?;
+    }
+    write_variable(
+        &mut output.add_variable::<f64>("time", &["time"])?,
+        modified_julian_days,
+        "days since 1858-11-17 00:00:00 UTC",
+    )?;
+    let mut reconstruction = output.add_variable::<f64>("reconstruction", &["time", "series"])?;
+    reconstruction.put_attribute("units", "source variable units")?;
+    reconstruction.put_attribute("long_name", "reconstructed scalar tidal signal")?;
+    for (series, series_values) in values.iter().enumerate() {
+        reconstruction.put_values(series_values, (.., series))?;
+    }
     Ok(())
 }
 
@@ -1030,7 +1298,9 @@ mod tests {
 
     use super::{
         NodeSelection, encode_hex, read_fvcom_scalar, resolve_node_selection, temporary_sibling,
+        write_reconstruction_variables,
     };
+    use rutide_core::{ReconstructionFilter, TidalConstituent};
 
     #[test]
     fn selection_preserves_explicit_order() {
@@ -1108,6 +1378,44 @@ mod tests {
             ]
         );
         assert_eq!(input.logical_input_bytes, 40);
+        fs::remove_file(path).expect("remove test NetCDF");
+    }
+
+    #[test]
+    fn reconstruction_is_written_time_major_with_filter_metadata() {
+        let destination = std::env::temp_dir().join("rutide-reconstruction-output-test.nc");
+        let path = temporary_sibling(&destination).expect("valid temporary path");
+        let mut dataset = netcdf::create(&path).expect("create test NetCDF");
+        dataset.add_dimension("time", 2).expect("add time");
+        dataset.add_dimension("series", 2).expect("add series");
+        write_reconstruction_variables(
+            &mut dataset,
+            &[58_113.0, 58_113.5],
+            2,
+            &ReconstructionFilter::Constituents(vec![TidalConstituent::K1, TidalConstituent::M2]),
+            &[vec![1.0, 2.0], vec![3.0, 4.0]],
+        )
+        .expect("write valid reconstruction");
+        dataset.close().expect("close test NetCDF");
+
+        let dataset = netcdf::open(&path).expect("open test NetCDF");
+        assert_eq!(
+            dataset
+                .variable("reconstruction")
+                .expect("reconstruction variable")
+                .get_values::<f64, _>(..)
+                .expect("read reconstruction"),
+            [1.0, 3.0, 2.0, 4.0]
+        );
+        assert_eq!(
+            dataset
+                .attribute("reconstruction_constituents")
+                .expect("constituent metadata")
+                .value()
+                .expect("read constituent metadata"),
+            netcdf::AttributeValue::Str("K1,M2".to_owned())
+        );
+        drop(dataset);
         fs::remove_file(path).expect("remove test NetCDF");
     }
 }

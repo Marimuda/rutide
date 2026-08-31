@@ -24,6 +24,7 @@ DEFAULT_TOLERANCES = {
     "mean": 3e-12,
     "slope_per_day": 3e-12,
     "frequency_cph": 1e-15,
+    "reconstruction": 1e-9,
 }
 BASE_PHASE_TOLERANCE_DEGREES = 3e-9
 SIGNAL_TO_NOISE_ABSOLUTE_TOLERANCE = 1e-6
@@ -189,6 +190,36 @@ def compare_with_oracle(
             if selection_method == "rayleigh"
             else None
         )
+        if "reconstruction" in result_dataset.variables:
+            reconstruction = _finite(
+                result_dataset.variables["reconstruction"][:],
+                "output reconstruction",
+            )
+            reconstruction_time = _finite(
+                result_dataset.variables["time"][:],
+                "output reconstruction time",
+            )
+            reconstruction_filter = str(result_dataset.getncattr("reconstruction_filter"))
+            reconstruction_constituents = (
+                str(result_dataset.getncattr("reconstruction_constituents")).split(",")
+                if reconstruction_filter == "constituents"
+                else None
+            )
+            reconstruction_minimum_pe = (
+                float(result_dataset.getncattr("reconstruction_minimum_percent_energy"))
+                if reconstruction_filter == "diagnostics"
+                else None
+            )
+            reconstruction_minimum_snr = (
+                float(result_dataset.getncattr("reconstruction_minimum_signal_to_noise"))
+                if "reconstruction_minimum_signal_to_noise" in result_dataset.ncattrs()
+                else None
+            )
+        else:
+            reconstruction = reconstruction_time = None
+            reconstruction_filter = None
+            reconstruction_constituents = None
+            reconstruction_minimum_pe = reconstruction_minimum_snr = None
 
     series_count = len(indices)
     constituent_count = len(names)
@@ -211,6 +242,13 @@ def compare_with_oracle(
         raise ValueError("unexpected mean or slope shape")
     if latitudes.shape != (series_count,) or frequencies.shape != (constituent_count,):
         raise ValueError("unexpected latitude or frequency shape")
+    if reconstruction is not None:
+        if reconstruction_time.ndim != 1 or reconstruction_time.size == 0:
+            raise ValueError("unexpected reconstruction time shape")
+        if reconstruction.shape != (reconstruction_time.size, series_count):
+            raise ValueError(f"unexpected reconstruction shape: {reconstruction.shape}")
+        if reconstruction_filter not in {"all", "constituents", "diagnostics"}:
+            raise ValueError(f"unsupported reconstruction filter: {reconstruction_filter}")
 
     metric_names = [
         "amplitude",
@@ -224,6 +262,8 @@ def compare_with_oracle(
         metric_names.extend(["amplitude_ci", "phase_ci_degrees"])
     elif confidence_interval != "none":
         raise ValueError(f"unsupported confidence interval: {confidence_interval}")
+    if reconstruction is not None:
+        metric_names.append("reconstruction")
     errors: dict[str, list[tuple[float, int, str | None]]] = {name: [] for name in metric_names}
     phase_errors: list[tuple[float, float, int, str]] = []
     snr_errors: list[tuple[float, float, int, str]] = []
@@ -368,6 +408,32 @@ def compare_with_oracle(
             errors["slope_per_day"].append(
                 (abs(slopes[position] - float(coefficient.slope)), node_index, None)
             )
+            if reconstruction is not None:
+                selected_names = _reconstruction_names(
+                    reconstruction_filter,
+                    reconstruction_constituents,
+                    reconstruction_minimum_pe,
+                    reconstruction_minimum_snr,
+                    coefficient,
+                )
+                expected_reconstruction = np.asarray(
+                    oracle.reconstruct(
+                        reconstruction_time,
+                        coefficient,
+                        epoch="1858-11-17",
+                        constit=selected_names,
+                        verbose=False,
+                    ).h,
+                    dtype=np.float64,
+                )
+                for actual, expected in zip(
+                    reconstruction[:, position],
+                    expected_reconstruction,
+                    strict=True,
+                ):
+                    errors["reconstruction"].append(
+                        (abs(float(actual - expected)), node_index, None)
+                    )
 
     metrics = {
         name: _maximum_error(values, DEFAULT_TOLERANCES[name]) for name, values in errors.items()
@@ -384,6 +450,7 @@ def compare_with_oracle(
         "constituent_selection": selection_method,
         "confidence_interval": confidence_interval,
         "confidence_noise": confidence_noise,
+        "reconstruction_filter": reconstruction_filter,
         "series": series_count,
         "constituents": names,
         "fixture": str(fixture_path),
@@ -392,6 +459,31 @@ def compare_with_oracle(
         "metrics": metrics,
         "passed": all(metric["within_tolerance"] for metric in metrics.values()),
     }
+
+
+def _reconstruction_names(
+    reconstruction_filter: str,
+    explicit_names: list[str] | None,
+    minimum_percent_energy: float | None,
+    minimum_signal_to_noise: float | None,
+    coefficient: Any,
+) -> list[str]:
+    names = [str(value) for value in coefficient.name.tolist()]
+    if reconstruction_filter == "all":
+        return names
+    if reconstruction_filter == "constituents":
+        if not explicit_names or not set(explicit_names).issubset(names):
+            raise ValueError("invalid explicit reconstruction constituent metadata")
+        return explicit_names
+    if minimum_percent_energy is None:
+        raise ValueError("diagnostic reconstruction is missing its PE threshold")
+    percent_energy = np.asarray(coefficient.PE, dtype=np.float64)
+    selected = percent_energy >= minimum_percent_energy
+    if minimum_signal_to_noise is not None:
+        if not hasattr(coefficient, "SNR"):
+            raise ValueError("diagnostic reconstruction requires unavailable Python SNR")
+        selected &= np.asarray(coefficient.SNR, dtype=np.float64) >= minimum_signal_to_noise
+    return [name for name, include in zip(names, selected, strict=True) if include]
 
 
 def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:

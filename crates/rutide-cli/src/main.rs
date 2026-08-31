@@ -11,6 +11,7 @@ use rutide_cli::{
     AnalyzeConfig, ConfidenceInterval, ConstituentSelection, DEFAULT_CONSTITUENTS, NodeSelection,
     analyze_scalar,
 };
+use rutide_core::ReconstructionFilter;
 use rutide_core::{LinearConfidence, TidalConstituent};
 
 // The application repeatedly allocates short-lived QR storage across worker
@@ -32,6 +33,11 @@ Options:
   --rayleigh-min X    Automatic selection criterion (default with auto: 1.0)
   --confidence MODE   Confidence intervals: none or linear (default: none)
   --white-noise       Use white noise instead of colored residual bands
+  --reconstruct       Write complete original-time reconstruction to the output
+  --reconstruct-constituents LIST
+                      Reconstruct only these fitted constituent names
+  --min-pe X          Reconstruct constituents with PE >= X percent
+  --min-snr X         Reconstruct constituents with SNR >= X (requires confidence)
   --overwrite         Replace existing output and report files
   -h, --help          Show this help
 ";
@@ -79,6 +85,10 @@ fn main() -> ExitCode {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "single-pass parsing keeps option duplication and cross-option validation explicit"
+)]
 fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let mut arguments = arguments.into_iter();
     let Some(command) = arguments.next() else {
@@ -106,6 +116,10 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let mut rayleigh_minimum = None;
     let mut confidence_requested = None;
     let mut white_noise = false;
+    let mut reconstruct = false;
+    let mut reconstruction_constituents = None;
+    let mut minimum_percent_energy = None;
+    let mut minimum_signal_to_noise = None;
     let mut overwrite = false;
     while let Some(argument) = arguments.next() {
         let option = argument
@@ -153,6 +167,34 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                 confidence_requested = Some(parse_confidence(&value)?);
             }
             "--white-noise" => white_noise = true,
+            "--reconstruct" => reconstruct = true,
+            "--reconstruct-constituents" => {
+                if reconstruction_constituents.is_some() {
+                    return Err("--reconstruct-constituents may only be supplied once".to_owned());
+                }
+                reconstruction_constituents = Some(parse_explicit_constituents(
+                    &required_value(&mut arguments, option)?,
+                    option,
+                )?);
+            }
+            "--min-pe" => {
+                if minimum_percent_energy.is_some() {
+                    return Err("--min-pe may only be supplied once".to_owned());
+                }
+                minimum_percent_energy = Some(parse_nonnegative_f64(
+                    &required_value(&mut arguments, option)?,
+                    option,
+                )?);
+            }
+            "--min-snr" => {
+                if minimum_signal_to_noise.is_some() {
+                    return Err("--min-snr may only be supplied once".to_owned());
+                }
+                minimum_signal_to_noise = Some(parse_nonnegative_f64(
+                    &required_value(&mut arguments, option)?,
+                    option,
+                )?);
+            }
             "--overwrite" => overwrite = true,
             "--help" | "-h" => return Ok(Command::Help),
             _ => return Err(format!("unknown option for analyze-scalar: {option}")),
@@ -161,6 +203,13 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
 
     let constituent_selection = resolve_constituent_selection(constituents, rayleigh_minimum)?;
     let confidence_interval = resolve_confidence_interval(confidence_requested, white_noise)?;
+    let reconstruction = resolve_reconstruction(
+        reconstruct,
+        reconstruction_constituents,
+        minimum_percent_energy,
+        minimum_signal_to_noise,
+        confidence_interval,
+    )?;
 
     Ok(Command::Analyze(AnalyzeConfig {
         input: input.ok_or_else(|| "analyze-scalar requires --input PATH".to_owned())?,
@@ -169,8 +218,48 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
         nodes: selection.unwrap_or(NodeSelection::All),
         constituent_selection,
         confidence_interval,
+        reconstruction,
         workers,
         overwrite,
+    }))
+}
+
+fn resolve_reconstruction(
+    enabled: bool,
+    constituents: Option<Vec<TidalConstituent>>,
+    minimum_percent_energy: Option<f64>,
+    minimum_signal_to_noise: Option<f64>,
+    confidence_interval: ConfidenceInterval,
+) -> Result<Option<ReconstructionFilter>, String> {
+    if !enabled {
+        if constituents.is_some()
+            || minimum_percent_energy.is_some()
+            || minimum_signal_to_noise.is_some()
+        {
+            return Err("reconstruction filters require --reconstruct".to_owned());
+        }
+        return Ok(None);
+    }
+    if constituents.is_some()
+        && (minimum_percent_energy.is_some() || minimum_signal_to_noise.is_some())
+    {
+        return Err(
+            "--reconstruct-constituents is mutually exclusive with --min-pe and --min-snr"
+                .to_owned(),
+        );
+    }
+    if minimum_signal_to_noise.is_some() && confidence_interval == ConfidenceInterval::None {
+        return Err("--min-snr requires --confidence linear".to_owned());
+    }
+    Ok(Some(match constituents {
+        Some(constituents) => ReconstructionFilter::Constituents(constituents),
+        None if minimum_percent_energy.is_some() || minimum_signal_to_noise.is_some() => {
+            ReconstructionFilter::Diagnostics {
+                minimum_percent_energy: minimum_percent_energy.unwrap_or(0.0),
+                minimum_signal_to_noise,
+            }
+        }
+        None => ReconstructionFilter::All,
     }))
 }
 
@@ -249,6 +338,19 @@ fn parse_positive_f64(value: &OsStr, option: &str) -> Result<f64, String> {
     Ok(parsed)
 }
 
+fn parse_nonnegative_f64(value: &OsStr, option: &str) -> Result<f64, String> {
+    let text = value
+        .to_str()
+        .ok_or_else(|| format!("{option} value must be valid UTF-8"))?;
+    let parsed = text
+        .parse::<f64>()
+        .map_err(|_| format!("{option} requires a non-negative number, received {text:?}"))?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err(format!("{option} requires a finite non-negative number"));
+    }
+    Ok(parsed)
+}
+
 fn parse_confidence(value: &OsStr) -> Result<bool, String> {
     match value.to_str() {
         Some("none") => Ok(false),
@@ -319,6 +421,16 @@ fn parse_constituents(value: &OsStr) -> Result<ParsedConstituents, String> {
     Ok(ParsedConstituents::Explicit(constituents))
 }
 
+fn parse_explicit_constituents(
+    value: &OsStr,
+    option: &str,
+) -> Result<Vec<TidalConstituent>, String> {
+    match parse_constituents(value)? {
+        ParsedConstituents::Explicit(constituents) => Ok(constituents),
+        ParsedConstituents::Auto => Err(format!("{option} requires explicit constituent names")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -327,7 +439,7 @@ mod tests {
     use rutide_cli::{
         ConfidenceInterval, ConstituentSelection, DEFAULT_CONSTITUENTS, NodeSelection,
     };
-    use rutide_core::{LinearConfidence, TidalConstituent};
+    use rutide_core::{LinearConfidence, ReconstructionFilter, TidalConstituent};
 
     fn args<'a>(values: &'a [&'a str]) -> impl Iterator<Item = OsString> + 'a {
         values.iter().map(OsString::from)
@@ -356,6 +468,7 @@ mod tests {
             ConstituentSelection::Explicit(DEFAULT_CONSTITUENTS.to_vec())
         );
         assert_eq!(config.confidence_interval, ConfidenceInterval::None);
+        assert_eq!(config.reconstruction, None);
         assert_eq!(config.workers, 8);
     }
 
@@ -503,5 +616,74 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_all_explicit_and_diagnostic_reconstruction_filters() {
+        for (extra, expected) in [
+            (
+                &["--reconstruct", "--reconstruct-constituents", "M2,K1"][..],
+                ReconstructionFilter::Constituents(vec![
+                    TidalConstituent::M2,
+                    TidalConstituent::K1,
+                ]),
+            ),
+            (
+                &[
+                    "--confidence",
+                    "linear",
+                    "--reconstruct",
+                    "--min-pe",
+                    "5",
+                    "--min-snr",
+                    "2",
+                ][..],
+                ReconstructionFilter::Diagnostics {
+                    minimum_percent_energy: 5.0,
+                    minimum_signal_to_noise: Some(2.0),
+                },
+            ),
+            (&["--reconstruct"][..], ReconstructionFilter::All),
+        ] {
+            let mut values = vec![
+                "analyze-scalar",
+                "--input",
+                "input.nc",
+                "--output",
+                "output.nc",
+            ];
+            values.extend_from_slice(extra);
+            let command = parse_arguments(args(&values)).expect("valid reconstruction options");
+            let Command::Analyze(config) = command else {
+                panic!("expected analyze command");
+            };
+            assert_eq!(config.reconstruction, Some(expected));
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_unavailable_reconstruction_filters() {
+        for extra in [
+            &["--min-pe", "5"][..],
+            &["--reconstruct", "--min-snr", "2"][..],
+            &[
+                "--reconstruct",
+                "--reconstruct-constituents",
+                "M2",
+                "--min-pe",
+                "5",
+            ][..],
+            &["--reconstruct", "--reconstruct-constituents", "auto"][..],
+        ] {
+            let mut values = vec![
+                "analyze-scalar",
+                "--input",
+                "input.nc",
+                "--output",
+                "output.nc",
+            ];
+            values.extend_from_slice(extra);
+            assert!(parse_arguments(args(&values)).is_err());
+        }
     }
 }

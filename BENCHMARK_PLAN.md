@@ -323,14 +323,19 @@ or if the maintenance cost outweighs the measured operational saving. A valid
 outcome may be a small Rust kernel exposed to Python rather than a complete UTide
 replacement.
 
-## Immediate next steps
+## Coverage increments
 
-1. Generate a checked-in Rust catalog from the pinned oracle's 146 constituent,
-   162 satellite, and 251 shallow-water relationship records.
-2. Generalize the corrected solver to explicit dynamic constituent lists, then
-   reproduce Python's Rayleigh-based automatic selection at several record spans.
-3. Add percent energy, followed by linear amplitude/phase confidence intervals;
-   signal-to-noise ratio depends on those intervals and must not be presented as
-   an independent amplitude-only diagnostic.
-4. Add complete-series reconstruction with constituent, PE, and SNR filtering,
-   then design missing-value grouping and vector-current support.
+The first coverage sequence is complete and retained as separate Git increments:
+
+1. the complete pinned 146-constituent, 162-satellite, and 251-shallow-term
+   catalog;
+2. explicit dynamic constituent lists;
+3. Python-compatible Rayleigh automatic selection;
+4. percent-energy diagnostics and ranking;
+5. linear amplitude/phase confidence intervals and CI-derived SNR; and
+6. exact complete-series reconstruction with explicit constituent, PE, and SNR
+   filtering, including held-out-time oracle tests.
+
+The next coverage design work is missing-value grouping followed by scalar/vector
+current support. Each expansion remains subject to the same parity and resource
+gates above.

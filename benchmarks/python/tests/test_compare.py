@@ -1,12 +1,14 @@
 """Unit tests for cross-language comparison utilities."""
 
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
 from rutide_baseline.compare import (
     BASE_PHASE_TOLERANCE_DEGREES,
     _maximum_error,
+    _reconstruction_names,
     circular_phase_error,
     phase_tolerance_degrees,
 )
@@ -29,6 +31,25 @@ class ComparisonUtilitiesTests(unittest.TestCase):
         self.assertEqual(phase_tolerance_degrees(1.0), BASE_PHASE_TOLERANCE_DEGREES)
         self.assertGreater(phase_tolerance_degrees(1e-4), BASE_PHASE_TOLERANCE_DEGREES)
         self.assertEqual(phase_tolerance_degrees(0.0), 180.0)
+
+    def test_reconstruction_diagnostics_apply_pe_and_snr_together(self) -> None:
+        coefficient = SimpleNamespace(
+            name=np.array(["M2", "S2", "K1"]),
+            PE=np.array([80.0, 10.0, 5.0]),
+            SNR=np.array([1000.0, 100.0, 1.0]),
+        )
+        self.assertEqual(
+            _reconstruction_names("all", None, None, None, coefficient),
+            ["M2", "S2", "K1"],
+        )
+        self.assertEqual(
+            _reconstruction_names("constituents", ["K1", "M2"], None, None, coefficient),
+            ["K1", "M2"],
+        )
+        self.assertEqual(
+            _reconstruction_names("diagnostics", None, 8.0, 500.0, coefficient),
+            ["M2"],
+        )
 
 
 if __name__ == "__main__":
