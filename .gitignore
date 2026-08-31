@@ -4,6 +4,12 @@
 # Project-local developer toolchains and benchmark artifacts
 /.tools/
 /benchmark-results/
+**/.venv/
+**/.ruff_cache/
+**/.pytest_cache/
+**/__pycache__/
+**/*.egg-info/
+*.py[cod]
 /perf.data*
 /*.profraw
 

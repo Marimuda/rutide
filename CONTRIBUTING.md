@@ -20,6 +20,10 @@ cargo fmt --all -- --check
 cargo ci
 cargo test-all
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+uv run --project benchmarks/python --locked ruff format --check benchmarks/python
+uv run --project benchmarks/python --locked ruff check benchmarks/python
+uv run --project benchmarks/python --locked \
+  python -m unittest discover -s benchmarks/python/tests -v
 ```
 
 Run release-mode correctness tests as well when floating-point behavior could be

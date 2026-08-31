@@ -15,6 +15,7 @@ protocol, correctness contract, and decision gates.
 ```text
 crates/rutide-core/  Numerical library; no file-format or CLI concerns
 crates/rutide-cli/   Thin application and future NetCDF benchmark entry point
+benchmarks/           Locked Python oracle harness and fixture manifests
 BENCHMARK_PLAN.md    Frozen experimental intent and measurement protocol
 ```
 
@@ -33,6 +34,10 @@ cargo ci
 cargo test-all
 cargo doc --workspace --all-features --no-deps --locked
 cargo run --bin rutide -- --version
+uv sync --project benchmarks/python --locked
+uv run --project benchmarks/python --locked ruff check benchmarks/python
+uv run --project benchmarks/python --locked \
+  python -m unittest discover -s benchmarks/python/tests -v
 ```
 
 `cargo ci` and `cargo test-all` are repository aliases defined in

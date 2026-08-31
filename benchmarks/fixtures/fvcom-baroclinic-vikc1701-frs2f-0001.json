@@ -1,0 +1,349 @@
+{
+  "correctness_selection": {
+    "algorithm": "depth-decile anchors, 16 linear anchors, then multiplicative fill",
+    "element_indices": [
+      0,
+      2987,
+      5974,
+      9657,
+      19314,
+      21121,
+      24108,
+      27095,
+      28971,
+      38629,
+      42242,
+      45229,
+      48216,
+      48286,
+      57943,
+      63363,
+      66350,
+      67600,
+      77258,
+      84484,
+      86915,
+      87471,
+      96572,
+      105605,
+      106229,
+      108592,
+      115887,
+      125544,
+      126726,
+      129713,
+      135201,
+      144859
+    ],
+    "element_latitude": {
+      "dtype": "<f4",
+      "finite_values": 32,
+      "masked_values": 0,
+      "maximum": 62.3604621887207,
+      "minimum": 60.977535247802734,
+      "sha256": "6f9db00d90145afe30568a353f2a2009d9b880da33fe45445272126b94665e0e",
+      "shape": [
+        32
+      ]
+    },
+    "node_depth": {
+      "dtype": "<f4",
+      "finite_values": 32,
+      "masked_values": 0,
+      "maximum": 2570.889892578125,
+      "minimum": 4.0,
+      "sha256": "cd49e6a3995cf8dc295c3b6bcb61b2050be542ae2355befdbcb398f4aa0d7fb3",
+      "shape": [
+        32
+      ]
+    },
+    "node_indices": [
+      0,
+      5010,
+      7142,
+      10021,
+      10041,
+      15031,
+      20042,
+      20082,
+      25053,
+      30063,
+      30123,
+      31821,
+      35074,
+      36147,
+      40084,
+      40164,
+      45095,
+      50106,
+      50205,
+      55116,
+      56941,
+      57389,
+      60127,
+      60246,
+      62015,
+      62197,
+      65137,
+      66654,
+      70148,
+      70782,
+      74949,
+      75159
+    ],
+    "node_latitude": {
+      "dtype": "<f4",
+      "finite_values": 32,
+      "masked_values": 0,
+      "maximum": 63.26142883300781,
+      "minimum": 60.95771789550781,
+      "sha256": "567a3faf38f2869595cf444388a1faffc9ea1d63039a5a42661e89770357e346",
+      "shape": [
+        32
+      ]
+    },
+    "ua": {
+      "dtype": "<f4",
+      "finite_values": 23840,
+      "masked_values": 0,
+      "maximum": 2.8854081630706787,
+      "minimum": -2.4844000339508057,
+      "sha256": "8a0d205668dce5fe71564779b72885ac32fa5ae284d1ba9261e64016f8199d4c",
+      "shape": [
+        745,
+        32
+      ]
+    },
+    "va": {
+      "dtype": "<f4",
+      "finite_values": 23840,
+      "masked_values": 0,
+      "maximum": 2.537229537963867,
+      "minimum": -2.867825746536255,
+      "sha256": "81a714d727f1aaacd0a3311666754e5641a7697593a297a3044d6c660ce96769",
+      "shape": [
+        745,
+        32
+      ]
+    },
+    "zeta": {
+      "dtype": "<f4",
+      "finite_values": 23840,
+      "masked_values": 0,
+      "maximum": 1.3682199716567993,
+      "minimum": -1.0508882999420166,
+      "sha256": "9c34624a2b3ffc1f14913a06f6e69caee4cb2927c4dfaae22a3a108ef62b599f",
+      "shape": [
+        745,
+        32
+      ]
+    }
+  },
+  "dimensions": {
+    "DateStrLen": {
+      "length": 26,
+      "unlimited": false
+    },
+    "four": {
+      "length": 4,
+      "unlimited": false
+    },
+    "maxelem": {
+      "length": 11,
+      "unlimited": false
+    },
+    "maxnode": {
+      "length": 13,
+      "unlimited": false
+    },
+    "nele": {
+      "length": 144860,
+      "unlimited": false
+    },
+    "node": {
+      "length": 75160,
+      "unlimited": false
+    },
+    "siglay": {
+      "length": 10,
+      "unlimited": false
+    },
+    "siglev": {
+      "length": 11,
+      "unlimited": false
+    },
+    "three": {
+      "length": 3,
+      "unlimited": false
+    },
+    "time": {
+      "length": 745,
+      "unlimited": true
+    }
+  },
+  "fixture": {
+    "format": "NETCDF3_64BIT_OFFSET",
+    "full_file_sha256": null,
+    "modified_time_ns": 1787814523648306699,
+    "modified_utc": "2026-08-27T07:08:43.648307+00:00",
+    "path_from_repository": "../projects/fvcom/claude_scratchpad/baroclinic_vikc1701/run/frs2f_0001.nc",
+    "schema_metadata_sha256": "461eb7b45603a244dd72ba0f6d651f2549d17f7b1f359a7aa8e2347bf4f88add",
+    "size_bytes": 25778391080
+  },
+  "global_attributes": {
+    "Tidal_Forcing": "Tidal Forcing Time Series Title: EOT20 tides + NWS-reanalysis subtidal (>40h) anomaly at 307 OBC nodes, 2017-12-01..2018-03-03",
+    "source": "FVCOM_5.1",
+    "title": "FAROE BAROCLINIC VIKC1701 - tides+surge+atm+heating + NWS T/S, 2017-12-26..2018-"
+  },
+  "schema_version": 1,
+  "time": {
+    "analysis_source": "Itime + Itime2 / 86400000",
+    "exact_time_sha256": "d93da1d6da28fd44ff4405b1fd46ccfe007de78fc61ce17b5140f85e536e1a3a",
+    "first_mjd": 58113.0,
+    "float32_time_interval_seconds": [
+      3375.0,
+      3712.5
+    ],
+    "last_mjd": 58144.0,
+    "maximum_interval_seconds": 3600.000000419095,
+    "minimum_interval_seconds": 3599.9999997904524,
+    "nominal_interval_seconds": 3600.0,
+    "raw_time_sha256": "08f542c235db550b617b2b82c4c20c95887db8a701ba98ebc3d677a6ec7f0239",
+    "samples": 745,
+    "units": "days since 1858-11-17 00:00:00",
+    "utide_detects_float32_time_as_equally_spaced": false,
+    "utide_detects_reconstructed_time_as_equally_spaced": true
+  },
+  "variables": {
+    "Itime": {
+      "attributes": {
+        "units": "days since 1858-11-17 00:00:00"
+      },
+      "dimensions": [
+        "time"
+      ],
+      "dtype": "<i4",
+      "shape": [
+        745
+      ]
+    },
+    "Itime2": {
+      "attributes": {
+        "units": "msec since 00:00:00"
+      },
+      "dimensions": [
+        "time"
+      ],
+      "dtype": "<i4",
+      "shape": [
+        745
+      ]
+    },
+    "h": {
+      "attributes": {
+        "coordinates": "lat lon",
+        "long_name": "Bathymetry",
+        "positive": "down",
+        "standard_name": "sea_floor_depth_below_geoid",
+        "units": "m"
+      },
+      "dimensions": [
+        "node"
+      ],
+      "dtype": "<f4",
+      "shape": [
+        75160
+      ]
+    },
+    "lat": {
+      "attributes": {
+        "long_name": "nodal latitude",
+        "standard_name": "latitude",
+        "units": "degrees_north"
+      },
+      "dimensions": [
+        "node"
+      ],
+      "dtype": "<f4",
+      "shape": [
+        75160
+      ]
+    },
+    "latc": {
+      "attributes": {
+        "long_name": "zonal latitude",
+        "standard_name": "latitude",
+        "units": "degrees_north"
+      },
+      "dimensions": [
+        "nele"
+      ],
+      "dtype": "<f4",
+      "shape": [
+        144860
+      ]
+    },
+    "time": {
+      "attributes": {
+        "long_name": "time",
+        "units": "days since 1858-11-17 00:00:00"
+      },
+      "dimensions": [
+        "time"
+      ],
+      "dtype": "<f4",
+      "shape": [
+        745
+      ]
+    },
+    "ua": {
+      "attributes": {
+        "long_name": "Vertically Averaged x-velocity",
+        "units": "meters s-1"
+      },
+      "dimensions": [
+        "time",
+        "nele"
+      ],
+      "dtype": "<f4",
+      "shape": [
+        745,
+        144860
+      ]
+    },
+    "va": {
+      "attributes": {
+        "long_name": "Vertically Averaged y-velocity",
+        "units": "meters s-1"
+      },
+      "dimensions": [
+        "time",
+        "nele"
+      ],
+      "dtype": "<f4",
+      "shape": [
+        745,
+        144860
+      ]
+    },
+    "zeta": {
+      "attributes": {
+        "coordinates": "time lat lon",
+        "location": "node",
+        "long_name": "Water Surface Elevation",
+        "positive": "up",
+        "standard_name": "sea_surface_height_above_geoid",
+        "units": "meters"
+      },
+      "dimensions": [
+        "time",
+        "node"
+      ],
+      "dtype": "<f4",
+      "shape": [
+        745,
+        75160
+      ]
+    }
+  }
+}

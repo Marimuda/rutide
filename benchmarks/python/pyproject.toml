@@ -1,0 +1,30 @@
+[project]
+name = "rutide-python-baseline"
+version = "0.1.0"
+description = "Reproducible Python UTide reference benchmark for RUTide"
+requires-python = "==3.10.*"
+dependencies = [
+  "netcdf4==1.7.2",
+  "numpy==2.2.6",
+  "scipy==1.13.1",
+  "threadpoolctl==3.5.0",
+]
+
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+  "ruff==0.16.5",
+]
+
+[tool.setuptools.packages.find]
+include = ["rutide_baseline*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]
