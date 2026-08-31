@@ -20,6 +20,15 @@ uv run --project benchmarks/python --locked \
   --workload smoke \
   --profile full-compatible \
   --repetitions 5
+
+# Depth-averaged current ellipses, fixed five-constituent parity profile.
+uv run --project benchmarks/python --locked \
+  python -m rutide_baseline \
+  --field vector \
+  --workload vector-full \
+  --profile fixed-constituents \
+  --mode multiprocessing --workers 32 --chunk-size 32 \
+  --repetitions 5
 ```
 
 Run these commands from the repository root. Generated run manifests are written
@@ -36,11 +45,24 @@ as the analysis time vector.
 - `correctness`: the 32 scalar nodes frozen in the fixture manifest;
 - `scaling`: a deterministic prefix selected with `--series-count`; and
 - `scalar-full`: all elevation nodes.
+- `vector-full`: all depth-averaged current elements when `--field vector` is
+  selected.
 
 `canonical` executes the one-dimensional Python UTide API serially.
 `multiprocessing` uses a Linux `fork` process pool and limits BLAS threads in each
 worker. Both modes digest the same canonical result schema, allowing their outputs
 to be compared without storing every coefficient in raw benchmark artifacts.
+Vector mode reads `ua(time, nele)`, `va(time, nele)`, and `latc(nele)`, applies a
+joint finite-value mask, and digests the ellipse parameters returned by the same
+pinned oracle.
+
+Compare a RUTide vector output with the oracle using:
+
+```console
+uv run --project benchmarks/python --locked \
+  python -m rutide_baseline.compare_vector \
+  --rust-output benchmark-results/rust-vector-correctness-32.nc
+```
 
 The `fixed-raw` solver profile is the first Rust parity target. It fits M2, S2,
 N2, K1, and O1 with ordinary least squares, a mean and trend, raw phase, no nodal

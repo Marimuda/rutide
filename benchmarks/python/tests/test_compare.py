@@ -12,6 +12,7 @@ from rutide_baseline.compare import (
     circular_phase_error,
     phase_tolerance_degrees,
 )
+from rutide_baseline.compare_vector import ellipse_component_coefficients
 
 
 class ComparisonUtilitiesTests(unittest.TestCase):
@@ -50,6 +51,15 @@ class ComparisonUtilitiesTests(unittest.TestCase):
             _reconstruction_names("diagnostics", None, 8.0, 500.0, coefficient),
             ["M2"],
         )
+
+    def test_vector_ellipse_conversion_recovers_component_coefficients(self) -> None:
+        coefficients = ellipse_component_coefficients(
+            np.array([2.0]),
+            np.array([0.5]),
+            np.array([0.0]),
+            np.array([0.0]),
+        )
+        np.testing.assert_allclose(coefficients, [[2.0, 0.0, 0.0, 0.5]], atol=1e-15)
 
 
 if __name__ == "__main__":

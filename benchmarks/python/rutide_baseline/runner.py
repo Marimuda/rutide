@@ -144,6 +144,40 @@ def _coefficient_summary(
     return summary
 
 
+def _vector_coefficient_summary(
+    coefficient: Any,
+    spatial_index: int,
+    latitude: float,
+    valid_observations: int,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "spatial_index": spatial_index,
+        "latitude_degrees_north": latitude,
+        "valid_observations": valid_observations,
+        "constituents": [str(value) for value in coefficient.name.tolist()],
+        "frequency_cph": _json_numbers(coefficient.aux.frq),
+        "semi_major": _json_numbers(coefficient.Lsmaj),
+        "semi_minor": _json_numbers(coefficient.Lsmin),
+        "inclination_degrees": _json_numbers(coefficient.theta),
+        "phase_degrees": _json_numbers(coefficient.g),
+        "eastward_mean": _json_number(coefficient.umean),
+        "northward_mean": _json_number(coefficient.vmean),
+        "eastward_slope_per_day": _json_number(coefficient.uslope),
+        "northward_slope_per_day": _json_number(coefficient.vslope),
+    }
+    for output_name, coefficient_name in (
+        ("semi_major_ci", "Lsmaj_ci"),
+        ("semi_minor_ci", "Lsmin_ci"),
+        ("inclination_ci_degrees", "theta_ci"),
+        ("phase_ci_degrees", "g_ci"),
+        ("percent_energy", "PE"),
+        ("signal_to_noise", "SNR"),
+    ):
+        if coefficient_name in coefficient:
+            summary[output_name] = _json_numbers(coefficient[coefficient_name])
+    return summary
+
+
 def _summary_digest(summary: dict[str, Any]) -> str:
     payload = json.dumps(
         summary,
@@ -165,21 +199,39 @@ def aggregate_result_digest(results: list[tuple[int, str, Any]]) -> str:
 
 def _solve_position(position: int, state: dict[str, Any]) -> tuple[int, str, Any]:
     oracle = state["oracle"]
-    observations = state["observations"][:, position]
     spatial_index = int(state["indices"][position])
     latitude = float(state["latitudes"][position])
-    coefficient = oracle.solve(
-        state["time"],
-        observations,
-        lat=latitude,
-        **state["options"],
-    )
-    summary = _coefficient_summary(
-        coefficient,
-        spatial_index,
-        latitude,
-        int(np.isfinite(observations).sum()),
-    )
+    if state["field"] == "vector":
+        eastward = state["eastward"][:, position]
+        northward = state["northward"][:, position]
+        valid = np.isfinite(eastward) & np.isfinite(northward)
+        coefficient = oracle.solve(
+            state["time"],
+            np.where(valid, eastward, np.nan),
+            np.where(valid, northward, np.nan),
+            lat=latitude,
+            **state["options"],
+        )
+        summary = _vector_coefficient_summary(
+            coefficient,
+            spatial_index,
+            latitude,
+            int(valid.sum()),
+        )
+    else:
+        observations = state["observations"][:, position]
+        coefficient = oracle.solve(
+            state["time"],
+            observations,
+            lat=latitude,
+            **state["options"],
+        )
+        summary = _coefficient_summary(
+            coefficient,
+            spatial_index,
+            latitude,
+            int(np.isfinite(observations).sum()),
+        )
     retained = summary if spatial_index in state["retained_indices"] else None
     return spatial_index, _summary_digest(summary), retained
 
@@ -239,25 +291,31 @@ def _verify_fixture_identity(path: Path, manifest: dict[str, Any]) -> None:
 
 
 def _workload_indices(
+    field: str,
     workload: str,
     series_count: int | None,
     manifest: dict[str, Any],
 ) -> np.ndarray:
-    node_count = int(manifest["dimensions"]["node"]["length"])
-    correctness = manifest["correctness_selection"]["node_indices"]
+    dimension = "nele" if field == "vector" else "node"
+    index_key = "element_indices" if field == "vector" else "node_indices"
+    spatial_count = int(manifest["dimensions"][dimension]["length"])
+    correctness = manifest["correctness_selection"][index_key]
     if workload == "smoke":
         return np.asarray(correctness[:1], dtype=np.int64)
     if workload == "correctness":
         return np.asarray(correctness, dtype=np.int64)
-    if workload == "scalar-full":
+    if workload in {"scalar-full", "vector-full"}:
+        expected_field = "vector" if workload == "vector-full" else "scalar"
+        if field != expected_field:
+            raise ValueError(f"{workload} requires --field {expected_field}")
         if series_count is not None:
-            raise ValueError("--series-count is incompatible with scalar-full")
-        return np.arange(node_count, dtype=np.int64)
+            raise ValueError(f"--series-count is incompatible with {workload}")
+        return np.arange(spatial_count, dtype=np.int64)
     if workload == "scaling":
         if series_count is None:
             raise ValueError("scaling workload requires --series-count")
-        if not 0 < series_count <= node_count:
-            raise ValueError("--series-count is outside the node dimension")
+        if not 0 < series_count <= spatial_count:
+            raise ValueError(f"--series-count is outside the {dimension} dimension")
         return np.arange(series_count, dtype=np.int64)
     raise ValueError(f"unknown workload: {workload}")
 
@@ -275,6 +333,30 @@ def _load_scalar_inputs(path: Path, indices: np.ndarray) -> dict[str, Any]:
         "latitudes": latitudes,
         "observations": observations,
         "source_observations_sha256": array_digest(values),
+        "indices": indices,
+    }
+
+
+def _load_vector_inputs(path: Path, indices: np.ndarray) -> dict[str, Any]:
+    prefix_selection = np.array_equal(indices, np.arange(len(indices), dtype=np.int64))
+    selector: slice | np.ndarray = slice(0, len(indices)) if prefix_selection else indices
+    with netCDF4.Dataset(path, mode="r") as dataset:
+        exact_time = reconstruct_mjd(dataset.variables["Itime"][:], dataset.variables["Itime2"][:])
+        latitudes = np.asarray(dataset.variables["latc"][selector], dtype=np.float64)
+        eastward_values = np.ma.asarray(dataset.variables["ua"][:, selector])
+        northward_values = np.ma.asarray(dataset.variables["va"][:, selector])
+    eastward = np.asarray(eastward_values.filled(np.nan), dtype=np.float64)
+    northward = np.asarray(northward_values.filled(np.nan), dtype=np.float64)
+    valid = np.isfinite(eastward) & np.isfinite(northward)
+    eastward[~valid] = np.nan
+    northward[~valid] = np.nan
+    return {
+        "time": np.asarray(exact_time, dtype=np.float64),
+        "latitudes": latitudes,
+        "eastward": eastward,
+        "northward": northward,
+        "source_eastward_sha256": array_digest(eastward_values),
+        "source_northward_sha256": array_digest(northward_values),
         "indices": indices,
     }
 
@@ -334,22 +416,36 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     fixture = args.fixture.resolve(strict=True)
     manifest = _load_manifest(args.manifest)
     _verify_fixture_identity(fixture, manifest)
-    indices = _workload_indices(args.workload, args.series_count, manifest)
+    indices = _workload_indices(args.field, args.workload, args.series_count, manifest)
 
     load_start = time.perf_counter()
-    inputs = _load_scalar_inputs(fixture, indices)
+    inputs = (
+        _load_vector_inputs(fixture, indices)
+        if args.field == "vector"
+        else _load_scalar_inputs(fixture, indices)
+    )
     load_seconds = time.perf_counter() - load_start
     if array_digest(inputs["time"]) != manifest["time"]["exact_time_sha256"]:
         raise RuntimeError("reconstructed fixture time differs from its manifest")
-    if (
-        args.workload == "correctness"
-        and inputs["source_observations_sha256"]
-        != manifest["correctness_selection"]["zeta"]["sha256"]
-    ):
-        raise RuntimeError("correctness observations differ from the fixture manifest")
+    if args.workload == "correctness":
+        if args.field == "vector":
+            for component, source_key in (("ua", "eastward"), ("va", "northward")):
+                if (
+                    inputs[f"source_{source_key}_sha256"]
+                    != manifest["correctness_selection"][component]["sha256"]
+                ):
+                    raise RuntimeError(
+                        f"correctness {component} observations differ from the fixture manifest"
+                    )
+        elif (
+            inputs["source_observations_sha256"]
+            != manifest["correctness_selection"]["zeta"]["sha256"]
+        ):
+            raise RuntimeError("correctness observations differ from the fixture manifest")
     retained_indices = {int(index) for index in indices[: min(3, len(indices))]}
     state = {
         **inputs,
+        "field": args.field,
         "oracle": oracle,
         "options": _profile_options(args.profile),
         "retained_indices": retained_indices,
@@ -359,9 +455,13 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         warmup_state = {
             **state,
             "latitudes": state["latitudes"][:1],
-            "observations": state["observations"][:, :1],
             "indices": state["indices"][:1],
         }
+        if args.field == "vector":
+            warmup_state["eastward"] = state["eastward"][:, :1]
+            warmup_state["northward"] = state["northward"][:, :1]
+        else:
+            warmup_state["observations"] = state["observations"][:, :1]
         _solve_once(warmup_state, "canonical", 1, 1, args.blas_threads)
 
     measurements = []
@@ -398,6 +498,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "layer": "solve-only",
         "configuration": {
             "mode": args.mode,
+            "field": args.field,
             "profile": args.profile,
             "workload": args.workload,
             "series": len(indices),
@@ -412,10 +513,21 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "path": str(fixture),
             "manifest": str(args.manifest.resolve()),
             "time_sha256": array_digest(state["time"]),
-            "source_observations_sha256": state["source_observations_sha256"],
-            "observations_sha256": array_digest(state["observations"]),
             "indices_sha256": array_digest(state["indices"]),
             "load_seconds": load_seconds,
+            **(
+                {
+                    "source_eastward_sha256": state["source_eastward_sha256"],
+                    "source_northward_sha256": state["source_northward_sha256"],
+                    "eastward_sha256": array_digest(state["eastward"]),
+                    "northward_sha256": array_digest(state["northward"]),
+                }
+                if args.field == "vector"
+                else {
+                    "source_observations_sha256": state["source_observations_sha256"],
+                    "observations_sha256": array_digest(state["observations"]),
+                }
+            ),
         },
         "environment": _environment_manifest(oracle),
         "measurements": measurements,
@@ -429,6 +541,11 @@ def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     """Parse benchmark-runner command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--field",
+        choices=("scalar", "vector"),
+        default="scalar",
+    )
+    parser.add_argument(
         "--mode",
         choices=("canonical", "multiprocessing"),
         default="canonical",
@@ -440,7 +557,7 @@ def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--workload",
-        choices=("smoke", "correctness", "scaling", "scalar-full"),
+        choices=("smoke", "correctness", "scaling", "scalar-full", "vector-full"),
         default="smoke",
     )
     parser.add_argument("--series-count", type=int)
