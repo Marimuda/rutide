@@ -1,4 +1,4 @@
-//! Exact Greenwich phase and nodal corrections for fixed constituents.
+//! Exact Greenwich phase and nodal corrections for catalog constituents.
 
 use std::f64::consts::TAU;
 
@@ -7,7 +7,9 @@ use rayon::prelude::*;
 
 use crate::{
     AnalysisError, Constituent, FixedRawOls, ScalarSolution, TidalConstituent,
-    astronomy::at_modified_julian_day, catalog::Metadata, scalar::validate_time,
+    astronomy::at_modified_julian_day,
+    catalog::{CONSTITUENT_COUNT, Metadata},
+    scalar::validate_time,
 };
 
 /// A reusable fixed-constituent OLS model with exact Greenwich and nodal terms.
@@ -198,8 +200,21 @@ impl GreenwichNodalBatch {
 struct CorrectionBasis {
     tidal_constituents: Vec<TidalConstituent>,
     scalar_constituents: Vec<Constituent>,
+    recipes: Vec<CorrectionRecipe>,
     time_terms: Vec<TimeTerms>,
     time_span_days: f64,
+}
+
+#[derive(Debug)]
+enum CorrectionRecipe {
+    Base { base_index: usize },
+    Shallow { terms: Vec<ShallowRecipeTerm> },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ShallowRecipeTerm {
+    base_index: usize,
+    coefficient: f64,
 }
 
 impl CorrectionBasis {
@@ -210,33 +225,60 @@ impl CorrectionBasis {
         validate_tidal_constituents(constituents)?;
         let (reference_time, time_span_days) =
             validate_time(modified_julian_days, constituents.len())?;
+        let (base_constituents, recipes) = dependency_recipes(constituents);
         let reference_astronomy = at_modified_julian_day(reference_time);
-        let scalar_constituents = constituents
+        let base_frequencies = base_constituents
             .iter()
             .copied()
             .map(|constituent| {
                 let metadata = constituent.metadata();
-                let frequency_cph =
-                    dot6(metadata.doodson, reference_astronomy.cycles_per_day) / 24.0;
-                Constituent::new(constituent.name(), frequency_cph)
+                dot6(
+                    metadata
+                        .doodson
+                        .expect("base catalog constituent has Doodson multipliers"),
+                    reference_astronomy.cycles_per_day,
+                ) / 24.0
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let scalar_constituents = constituents
+            .iter()
+            .copied()
+            .zip(&recipes)
+            .map(|(constituent, recipe)| {
+                Constituent::new(
+                    constituent.name(),
+                    recipe.combine_frequency(&base_frequencies),
+                )
+            })
+            .collect::<Vec<_>>();
+        validate_derived_frequencies(&scalar_constituents)?;
         let time_terms = modified_julian_days
             .iter()
             .copied()
             .map(|time| {
                 let astronomy = at_modified_julian_day(time);
-                let greenwich_phase = constituents
+                let base_greenwich_phase = base_constituents
                     .iter()
                     .copied()
                     .map(|constituent| {
                         let metadata = constituent.metadata();
-                        (dot6(metadata.doodson, astronomy.cycles) + metadata.semi) % 1.0
+                        (dot6(
+                            metadata
+                                .doodson
+                                .expect("base catalog constituent has Doodson multipliers"),
+                            astronomy.cycles,
+                        ) + metadata
+                            .semi
+                            .expect("base catalog constituent has a phase offset"))
+                            % 1.0
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
                 TimeTerms {
-                    greenwich_phase,
-                    nodal_terms: constituents
+                    greenwich_phase: recipes
+                        .iter()
+                        .map(|recipe| recipe.combine_phase(&base_greenwich_phase))
+                        .collect(),
+                    base_nodal_terms: base_constituents
                         .iter()
                         .copied()
                         .map(|constituent| {
@@ -250,6 +292,7 @@ impl CorrectionBasis {
         Ok(Self {
             tidal_constituents: constituents.to_vec(),
             scalar_constituents,
+            recipes,
             time_terms,
             time_span_days,
         })
@@ -261,9 +304,15 @@ impl CorrectionBasis {
         let mut design = Mat::zeros(self.time_terms.len(), harmonic_columns + 2);
         let latitude_factors = latitude_factors(latitude);
         for (time_index, terms) in self.time_terms.iter().enumerate() {
+            let base_corrections = terms
+                .base_nodal_terms
+                .iter()
+                .copied()
+                .map(|terms| nodal_correction(terms, latitude_factors))
+                .collect::<Vec<_>>();
             for constituent_index in 0..self.tidal_constituents.len() {
                 let (nodal_amplitude, nodal_phase) =
-                    nodal_correction(terms.nodal_terms[constituent_index], latitude_factors);
+                    self.recipes[constituent_index].combine_nodal(&base_corrections);
                 let angle = TAU * (nodal_phase + terms.greenwich_phase[constituent_index]);
                 design[(time_index, constituent_index * 2)] = nodal_amplitude * angle.cos();
                 design[(time_index, constituent_index * 2 + 1)] = nodal_amplitude * angle.sin();
@@ -283,8 +332,109 @@ impl CorrectionBasis {
 #[derive(Debug)]
 struct TimeTerms {
     greenwich_phase: Vec<f64>,
-    nodal_terms: Vec<NodalTerms>,
+    base_nodal_terms: Vec<NodalTerms>,
     normalized_trend: f64,
+}
+
+impl CorrectionRecipe {
+    fn combine_frequency(&self, base_frequencies: &[f64]) -> f64 {
+        match self {
+            Self::Base { base_index } => base_frequencies[*base_index],
+            Self::Shallow { terms } => terms
+                .iter()
+                .map(|term| term.coefficient * base_frequencies[term.base_index])
+                .sum(),
+        }
+    }
+
+    fn combine_phase(&self, base_phases: &[f64]) -> f64 {
+        match self {
+            Self::Base { base_index } => base_phases[*base_index],
+            Self::Shallow { terms } => terms
+                .iter()
+                .map(|term| term.coefficient * base_phases[term.base_index])
+                .sum(),
+        }
+    }
+
+    fn combine_nodal(&self, base_corrections: &[(f64, f64)]) -> (f64, f64) {
+        match self {
+            Self::Base { base_index } => base_corrections[*base_index],
+            Self::Shallow { terms } => {
+                let mut amplitude = 1.0;
+                let mut phase = 0.0;
+                for term in terms {
+                    let (parent_amplitude, parent_phase) = base_corrections[term.base_index];
+                    amplitude *= parent_amplitude.powf(term.coefficient.abs());
+                    phase += parent_phase * term.coefficient;
+                }
+                (amplitude, phase)
+            }
+        }
+    }
+}
+
+fn dependency_recipes(
+    constituents: &[TidalConstituent],
+) -> (Vec<TidalConstituent>, Vec<CorrectionRecipe>) {
+    let mut needed = [false; CONSTITUENT_COUNT];
+    for constituent in constituents.iter().copied() {
+        let metadata = constituent.metadata();
+        if metadata.shallow_terms.is_empty() {
+            needed[constituent.index()] = true;
+        } else {
+            for term in metadata.shallow_terms {
+                needed[term.parent_index] = true;
+            }
+        }
+    }
+
+    let base_constituents = TidalConstituent::all()
+        .filter(|constituent| needed[constituent.index()])
+        .collect::<Vec<_>>();
+    let mut base_positions = [usize::MAX; CONSTITUENT_COUNT];
+    for (position, constituent) in base_constituents.iter().copied().enumerate() {
+        base_positions[constituent.index()] = position;
+    }
+    let recipes = constituents
+        .iter()
+        .copied()
+        .map(|constituent| {
+            let metadata = constituent.metadata();
+            if metadata.shallow_terms.is_empty() {
+                CorrectionRecipe::Base {
+                    base_index: base_positions[constituent.index()],
+                }
+            } else {
+                CorrectionRecipe::Shallow {
+                    terms: metadata
+                        .shallow_terms
+                        .iter()
+                        .map(|term| ShallowRecipeTerm {
+                            base_index: base_positions[term.parent_index],
+                            coefficient: term.coefficient,
+                        })
+                        .collect(),
+                }
+            }
+        })
+        .collect();
+    (base_constituents, recipes)
+}
+
+fn validate_derived_frequencies(constituents: &[Constituent]) -> Result<(), AnalysisError> {
+    for (index, constituent) in constituents.iter().enumerate() {
+        if !constituent.frequency_cph.is_finite() || constituent.frequency_cph <= 0.0 {
+            return Err(AnalysisError::InvalidFrequency { index });
+        }
+        if constituents[..index]
+            .iter()
+            .any(|earlier| earlier.frequency_cph.to_bits() == constituent.frequency_cph.to_bits())
+        {
+            return Err(AnalysisError::DuplicateFrequency { index });
+        }
+    }
+    Ok(())
 }
 
 fn validate_latitude(latitude: f64) -> Result<(), AnalysisError> {
@@ -360,13 +510,13 @@ fn nodal_correction(terms: NodalTerms, latitude_factors: [f64; 3]) -> (f64, f64)
     (real.hypot(imaginary), imaginary.atan2(real) / TAU)
 }
 
-fn dot6(left: [f64; 6], right: [f64; 6]) -> f64 {
-    left[0] * right[0]
-        + left[1] * right[1]
-        + left[2] * right[2]
-        + left[3] * right[3]
-        + left[4] * right[4]
-        + left[5] * right[5]
+fn dot6(left: [i8; 6], right: [f64; 6]) -> f64 {
+    f64::from(left[0]) * right[0]
+        + f64::from(left[1]) * right[1]
+        + f64::from(left[2]) * right[2]
+        + f64::from(left[3]) * right[3]
+        + f64::from(left[4]) * right[4]
+        + f64::from(left[5]) * right[5]
 }
 
 #[cfg(test)]

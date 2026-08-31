@@ -10,7 +10,10 @@ mod corrected;
 mod error;
 mod scalar;
 
-pub use catalog::TidalConstituent;
+pub use catalog::{
+    CATALOG_ORACLE_REVISION, CATALOG_SOURCE_SHA256, CONSTITUENT_COUNT, TidalConstituent,
+    UnknownTidalConstituent,
+};
 pub use corrected::{GreenwichNodalBatch, GreenwichNodalOls};
 pub use error::AnalysisError;
 pub use scalar::{Constituent, FixedRawOls, ScalarSolution};
