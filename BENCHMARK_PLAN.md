@@ -336,6 +336,9 @@ The first coverage sequence is complete and retained as separate Git increments:
 6. exact complete-series reconstruction with explicit constituent, PE, and SNR
    filtering, including held-out-time oracle tests.
 
-The next coverage design work is missing-value grouping followed by scalar/vector
-current support. Each expansion remains subject to the same parity and resource
-gates above.
+Missing-value grouping and scalar/vector current support are now complete. Scalar
+and vector fits use per-series valid-time masks, vector fits use the joint
+component mask, and equidistant gaps retain Python-compatible colored FFT
+behavior. Truly irregular colored spectra are rejected explicitly until a
+Lomb–Scargle path is implemented. Each further expansion remains subject to the
+same parity and resource gates above.

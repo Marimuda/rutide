@@ -21,6 +21,12 @@ The subsequent [memory optimization](benchmarks/results/memory-optimization-2026
 reduced 64-worker peak RSS from 5.40 GiB to 0.690 GiB and whole-process wall time
 to 1.51 seconds without changing either correctness digest.
 
+The completed depth-averaged vector path also clears the gate: its
+[whole-field snapshot](benchmarks/results/fvcom-vector-application-2026-09-01.md)
+reports a 5.39-second Rust median versus 126.97 seconds for the 32-process Python
+UTide baseline across all 144,860 current elements, a 23.6x process-boundary
+speedup with Python-compatible ellipse and colored-CI correctness.
+
 The implemented scalar kernels now cover fixed-constituent OLS with mean and
 trend in both raw-phase mode and exact Greenwich/nodal mode. The exact-correction
 catalog contains all 146 constituents, 162 satellite corrections, and 251
