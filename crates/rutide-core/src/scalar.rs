@@ -45,9 +45,42 @@ pub enum LinearConfidence {
     Colored,
 }
 
+#[derive(Clone, Copy)]
+enum ConfidenceSpec<'noise> {
+    None,
+    Shared(LinearConfidence),
+    BySeries(&'noise [LinearConfidence]),
+}
+
+impl ConfidenceSpec<'_> {
+    fn is_enabled(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    fn uses_colored(self) -> bool {
+        match self {
+            Self::None => false,
+            Self::Shared(noise) => noise == LinearConfidence::Colored,
+            Self::BySeries(noise) => noise.contains(&LinearConfidence::Colored),
+        }
+    }
+
+    fn for_series(self, series: usize) -> Option<LinearConfidence> {
+        match self {
+            Self::None => None,
+            Self::Shared(noise) => Some(noise),
+            Self::BySeries(noise) => noise.get(series).copied(),
+        }
+    }
+}
+
 /// Scalar coefficients returned by a fixed raw-phase OLS fit.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScalarSolution {
+    /// Cosine coefficient for each prepared constituent.
+    pub cosine_coefficient: Vec<f64>,
+    /// Sine coefficient for each prepared constituent.
+    pub sine_coefficient: Vec<f64>,
     /// Amplitude for each prepared constituent, in input order.
     pub amplitude: Vec<f64>,
     /// Raw phase in degrees in the half-open range `[0, 360)`.
@@ -60,6 +93,10 @@ pub struct ScalarSolution {
     pub phase_ci_degrees: Option<Vec<f64>>,
     /// Signal-to-noise ratio derived from amplitude and amplitude CI.
     pub signal_to_noise: Option<Vec<f64>>,
+    /// Estimated cosine-coefficient variance used by linear confidence intervals.
+    pub cosine_coefficient_variance: Option<Vec<f64>>,
+    /// Estimated sine-coefficient variance used by linear confidence intervals.
+    pub sine_coefficient_variance: Option<Vec<f64>>,
     /// Fitted constant offset.
     pub mean: f64,
     /// Fitted linear trend per day.
@@ -242,7 +279,7 @@ impl FixedRawOls {
         observations: &[f64],
         series_count: usize,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_many_time_major_impl(observations, series_count, None)
+        self.solve_many_time_major_impl(observations, series_count, ConfidenceSpec::None)
     }
 
     /// Fit multiple series and calculate linearized 95% confidence intervals.
@@ -257,19 +294,31 @@ impl FixedRawOls {
         series_count: usize,
         noise: LinearConfidence,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_many_time_major_impl(observations, series_count, Some(noise))
+        self.solve_many_time_major_impl(observations, series_count, ConfidenceSpec::Shared(noise))
+    }
+
+    pub(crate) fn solve_many_time_major_with_linear_confidence_by_series(
+        &self,
+        observations: &[f64],
+        noise_by_series: &[LinearConfidence],
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_many_time_major_impl(
+            observations,
+            noise_by_series.len(),
+            ConfidenceSpec::BySeries(noise_by_series),
+        )
     }
 
     fn solve_many_time_major_impl(
         &self,
         observations: &[f64],
         series_count: usize,
-        confidence: Option<LinearConfidence>,
+        confidence: ConfidenceSpec<'_>,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         if series_count == 0 {
             return Err(AnalysisError::EmptySeries);
         }
-        if confidence == Some(LinearConfidence::Colored) && self.sample_interval_hours.is_none() {
+        if confidence.uses_colored() && self.sample_interval_hours.is_none() {
             return Err(AnalysisError::UnevenTimeForColoredConfidence);
         }
         let expected = self.time_count.saturating_mul(series_count);
@@ -293,15 +342,21 @@ impl FixedRawOls {
         });
         let coefficients = self.decomposition.solve_lstsq(right_hand_sides.as_ref());
         let harmonic_columns = self.constituents.len() * 2;
-        let variance_weights = confidence.map(|_| self.linear_variance_weights());
+        let variance_weights = confidence
+            .is_enabled()
+            .then(|| self.linear_variance_weights());
 
         Ok((0..series_count)
             .map(|series| {
                 let mut amplitude = Vec::with_capacity(self.constituents.len());
                 let mut phase_degrees = Vec::with_capacity(self.constituents.len());
+                let mut cosine_coefficient = Vec::with_capacity(self.constituents.len());
+                let mut sine_coefficient = Vec::with_capacity(self.constituents.len());
                 for constituent in 0..self.constituents.len() {
                     let cosine = coefficients[(constituent * 2, series)];
                     let sine = coefficients[(constituent * 2 + 1, series)];
+                    cosine_coefficient.push(cosine);
+                    sine_coefficient.push(sine);
                     amplitude.push(cosine.hypot(sine));
                     phase_degrees.push(sine.atan2(cosine).to_degrees().rem_euclid(360.0));
                 }
@@ -310,40 +365,49 @@ impl FixedRawOls {
                     .iter()
                     .map(|value| 100.0 * (value * value) / total_energy)
                     .collect();
-                let (amplitude_ci, phase_ci_degrees, signal_to_noise) =
-                    if let (Some(noise), Some(variance_weights)) =
-                        (confidence, variance_weights.as_ref())
-                    {
-                        let intervals = self.linear_confidence_intervals(
-                            observations,
-                            series_count,
-                            series,
-                            coefficients.as_ref(),
-                            variance_weights,
-                            noise,
-                        );
-                        let signal_to_noise = amplitude
-                            .iter()
-                            .zip(&intervals.amplitude)
-                            .map(|(amplitude, interval)| {
-                                amplitude.powi(2) / (interval / 1.96).powi(2)
-                            })
-                            .collect();
-                        (
-                            Some(intervals.amplitude),
-                            Some(intervals.phase_degrees),
-                            Some(signal_to_noise),
-                        )
-                    } else {
-                        (None, None, None)
-                    };
+                let (
+                    amplitude_ci,
+                    phase_ci_degrees,
+                    signal_to_noise,
+                    cosine_coefficient_variance,
+                    sine_coefficient_variance,
+                ) = if let (Some(noise), Some(variance_weights)) =
+                    (confidence.for_series(series), variance_weights.as_ref())
+                {
+                    let intervals = self.linear_confidence_intervals(
+                        observations,
+                        series_count,
+                        series,
+                        coefficients.as_ref(),
+                        variance_weights,
+                        noise,
+                    );
+                    let signal_to_noise = amplitude
+                        .iter()
+                        .zip(&intervals.amplitude)
+                        .map(|(amplitude, interval)| amplitude.powi(2) / (interval / 1.96).powi(2))
+                        .collect();
+                    (
+                        Some(intervals.amplitude),
+                        Some(intervals.phase_degrees),
+                        Some(signal_to_noise),
+                        Some(intervals.cosine_variance),
+                        Some(intervals.sine_variance),
+                    )
+                } else {
+                    (None, None, None, None, None)
+                };
                 ScalarSolution {
+                    cosine_coefficient,
+                    sine_coefficient,
                     amplitude,
                     phase_degrees,
                     percent_energy,
                     amplitude_ci,
                     phase_ci_degrees,
                     signal_to_noise,
+                    cosine_coefficient_variance,
+                    sine_coefficient_variance,
                     mean: coefficients[(harmonic_columns, series)],
                     slope_per_day: coefficients[(harmonic_columns + 1, series)]
                         / self.time_span_days,
@@ -402,6 +466,8 @@ impl FixedRawOls {
         });
         let mut amplitude = Vec::with_capacity(self.constituents.len());
         let mut phase_degrees = Vec::with_capacity(self.constituents.len());
+        let mut cosine_variance_values = Vec::with_capacity(self.constituents.len());
+        let mut sine_variance_values = Vec::with_capacity(self.constituents.len());
         for constituent in 0..self.constituents.len() {
             let cosine = coefficients[(constituent * 2, series)];
             let sine = coefficients[(constituent * 2 + 1, series)];
@@ -428,10 +494,14 @@ impl FixedRawOls {
             .sqrt();
             amplitude.push(1.96 * amplitude_sigma);
             phase_degrees.push(1.96 * phase_sigma_radians * 180.0 / PI);
+            cosine_variance_values.push(cosine_variance);
+            sine_variance_values.push(sine_variance);
         }
         LinearIntervals {
             amplitude,
             phase_degrees,
+            cosine_variance: cosine_variance_values,
+            sine_variance: sine_variance_values,
         }
     }
 
@@ -489,6 +559,8 @@ impl ConfidenceSampling {
 struct LinearIntervals {
     amplitude: Vec<f64>,
     phase_degrees: Vec<f64>,
+    cosine_variance: Vec<f64>,
+    sine_variance: Vec<f64>,
 }
 
 const FREQUENCY_BANDS_CPH: [[f64; 2]; 9] = [

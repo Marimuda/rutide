@@ -10,6 +10,7 @@ mod corrected;
 mod error;
 mod scalar;
 mod selection;
+mod vector;
 
 pub use catalog::{
     CATALOG_ORACLE_REVISION, CATALOG_SOURCE_SHA256, CONSTITUENT_COUNT, TidalConstituent,
@@ -21,6 +22,7 @@ pub use corrected::{
 pub use error::AnalysisError;
 pub use scalar::{Constituent, FixedRawOls, LinearConfidence, ScalarSolution};
 pub use selection::{RayleighSelection, select_constituents_by_rayleigh};
+pub use vector::{VectorReconstruction, VectorSolution};
 
 /// The `RUTide` core crate version used to produce a result.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

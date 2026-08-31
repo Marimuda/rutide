@@ -162,6 +162,27 @@ fn oracle_observations() -> Vec<f64> {
         .collect()
 }
 
+fn synthetic_vector_observations(time: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let reference = time[0].midpoint(time[time.len() - 1]);
+    let mut eastward = Vec::with_capacity(time.len());
+    let mut northward = Vec::with_capacity(time.len());
+    for (index, time) in time.iter().copied().enumerate() {
+        let index = f64::from(u32::try_from(index).expect("fixture index fits u32"));
+        eastward.push(
+            0.15 + 0.0008 * (time - reference)
+                + 0.42 * (index / 11.0).sin()
+                + 0.17 * (index / 37.0).cos()
+                + 0.05 * (index / 3.7).sin(),
+        );
+        northward.push(
+            -0.08 - 0.0003 * (time - reference) + 0.31 * (index / 13.0).cos()
+                - 0.12 * (index / 29.0).sin()
+                + 0.04 * (index / 4.1).cos(),
+        );
+    }
+    (eastward, northward)
+}
+
 fn assert_close(label: &str, actual: f64, expected: f64, tolerance: f64) {
     assert!(
         (actual - expected).abs() <= tolerance,
@@ -460,6 +481,197 @@ fn matches_python_utide_for_gappy_equidistant_scalar_observations() {
         58_128.5,
         0.0,
     );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one oracle test keeps the complete Python vector reference together"
+)]
+fn matches_python_utide_for_vector_ellipse_and_linear_confidence() {
+    let time = oracle_times();
+    let (eastward, northward) = synthetic_vector_observations(&time);
+    let model = GreenwichNodalOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE_DEGREES_NORTH,
+        &CONSTITUENTS,
+    )
+    .expect("valid vector oracle model");
+    let solution = model
+        .solve_vector_with_linear_confidence(&eastward, &northward, LinearConfidence::Colored)
+        .expect("valid vector solution");
+    for (label, actual, expected, tolerance) in [
+        (
+            "semi-major",
+            &solution.semi_major,
+            &[
+                0.002_486_233_839_933_877_7,
+                0.002_666_631_814_593_371,
+                0.001_976_887_831_240_454,
+                0.003_275_660_317_339_441,
+                0.043_164_565_030_656_69,
+            ],
+            3e-12,
+        ),
+        (
+            "semi-minor",
+            &solution.semi_minor,
+            &[
+                0.000_092_720_326_357_076_47,
+                -0.000_777_074_217_725_045,
+                0.001_283_217_988_927_234_3,
+                -0.001_555_730_689_804_322_1,
+                -0.007_662_224_838_614_503,
+            ],
+            3e-12,
+        ),
+        (
+            "inclination",
+            &solution.inclination_degrees,
+            &[
+                22.873_737_196_375_4,
+                15.895_822_755_234_192,
+                45.248_612_515_338_9,
+                160.750_488_449_543_4,
+                84.464_012_966_697_37,
+            ],
+            3e-9,
+        ),
+        (
+            "vector phase",
+            &solution.phase_degrees,
+            &[
+                253.895_020_678_863_92,
+                101.169_510_998_694_63,
+                333.136_727_463_567_07,
+                4.911_679_784_761_191,
+                173.409_132_482_763_14,
+            ],
+            3e-9,
+        ),
+        (
+            "semi-major CI",
+            solution.semi_major_ci.as_ref().expect("major CI"),
+            &[
+                0.030_245_151_900_170_797,
+                0.032_399_581_824_420_73,
+                0.023_184_999_745_889_23,
+                0.034_460_336_365_175_95,
+                0.003_814_729_197_693_577_4,
+            ],
+            1e-9,
+        ),
+        (
+            "semi-minor CI",
+            solution.semi_minor_ci.as_ref().expect("minor CI"),
+            &[
+                0.012_764_231_471_522_686,
+                0.009_221_318_938_658_544,
+                0.023_382_510_755_167_354,
+                0.012_102_614_259_441_032,
+                0.038_311_096_549_943_98,
+            ],
+            1e-9,
+        ),
+        (
+            "inclination CI",
+            solution
+                .inclination_ci_degrees
+                .as_ref()
+                .expect("inclination CI"),
+            &[
+                295.708_730_458_798_1,
+                309.785_271_593_489_14,
+                1_392.701_460_726_081_7,
+                460.086_677_051_758_7,
+                52.592_221_479_106_08,
+            ],
+            1e-6,
+        ),
+        (
+            "vector phase CI",
+            solution.phase_ci_degrees.as_ref().expect("phase CI"),
+            &[
+                698.071_275_281_994_2,
+                762.332_233_985_891_9,
+                1_387.680_485_030_409,
+                791.616_825_599_554_2,
+                10.696_586_935_146_975,
+            ],
+            1e-6,
+        ),
+        (
+            "vector SNR",
+            solution.signal_to_noise.as_ref().expect("SNR"),
+            &[
+                0.022_064_998_050_471_282,
+                0.026_117_339_241_458_662,
+                0.019_680_292_215_999_23,
+                0.037_869_900_296_619_72,
+                4.980_886_894_475_968,
+            ],
+            1e-9,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{label}[{index}]"), *actual, *expected, tolerance);
+        }
+    }
+    assert_close(
+        "eastward mean",
+        solution.eastward_mean,
+        0.163_543_485_854_886_54,
+        3e-12,
+    );
+    assert_close(
+        "northward mean",
+        solution.northward_mean,
+        -0.076_833_155_211_310_57,
+        3e-12,
+    );
+    assert_close(
+        "eastward slope",
+        solution.eastward_slope_per_day,
+        0.000_755_094_997_466_368_3,
+        3e-12,
+    );
+    assert_close(
+        "northward slope",
+        solution.northward_slope_per_day,
+        0.001_988_433_323_868_402_5,
+        3e-12,
+    );
+    let reconstruction = model
+        .reconstruct_vector_modified_julian_days(
+            &[58_113.0, 58_120.25, 58_144.5],
+            &solution,
+            &ReconstructionFilter::All,
+        )
+        .expect("valid vector reconstruction");
+    for (label, actual, expected) in [
+        (
+            "eastward reconstruction",
+            reconstruction.eastward,
+            [
+                0.154_198_324_752_660_13,
+                0.151_328_812_754_194_66,
+                0.179_997_581_693_468_05,
+            ],
+        ),
+        (
+            "northward reconstruction",
+            reconstruction.northward,
+            [
+                -0.069_338_712_966_28,
+                -0.092_497_626_762_27,
+                -0.059_352_174_782_471_005,
+            ],
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{label}[{index}]"), *actual, expected, 3e-12);
+        }
+    }
 }
 
 #[test]

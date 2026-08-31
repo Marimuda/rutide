@@ -7,9 +7,11 @@ use rayon::prelude::*;
 
 use crate::{
     AnalysisError, Constituent, FixedRawOls, LinearConfidence, ScalarSolution, TidalConstituent,
+    VectorReconstruction, VectorSolution,
     astronomy::at_modified_julian_day,
     catalog::{CONSTITUENT_COUNT, Metadata},
     scalar::{ConfidenceSampling, equidistant_sample_interval_hours, validate_time},
+    vector::from_component_solutions,
 };
 
 /// A reusable fixed-constituent OLS model with exact Greenwich and nodal terms.
@@ -140,6 +142,67 @@ impl GreenwichNodalOls {
             .solve_many_time_major_with_linear_confidence(observations, series_count, noise)
     }
 
+    /// Jointly fit one eastward/northward current series.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid component shapes or values.
+    pub fn solve_vector(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+    ) -> Result<VectorSolution, AnalysisError> {
+        self.solve_vector_impl(eastward, northward, None)
+    }
+
+    /// Jointly fit one current series with linearized ellipse confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid inputs or unsupported irregular
+    /// colored spectra.
+    pub fn solve_vector_with_linear_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        noise: LinearConfidence,
+    ) -> Result<VectorSolution, AnalysisError> {
+        self.solve_vector_impl(eastward, northward, Some(noise))
+    }
+
+    fn solve_vector_impl(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        confidence: Option<LinearConfidence>,
+    ) -> Result<VectorSolution, AnalysisError> {
+        if eastward.len() != northward.len() {
+            return Err(AnalysisError::ObservationShape {
+                actual: northward.len(),
+                expected: eastward.len(),
+            });
+        }
+        let mut time_major = Vec::with_capacity(eastward.len() * 2);
+        for (eastward, northward) in eastward.iter().copied().zip(northward.iter().copied()) {
+            time_major.extend([eastward, northward]);
+        }
+        let mut components = match confidence {
+            // Python UTide's two-dimensional colored linear CI path leaves the
+            // eastward pair white and applies the band spectrum to the
+            // northward pair. Keep that asymmetric reference behavior here.
+            Some(noise) => self
+                .model
+                .solve_many_time_major_with_linear_confidence_by_series(
+                    &time_major,
+                    &[LinearConfidence::White, noise],
+                )?,
+            None => self.model.solve_many_time_major(&time_major, 2)?,
+        };
+        let northward = components.pop().expect("two requested component solutions");
+        let eastward = components.pop().expect("two requested component solutions");
+        from_component_solutions(&eastward, &northward)
+    }
+
     /// Reconstruct one solution at arbitrary Modified Julian Days.
     ///
     /// Exact Greenwich phase and nodal corrections are evaluated at each target
@@ -163,6 +226,28 @@ impl GreenwichNodalOls {
             self.recipes.clone(),
         )?
         .reconstruct_at_latitude(solution, self.latitude_degrees_north, filter)
+    }
+
+    /// Reconstruct one current-ellipse solution at arbitrary Modified Julian Days.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid target times, solution shapes,
+    /// latitude, thresholds, or constituent filters.
+    pub fn reconstruct_vector_modified_julian_days(
+        &self,
+        modified_julian_days: &[f64],
+        solution: &VectorSolution,
+        filter: &ReconstructionFilter,
+    ) -> Result<VectorReconstruction, AnalysisError> {
+        GreenwichNodalReconstructor::from_parts(
+            modified_julian_days,
+            self.reference_time_modified_julian_day,
+            self.tidal_constituents.clone(),
+            &self.base_constituents,
+            self.recipes.clone(),
+        )?
+        .reconstruct_vector_at_latitude(solution, self.latitude_degrees_north, filter)
     }
 }
 
@@ -361,6 +446,57 @@ impl GreenwichNodalReconstructor {
             .map(|(solution, latitude)| self.reconstruct_at_latitude(solution, latitude, filter))
             .collect()
     }
+
+    /// Reconstruct varying-latitude current ellipses in parallel.
+    ///
+    /// Each returned pair is target-time-major within its component and retains
+    /// input series order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for inconsistent series counts, latitude,
+    /// solution-shape, or filter inputs.
+    pub fn reconstruct_many_vectors_series_major(
+        &self,
+        solutions: &[VectorSolution],
+        latitudes: &[f64],
+        filter: &ReconstructionFilter,
+    ) -> Result<Vec<VectorReconstruction>, AnalysisError> {
+        if solutions.is_empty() {
+            return Err(AnalysisError::EmptySeries);
+        }
+        if solutions.len() != latitudes.len() {
+            return Err(AnalysisError::ObservationShape {
+                actual: latitudes.len(),
+                expected: solutions.len(),
+            });
+        }
+        solutions
+            .par_iter()
+            .zip(latitudes.par_iter().copied())
+            .map(|(solution, latitude)| {
+                self.reconstruct_vector_at_latitude(solution, latitude, filter)
+            })
+            .collect()
+    }
+
+    /// Reconstruct one current-ellipse solution at a specified latitude.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid latitude, solution shape, or filter.
+    pub fn reconstruct_vector_at_latitude(
+        &self,
+        solution: &VectorSolution,
+        latitude_degrees_north: f64,
+        filter: &ReconstructionFilter,
+    ) -> Result<VectorReconstruction, AnalysisError> {
+        let (eastward, northward) = solution.component_solutions();
+        Ok(VectorReconstruction {
+            eastward: self.reconstruct_at_latitude(&eastward, latitude_degrees_north, filter)?,
+            northward: self.reconstruct_at_latitude(&northward, latitude_degrees_north, filter)?,
+        })
+    }
 }
 
 /// Shared exact astronomy for fitting many series at different latitudes.
@@ -524,6 +660,113 @@ impl GreenwichNodalBatch {
         noise: LinearConfidence,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         self.solve_time_major_with_missing_impl(observations, latitudes, Some(noise))
+    }
+
+    /// Jointly fit possibly gappy eastward/northward current series.
+    ///
+    /// A sample is omitted from both components when either component is `NaN`.
+    /// Series sharing that joint mask reuse prepared record metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid shapes, infinities, latitudes, or
+    /// underdetermined masked records.
+    pub fn solve_vector_time_major_with_missing(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_with_missing_impl(eastward, northward, latitudes, None)
+    }
+
+    /// Jointly fit gappy currents with linearized ellipse confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input or unsupported irregular
+    /// colored spectra.
+    pub fn solve_vector_time_major_with_missing_and_linear_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        noise: LinearConfidence,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_with_missing_impl(eastward, northward, latitudes, Some(noise))
+    }
+
+    fn solve_vector_time_major_with_missing_impl(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        confidence: Option<LinearConfidence>,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        validate_batch_shape_and_latitudes(self.time_count(), eastward, latitudes)?;
+        if northward.len() != eastward.len() {
+            return Err(AnalysisError::ObservationShape {
+                actual: northward.len(),
+                expected: eastward.len(),
+            });
+        }
+        let series_count = latitudes.len();
+        for (index, value) in eastward.iter().chain(northward).copied().enumerate() {
+            if value.is_infinite() {
+                return Err(AnalysisError::NonFiniteObservation {
+                    series: index % series_count,
+                    time: (index % eastward.len()) / series_count,
+                });
+            }
+        }
+
+        let mut records = Vec::<RecordSubset>::new();
+        let mut record_by_positions = HashMap::<Vec<usize>, usize>::new();
+        let mut record_for_series = Vec::with_capacity(series_count);
+        for series in 0..series_count {
+            let positions = (0..self.time_count())
+                .filter(|time| {
+                    eastward[time * series_count + series].is_finite()
+                        && northward[time * series_count + series].is_finite()
+                })
+                .collect::<Vec<_>>();
+            let record_index = if let Some(index) = record_by_positions.get(&positions) {
+                *index
+            } else {
+                let index = records.len();
+                records.push(self.basis.record_subset(positions.clone())?);
+                record_by_positions.insert(positions, index);
+                index
+            };
+            record_for_series.push(record_index);
+        }
+
+        (0..series_count)
+            .into_par_iter()
+            .map(|series| {
+                let record = &records[record_for_series[series]];
+                let model = self
+                    .basis
+                    .model_at_latitude_for_record(latitudes[series], record)?;
+                let mut component_values = Vec::with_capacity(record.positions.len() * 2);
+                for time in record.positions.iter().copied() {
+                    component_values.push(eastward[time * series_count + series]);
+                    component_values.push(northward[time * series_count + series]);
+                }
+                let mut components = match confidence {
+                    // Match Python UTide's asymmetric 2-D colored linear CI:
+                    // eastward remains white while northward is colored.
+                    Some(noise) => model.solve_many_time_major_with_linear_confidence_by_series(
+                        &component_values,
+                        &[LinearConfidence::White, noise],
+                    )?,
+                    None => model.solve_many_time_major(&component_values, 2)?,
+                };
+                let northward = components.pop().expect("two requested component solutions");
+                let eastward = components.pop().expect("two requested component solutions");
+                from_component_solutions(&eastward, &northward)
+            })
+            .collect()
     }
 
     fn solve_time_major_with_missing_impl(
@@ -1181,7 +1424,7 @@ fn usize_to_f64(value: usize) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{GreenwichNodalBatch, GreenwichNodalOls};
+    use super::{GreenwichNodalBatch, GreenwichNodalOls, usize_to_f64};
     use crate::{AnalysisError, LinearConfidence, TidalConstituent};
 
     fn times() -> Vec<f64> {
@@ -1284,5 +1527,73 @@ mod tests {
             ),
             Err(AnalysisError::UnevenTimeForColoredConfidence)
         );
+
+        let mut northward = observations
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value + (usize_to_f64(index) / 17.0).cos())
+            .collect::<Vec<_>>();
+        northward[2] = f64::NAN;
+        assert!(
+            batch
+                .solve_vector_time_major_with_missing_and_linear_confidence(
+                    &observations,
+                    &northward,
+                    &[60.0],
+                    LinearConfidence::White,
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            batch.solve_vector_time_major_with_missing_and_linear_confidence(
+                &observations,
+                &northward,
+                &[60.0],
+                LinearConfidence::Colored,
+            ),
+            Err(AnalysisError::UnevenTimeForColoredConfidence)
+        );
+    }
+
+    #[test]
+    fn vector_missing_values_use_a_joint_component_mask() {
+        let time = times();
+        let constituents = [TidalConstituent::M2, TidalConstituent::K1];
+        let mut eastward = (0_u32..745)
+            .map(|index| 0.2 + (f64::from(index) / 13.0).sin())
+            .collect::<Vec<_>>();
+        let mut northward = (0_u32..745)
+            .map(|index| -0.1 + (f64::from(index) / 17.0).cos())
+            .collect::<Vec<_>>();
+        eastward[7] = f64::NAN;
+        northward[19] = f64::NAN;
+
+        let batch = GreenwichNodalBatch::prepare_modified_julian_days(&time, &constituents)
+            .expect("valid batch");
+        let actual = batch
+            .solve_vector_time_major_with_missing(&eastward, &northward, &[60.0])
+            .expect("valid gappy vector");
+
+        let retained = (0..time.len())
+            .filter(|index| eastward[*index].is_finite() && northward[*index].is_finite())
+            .collect::<Vec<_>>();
+        let retained_time = retained
+            .iter()
+            .map(|index| time[*index])
+            .collect::<Vec<_>>();
+        let retained_eastward = retained
+            .iter()
+            .map(|index| eastward[*index])
+            .collect::<Vec<_>>();
+        let retained_northward = retained
+            .iter()
+            .map(|index| northward[*index])
+            .collect::<Vec<_>>();
+        let individual =
+            GreenwichNodalOls::prepare_modified_julian_days(&retained_time, 60.0, &constituents)
+                .expect("valid retained model")
+                .solve_vector(&retained_eastward, &retained_northward)
+                .expect("valid retained vector");
+        assert_eq!(actual, [individual]);
     }
 }
