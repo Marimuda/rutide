@@ -9,6 +9,7 @@ mod catalog;
 mod corrected;
 mod error;
 mod scalar;
+mod selection;
 
 pub use catalog::{
     CATALOG_ORACLE_REVISION, CATALOG_SOURCE_SHA256, CONSTITUENT_COUNT, TidalConstituent,
@@ -17,6 +18,7 @@ pub use catalog::{
 pub use corrected::{GreenwichNodalBatch, GreenwichNodalOls};
 pub use error::AnalysisError;
 pub use scalar::{Constituent, FixedRawOls, ScalarSolution};
+pub use selection::{RayleighSelection, select_constituents_by_rayleigh};
 
 /// The `RUTide` core crate version used to produce a result.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

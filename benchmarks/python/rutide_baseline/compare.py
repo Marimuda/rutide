@@ -17,16 +17,26 @@ from .runner import _profile_options, load_oracle
 
 DEFAULT_TOLERANCES = {
     "amplitude": 3e-12,
-    "phase_degrees": 3e-9,
+    "complex_coefficient": 3e-12,
     "mean": 3e-12,
     "slope_per_day": 3e-12,
     "frequency_cph": 1e-15,
 }
+BASE_PHASE_TOLERANCE_DEGREES = 3e-9
 
 
 def circular_phase_error(actual: np.ndarray, expected: np.ndarray) -> np.ndarray:
     """Return the shortest absolute separation between angles in degrees."""
     return np.abs((actual - expected + 180.0) % 360.0 - 180.0)
+
+
+def phase_tolerance_degrees(amplitude: float) -> float:
+    """Return a phase tolerance consistent with the complex-coefficient bound."""
+    coefficient_tolerance = DEFAULT_TOLERANCES["complex_coefficient"]
+    if amplitude <= coefficient_tolerance:
+        return 180.0
+    geometric_bound = np.degrees(np.arcsin(min(1.0, coefficient_tolerance / amplitude)))
+    return max(BASE_PHASE_TOLERANCE_DEGREES, float(geometric_bound))
 
 
 def _finite(values: Any, description: str) -> np.ndarray:
@@ -55,6 +65,26 @@ def _maximum_error(
     return result
 
 
+def _maximum_phase_error(values: list[tuple[float, float, int, str]]) -> dict[str, Any]:
+    error, tolerance, node_index, constituent = max(
+        values,
+        key=lambda item: item[0] / item[1],
+    )
+    maximum_error, _, maximum_node, maximum_constituent = max(values, key=lambda item: item[0])
+    return {
+        "maximum_absolute_error": float(maximum_error),
+        "maximum_error_node_index": int(maximum_node),
+        "maximum_error_constituent": maximum_constituent,
+        "base_tolerance": BASE_PHASE_TOLERANCE_DEGREES,
+        "near_zero_rule": "max(base, asin(complex_coefficient_tolerance / amplitude))",
+        "worst_tolerance_ratio": float(error / tolerance),
+        "tolerance_at_worst_ratio": float(tolerance),
+        "within_tolerance": bool(all(item[0] <= item[1] for item in values)),
+        "worst_node_index": int(node_index),
+        "worst_constituent": constituent,
+    }
+
+
 def compare_with_oracle(
     rust_output: Path,
     fixture: Path,
@@ -66,8 +96,17 @@ def compare_with_oracle(
     fixture_path = fixture.resolve(strict=True)
 
     with netCDF4.Dataset(rust_path, mode="r") as result_dataset:
-        if result_dataset.getncattr("profile") != "fixed-constituents-greenwich-nodal-ols":
+        profile = str(result_dataset.getncattr("profile"))
+        if profile not in {
+            "fixed-constituents-greenwich-nodal-ols",
+            "rayleigh-auto-greenwich-nodal-ols",
+        }:
             raise ValueError("RUTide output uses an unsupported analysis profile")
+        selection_method = (
+            str(result_dataset.getncattr("constituent_selection"))
+            if "constituent_selection" in result_dataset.ncattrs()
+            else "explicit"
+        )
         names = str(result_dataset.getncattr("constituent_names")).split(",")
         if not names or len(set(names)) != len(names):
             raise ValueError(f"constituent names must be non-empty and unique: {names}")
@@ -79,6 +118,11 @@ def compare_with_oracle(
         slopes = _finite(result_dataset.variables["slope"][:], "output slope")
         frequencies = _finite(result_dataset.variables["frequency"][:], "output frequency")
         result_digest = str(result_dataset.getncattr("result_sha256"))
+        rayleigh_min = (
+            float(result_dataset.getncattr("rayleigh_min"))
+            if selection_method == "rayleigh"
+            else None
+        )
 
     series_count = len(indices)
     constituent_count = len(names)
@@ -96,8 +140,19 @@ def compare_with_oracle(
     errors: dict[str, list[tuple[float, int, str | None]]] = {
         name: [] for name in DEFAULT_TOLERANCES
     }
+    phase_errors: list[tuple[float, float, int, str]] = []
     options = _profile_options("fixed-constituents")
-    options["constit"] = names
+    if selection_method == "rayleigh":
+        if profile != "rayleigh-auto-greenwich-nodal-ols" or rayleigh_min is None:
+            raise ValueError("inconsistent Rayleigh selection metadata")
+        options["constit"] = "auto"
+        options["Rayleigh_min"] = rayleigh_min
+    elif selection_method == "explicit":
+        if profile != "fixed-constituents-greenwich-nodal-ols":
+            raise ValueError("inconsistent explicit selection metadata")
+        options["constit"] = names
+    else:
+        raise ValueError(f"unsupported constituent selection method: {selection_method}")
     with netCDF4.Dataset(fixture_path, mode="r") as source_dataset:
         time = reconstruct_mjd(
             source_dataset.variables["Itime"][:],
@@ -122,6 +177,11 @@ def compare_with_oracle(
                 **options,
             )
             oracle_names = [str(value) for value in coefficient.name.tolist()]
+            if len(oracle_names) != len(names) or set(oracle_names) != set(names):
+                raise ValueError(
+                    "RUTide selection differs from Python UTide: "
+                    f"rust={names}, python={oracle_names}"
+                )
             order = [oracle_names.index(name) for name in names]
 
             expected_amplitude = np.asarray(coefficient.A, dtype=np.float64)[order]
@@ -138,17 +198,28 @@ def compare_with_oracle(
                         constituent,
                     )
                 )
-                errors["phase_degrees"].append(
+                phase_error = float(
+                    circular_phase_error(
+                        phases[position, constituent_position],
+                        expected_phase[constituent_position],
+                    )
+                )
+                phase_errors.append(
                     (
-                        float(
-                            circular_phase_error(
-                                phases[position, constituent_position],
-                                expected_phase[constituent_position],
-                            )
-                        ),
+                        phase_error,
+                        phase_tolerance_degrees(float(expected_amplitude[constituent_position])),
                         node_index,
                         constituent,
                     )
+                )
+                actual_complex = amplitudes[position, constituent_position] * np.exp(
+                    -1j * np.deg2rad(phases[position, constituent_position])
+                )
+                expected_complex = expected_amplitude[constituent_position] * np.exp(
+                    -1j * np.deg2rad(expected_phase[constituent_position])
+                )
+                errors["complex_coefficient"].append(
+                    (abs(actual_complex - expected_complex), node_index, constituent)
                 )
                 errors["frequency_cph"].append(
                     (
@@ -170,12 +241,14 @@ def compare_with_oracle(
     metrics = {
         name: _maximum_error(values, DEFAULT_TOLERANCES[name]) for name, values in errors.items()
     }
+    metrics["phase_degrees"] = _maximum_phase_error(phase_errors)
     return {
         "schema_version": 1,
         "created_utc": datetime.now(tz=timezone.utc).isoformat(),
         "implementation_under_test": "rutide",
         "oracle": "python-utide",
-        "profile": "fixed-constituents-greenwich-nodal-ols",
+        "profile": profile,
+        "constituent_selection": selection_method,
         "series": series_count,
         "constituents": names,
         "fixture": str(fixture_path),

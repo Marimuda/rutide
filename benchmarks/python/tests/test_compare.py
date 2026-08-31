@@ -4,7 +4,12 @@ import unittest
 
 import numpy as np
 
-from rutide_baseline.compare import _maximum_error, circular_phase_error
+from rutide_baseline.compare import (
+    BASE_PHASE_TOLERANCE_DEGREES,
+    _maximum_error,
+    circular_phase_error,
+    phase_tolerance_degrees,
+)
 
 
 class ComparisonUtilitiesTests(unittest.TestCase):
@@ -19,6 +24,11 @@ class ComparisonUtilitiesTests(unittest.TestCase):
         self.assertEqual(result["worst_node_index"], 7)
         self.assertEqual(result["worst_constituent"], "S2")
         self.assertTrue(result["within_tolerance"])
+
+    def test_phase_tolerance_only_relaxes_for_near_zero_amplitude(self) -> None:
+        self.assertEqual(phase_tolerance_degrees(1.0), BASE_PHASE_TOLERANCE_DEGREES)
+        self.assertGreater(phase_tolerance_degrees(1e-4), BASE_PHASE_TOLERANCE_DEGREES)
+        self.assertEqual(phase_tolerance_degrees(0.0), 180.0)
 
 
 if __name__ == "__main__":

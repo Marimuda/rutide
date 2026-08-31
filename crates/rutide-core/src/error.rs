@@ -30,6 +30,8 @@ pub enum AnalysisError {
     EquatorialLatitude,
     /// No constituents were requested.
     EmptyConstituents,
+    /// The Rayleigh criterion is not finite and strictly positive.
+    InvalidRayleighMinimum,
     /// A constituent name is empty.
     EmptyConstituentName {
         /// Position of the invalid constituent.
@@ -84,6 +86,9 @@ impl fmt::Display for AnalysisError {
                 "exact UTide nodal corrections are undefined at precisely zero latitude",
             ),
             Self::EmptyConstituents => formatter.write_str("at least one constituent is required"),
+            Self::InvalidRayleighMinimum => {
+                formatter.write_str("Rayleigh minimum must be finite and greater than zero")
+            }
             Self::EmptyConstituentName { index } => {
                 write!(formatter, "constituent at index {index} has an empty name")
             }

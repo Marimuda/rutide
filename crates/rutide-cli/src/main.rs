@@ -7,7 +7,9 @@ use std::{
     process::ExitCode,
 };
 
-use rutide_cli::{AnalyzeConfig, DEFAULT_CONSTITUENTS, NodeSelection, analyze_scalar};
+use rutide_cli::{
+    AnalyzeConfig, ConstituentSelection, DEFAULT_CONSTITUENTS, NodeSelection, analyze_scalar,
+};
 use rutide_core::TidalConstituent;
 
 // The application repeatedly allocates short-lived QR storage across worker
@@ -25,7 +27,8 @@ Options:
   --workers N         Outer spatial workers (default: available CPUs)
   --node-count N      Analyze the first N nodes
   --nodes I,J,...     Analyze explicit zero-based node indices
-  --constituents LIST Comma-separated catalog names (default: M2,S2,N2,K1,O1)
+  --constituents LIST Comma-separated names or 'auto' (default: M2,S2,N2,K1,O1)
+  --rayleigh-min X    Automatic selection criterion (default with auto: 1.0)
   --overwrite         Replace existing output and report files
   -h, --help          Show this help
 ";
@@ -97,6 +100,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let mut workers = std::thread::available_parallelism().map_or(1, usize::from);
     let mut selection = None;
     let mut constituents = None;
+    let mut rayleigh_minimum = None;
     let mut overwrite = false;
     while let Some(argument) = arguments.next() {
         let option = argument
@@ -127,18 +131,45 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                     option,
                 )?)?);
             }
+            "--rayleigh-min" => {
+                if rayleigh_minimum.is_some() {
+                    return Err("--rayleigh-min may only be supplied once".to_owned());
+                }
+                rayleigh_minimum = Some(parse_positive_f64(
+                    &required_value(&mut arguments, option)?,
+                    option,
+                )?);
+            }
             "--overwrite" => overwrite = true,
             "--help" | "-h" => return Ok(Command::Help),
             _ => return Err(format!("unknown option for analyze-scalar: {option}")),
         }
     }
 
+    let constituent_selection = match constituents {
+        Some(ParsedConstituents::Auto) => ConstituentSelection::Rayleigh {
+            minimum: rayleigh_minimum.unwrap_or(1.0),
+        },
+        Some(ParsedConstituents::Explicit(constituents)) => {
+            if rayleigh_minimum.is_some() {
+                return Err("--rayleigh-min requires --constituents auto".to_owned());
+            }
+            ConstituentSelection::Explicit(constituents)
+        }
+        None => {
+            if rayleigh_minimum.is_some() {
+                return Err("--rayleigh-min requires --constituents auto".to_owned());
+            }
+            ConstituentSelection::Explicit(DEFAULT_CONSTITUENTS.to_vec())
+        }
+    };
+
     Ok(Command::Analyze(AnalyzeConfig {
         input: input.ok_or_else(|| "analyze-scalar requires --input PATH".to_owned())?,
         output: output.ok_or_else(|| "analyze-scalar requires --output PATH".to_owned())?,
         report,
         nodes: selection.unwrap_or(NodeSelection::All),
-        constituents: constituents.unwrap_or_else(|| DEFAULT_CONSTITUENTS.to_vec()),
+        constituent_selection,
         workers,
         overwrite,
     }))
@@ -162,6 +193,19 @@ fn parse_positive_usize(value: &OsStr, option: &str) -> Result<usize, String> {
         .map_err(|_| format!("{option} requires a positive integer, received {text:?}"))?;
     if parsed == 0 {
         return Err(format!("{option} requires a positive integer"));
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_f64(value: &OsStr, option: &str) -> Result<f64, String> {
+    let text = value
+        .to_str()
+        .ok_or_else(|| format!("{option} value must be valid UTF-8"))?;
+    let parsed = text
+        .parse::<f64>()
+        .map_err(|_| format!("{option} requires a positive number, received {text:?}"))?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(format!("{option} requires a finite positive number"));
     }
     Ok(parsed)
 }
@@ -193,12 +237,20 @@ fn parse_nodes(value: &OsStr) -> Result<NodeSelection, String> {
     Ok(NodeSelection::Indices(indices))
 }
 
-fn parse_constituents(value: &OsStr) -> Result<Vec<TidalConstituent>, String> {
+enum ParsedConstituents {
+    Auto,
+    Explicit(Vec<TidalConstituent>),
+}
+
+fn parse_constituents(value: &OsStr) -> Result<ParsedConstituents, String> {
     let text = value
         .to_str()
         .ok_or_else(|| "--constituents value must be valid UTF-8".to_owned())?;
     if text.is_empty() {
         return Err("--constituents requires a comma-separated name list".to_owned());
+    }
+    if text == "auto" {
+        return Ok(ParsedConstituents::Auto);
     }
     let mut constituents = Vec::new();
     for raw_name in text.split(',') {
@@ -214,7 +266,7 @@ fn parse_constituents(value: &OsStr) -> Result<Vec<TidalConstituent>, String> {
         }
         constituents.push(constituent);
     }
-    Ok(constituents)
+    Ok(ParsedConstituents::Explicit(constituents))
 }
 
 #[cfg(test)]
@@ -222,7 +274,7 @@ mod tests {
     use std::ffi::OsString;
 
     use super::{Command, parse_arguments};
-    use rutide_cli::{DEFAULT_CONSTITUENTS, NodeSelection};
+    use rutide_cli::{ConstituentSelection, DEFAULT_CONSTITUENTS, NodeSelection};
     use rutide_core::TidalConstituent;
 
     fn args<'a>(values: &'a [&'a str]) -> impl Iterator<Item = OsString> + 'a {
@@ -247,7 +299,10 @@ mod tests {
             panic!("expected analyze command");
         };
         assert_eq!(config.nodes, NodeSelection::Indices(vec![4, 1, 3]));
-        assert_eq!(config.constituents, DEFAULT_CONSTITUENTS);
+        assert_eq!(
+            config.constituent_selection,
+            ConstituentSelection::Explicit(DEFAULT_CONSTITUENTS.to_vec())
+        );
         assert_eq!(config.workers, 8);
     }
 
@@ -285,9 +340,12 @@ mod tests {
             panic!("expected analyze command");
         };
         assert_eq!(
-            config.constituents,
-            ["Q1", "M2", "M4", "MK3"]
-                .map(|name| name.parse::<TidalConstituent>().expect("catalog name"))
+            config.constituent_selection,
+            ConstituentSelection::Explicit(
+                ["Q1", "M2", "M4", "MK3"]
+                    .map(|name| name.parse::<TidalConstituent>().expect("catalog name"))
+                    .to_vec()
+            )
         );
     }
 
@@ -306,6 +364,48 @@ mod tests {
                 ]))
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn parses_rayleigh_auto_selection_and_custom_minimum() {
+        let command = parse_arguments(args(&[
+            "analyze-scalar",
+            "--input",
+            "input.nc",
+            "--output",
+            "output.nc",
+            "--constituents",
+            "auto",
+            "--rayleigh-min",
+            "0.95",
+        ]))
+        .expect("valid arguments");
+        let Command::Analyze(config) = command else {
+            panic!("expected analyze command");
+        };
+        assert_eq!(
+            config.constituent_selection,
+            ConstituentSelection::Rayleigh { minimum: 0.95 }
+        );
+    }
+
+    #[test]
+    fn rejects_rayleigh_minimum_without_valid_auto_selection() {
+        for extra in [
+            &["--rayleigh-min", "1.0"][..],
+            &["--constituents", "M2,S2", "--rayleigh-min", "1.0"][..],
+            &["--constituents", "auto", "--rayleigh-min", "NaN"][..],
+        ] {
+            let mut values = vec![
+                "analyze-scalar",
+                "--input",
+                "input.nc",
+                "--output",
+                "output.nc",
+            ];
+            values.extend_from_slice(extra);
+            assert!(parse_arguments(args(&values)).is_err());
         }
     }
 }

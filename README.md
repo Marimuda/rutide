@@ -29,10 +29,10 @@ API shares latitude-independent astronomy, pre-aggregates satellite terms, and
 parallelizes the latitude-specific factorizations across spatial series. Both
 paths have real-FVCOM parity tests against the pinned Python oracle.
 
-Automatic selection, confidence intervals, missing observations, vector
-currents, and reconstruction are not implemented yet. The command-line
-application can analyze a complete, finite FVCOM `zeta(time, node)` field with
-an explicit constituent list and serialize its coefficients to NetCDF.
+Confidence intervals, missing observations, vector currents, and reconstruction
+are not implemented yet. The command-line application can analyze a complete,
+finite FVCOM `zeta(time, node)` field with an explicit or Rayleigh-selected
+constituent list and serialize its coefficients to NetCDF.
 
 ## Repository layout
 
@@ -89,7 +89,9 @@ cargo run --release --bin rutide -- analyze-scalar \
 
 Supply any unique catalog names in output order with, for example,
 `--constituents Q1,O1,K1,M2,S2,K2,M4`. The default remains the frozen five-name
-benchmark profile shown above.
+benchmark profile shown above. Use `--constituents auto` for UTide-compatible
+record-length selection; its Rayleigh criterion defaults to `1.0` and can be
+changed with `--rayleigh-min X`.
 
 Use `--node-count N` for a prefix or `--nodes 0,10,20` for an explicit
 correctness sample. Existing destinations are preserved unless `--overwrite`

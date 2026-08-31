@@ -13,7 +13,8 @@ use std::{
 use netcdf::{Variable, VariableMut};
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
-    AnalysisError, Constituent, GreenwichNodalBatch, ScalarSolution, TidalConstituent,
+    AnalysisError, Constituent, GreenwichNodalBatch, RayleighSelection, ScalarSolution,
+    TidalConstituent, select_constituents_by_rayleigh,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -40,8 +41,20 @@ pub enum NodeSelection {
     Indices(Vec<usize>),
 }
 
+/// Strategy used to choose constituents for one analysis run.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConstituentSelection {
+    /// Use exactly these catalog constituents in the supplied order.
+    Explicit(Vec<TidalConstituent>),
+    /// Select all catalog entries resolved by the record span.
+    Rayleigh {
+        /// Dimensionless minimum Rayleigh criterion.
+        minimum: f64,
+    },
+}
+
 /// Configuration for one scalar FVCOM analysis run.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AnalyzeConfig {
     /// Read-only source FVCOM `NetCDF` path.
     pub input: PathBuf,
@@ -51,8 +64,8 @@ pub struct AnalyzeConfig {
     pub report: Option<PathBuf>,
     /// Spatial subset to analyze.
     pub nodes: NodeSelection,
-    /// Catalog constituents to solve, in output order.
-    pub constituents: Vec<TidalConstituent>,
+    /// Explicit or record-length-based constituent selection.
+    pub constituent_selection: ConstituentSelection,
     /// Number of outer spatial worker threads.
     pub workers: usize,
     /// Permit replacing existing output and report files.
@@ -93,6 +106,19 @@ pub struct SampleResult {
     pub slope_per_day: f64,
 }
 
+/// Constituent-selection details retained in a completed run report.
+#[derive(Clone, Debug, Serialize)]
+pub struct ConstituentSelectionReport {
+    /// Selection algorithm: `explicit` or `rayleigh`.
+    pub method: &'static str,
+    /// Dimensionless Rayleigh criterion for automatic selection.
+    pub rayleigh_min: Option<f64>,
+    /// Derived acceptance threshold in cycles per hour.
+    pub minimum_separation_cph: Option<f64>,
+    /// Timestamp span used by automatic selection, in days.
+    pub record_span_days: Option<f64>,
+}
+
 /// Machine-readable summary of one completed application run.
 #[derive(Clone, Debug, Serialize)]
 pub struct RunReport {
@@ -120,6 +146,8 @@ pub struct RunReport {
     pub series_count: usize,
     /// Number of outer spatial workers.
     pub workers: usize,
+    /// Auditable constituent-selection method and threshold.
+    pub constituent_selection: ConstituentSelectionReport,
     /// Constituent names in coefficient order.
     pub constituents: Vec<String>,
     /// Reference-time frequencies in cycles per hour.
@@ -221,6 +249,21 @@ struct InputData {
     logical_input_bytes: u64,
 }
 
+struct ResolvedConstituentSelection {
+    constituents: Vec<TidalConstituent>,
+    report: ConstituentSelectionReport,
+}
+
+impl ResolvedConstituentSelection {
+    fn profile(&self) -> &'static str {
+        match self.report.method {
+            "explicit" => "fixed-constituents-greenwich-nodal-ols",
+            "rayleigh" => "rayleigh-auto-greenwich-nodal-ols",
+            _ => unreachable!("selection methods are constructed internally"),
+        }
+    }
+}
+
 /// Analyze an FVCOM `zeta(time, node)` field and write every coefficient.
 ///
 /// # Errors
@@ -237,9 +280,11 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
     let input_seconds = input_start.elapsed().as_secs_f64();
 
     let preparation_start = Instant::now();
+    let selection =
+        resolve_constituent_selection(&config.constituent_selection, &input.modified_julian_days)?;
     let batch = GreenwichNodalBatch::prepare_modified_julian_days(
         &input.modified_julian_days,
-        &config.constituents,
+        &selection.constituents,
     )?;
     let preparation_seconds = preparation_start.elapsed().as_secs_f64();
 
@@ -265,11 +310,14 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
     write_output(
         &config.output,
         config.overwrite,
-        &input.node_indices,
-        &input.latitudes,
-        batch.constituents(),
-        &solutions,
-        &result_sha256,
+        &OutputData {
+            node_indices: &input.node_indices,
+            latitudes: &input.latitudes,
+            constituents: batch.constituents(),
+            solutions: &solutions,
+            result_sha256: &result_sha256,
+            selection: &selection,
+        },
     )?;
     let output_seconds = output_start.elapsed().as_secs_f64();
     let total_seconds = total_start.elapsed().as_secs_f64();
@@ -283,7 +331,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         schema_version: OUTPUT_SCHEMA_VERSION,
         created_unix_seconds,
         rutide_version: rutide_core::VERSION,
-        profile: "fixed-constituents-greenwich-nodal-ols",
+        profile: selection.profile(),
         input_path: config.input.to_string_lossy().into_owned(),
         input_file_bytes: input.input_file_bytes,
         logical_input_bytes: input.logical_input_bytes,
@@ -292,6 +340,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         time_count: input.modified_julian_days.len(),
         series_count: input.node_indices.len(),
         workers: config.workers,
+        constituent_selection: selection.report,
         constituents: batch
             .constituents()
             .iter()
@@ -331,17 +380,19 @@ fn validate_config(config: &AnalyzeConfig) -> Result<(), AppError> {
             "input and output paths must differ".to_owned(),
         ));
     }
-    if config.constituents.is_empty() {
-        return Err(AppError::Invalid(
-            "constituent list must not be empty".to_owned(),
-        ));
-    }
-    let mut unique_constituents = BTreeSet::new();
-    for constituent in config.constituents.iter().copied() {
-        if !unique_constituents.insert(constituent) {
-            return Err(AppError::Invalid(format!(
-                "constituent {constituent} appears more than once"
-            )));
+    if let ConstituentSelection::Explicit(constituents) = &config.constituent_selection {
+        if constituents.is_empty() {
+            return Err(AppError::Invalid(
+                "constituent list must not be empty".to_owned(),
+            ));
+        }
+        let mut unique_constituents = BTreeSet::new();
+        for constituent in constituents.iter().copied() {
+            if !unique_constituents.insert(constituent) {
+                return Err(AppError::Invalid(format!(
+                    "constituent {constituent} appears more than once"
+                )));
+            }
         }
     }
     if config.output.exists() && !config.overwrite {
@@ -358,6 +409,40 @@ fn validate_config(config: &AnalyzeConfig) -> Result<(), AppError> {
         }
     }
     Ok(())
+}
+
+fn resolve_constituent_selection(
+    selection: &ConstituentSelection,
+    modified_julian_days: &[f64],
+) -> Result<ResolvedConstituentSelection, AnalysisError> {
+    match selection {
+        ConstituentSelection::Explicit(constituents) => Ok(ResolvedConstituentSelection {
+            constituents: constituents.clone(),
+            report: ConstituentSelectionReport {
+                method: "explicit",
+                rayleigh_min: None,
+                minimum_separation_cph: None,
+                record_span_days: None,
+            },
+        }),
+        ConstituentSelection::Rayleigh { minimum } => {
+            let RayleighSelection {
+                rayleigh_min,
+                record_span_days,
+                minimum_separation_cph,
+                constituents,
+            } = select_constituents_by_rayleigh(modified_julian_days, *minimum)?;
+            Ok(ResolvedConstituentSelection {
+                constituents,
+                report: ConstituentSelectionReport {
+                    method: "rayleigh",
+                    rayleigh_min: Some(rayleigh_min),
+                    minimum_separation_cph: Some(minimum_separation_cph),
+                    record_span_days: Some(record_span_days),
+                },
+            })
+        }
+    }
 }
 
 fn read_fvcom_scalar(path: &Path, selection: &NodeSelection) -> Result<InputData, AppError> {
@@ -623,24 +708,18 @@ fn retained_samples(
         .collect()
 }
 
-fn write_output(
-    path: &Path,
-    overwrite: bool,
-    node_indices: &[usize],
-    latitudes: &[f64],
-    constituents: &[Constituent],
-    solutions: &[ScalarSolution],
-    result_sha256: &str,
-) -> Result<(), AppError> {
+struct OutputData<'data> {
+    node_indices: &'data [usize],
+    latitudes: &'data [f64],
+    constituents: &'data [Constituent],
+    solutions: &'data [ScalarSolution],
+    result_sha256: &'data str,
+    selection: &'data ResolvedConstituentSelection,
+}
+
+fn write_output(path: &Path, overwrite: bool, data: &OutputData<'_>) -> Result<(), AppError> {
     let temporary = temporary_sibling(path)?;
-    let write_result = write_output_file(
-        &temporary,
-        node_indices,
-        latitudes,
-        constituents,
-        solutions,
-        result_sha256,
-    );
+    let write_result = write_output_file(&temporary, data);
     if let Err(error) = write_result {
         let _ignored = fs::remove_file(&temporary);
         return Err(error);
@@ -653,20 +732,31 @@ fn write_output(
     Ok(())
 }
 
-fn write_output_file(
-    path: &Path,
-    node_indices: &[usize],
-    latitudes: &[f64],
-    constituents: &[Constituent],
-    solutions: &[ScalarSolution],
-    result_sha256: &str,
-) -> Result<(), AppError> {
+fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError> {
+    let OutputData {
+        node_indices,
+        latitudes,
+        constituents,
+        solutions,
+        result_sha256,
+        selection,
+    } = *data;
     let mut output = netcdf::create(path)?;
     output.add_dimension("series", node_indices.len())?;
     output.add_dimension("constituent", constituents.len())?;
     output.add_attribute("title", "RUTide scalar harmonic coefficients")?;
     output.add_attribute("rutide_version", rutide_core::VERSION)?;
-    output.add_attribute("profile", "fixed-constituents-greenwich-nodal-ols")?;
+    output.add_attribute("profile", selection.profile())?;
+    output.add_attribute("constituent_selection", selection.report.method)?;
+    if let Some(rayleigh_min) = selection.report.rayleigh_min {
+        output.add_attribute("rayleigh_min", rayleigh_min)?;
+    }
+    if let Some(minimum_separation_cph) = selection.report.minimum_separation_cph {
+        output.add_attribute("minimum_separation_cph", minimum_separation_cph)?;
+    }
+    if let Some(record_span_days) = selection.report.record_span_days {
+        output.add_attribute("record_span_days", record_span_days)?;
+    }
     let constituent_names = constituents
         .iter()
         .map(|constituent| constituent.name.as_str())

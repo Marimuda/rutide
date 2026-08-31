@@ -245,6 +245,9 @@ Phase error must use circular distance, not ordinary subtraction. Constituents
 should be matched by name before comparing numeric arrays. Use both absolute and
 relative tolerances, with explicit handling near zero amplitude. Record maximum,
 median, and high-percentile errors; do not rely only on a single aggregate norm.
+For scalar phase, also compare the equivalent complex coefficient and expand the
+angular tolerance by the geometric bound `asin(coefficient tolerance / amplitude)`
+near zero, where phase is intrinsically ill-conditioned.
 
 Exact floating-point identity is not required across LAPACK implementations or
 parallel reduction orders. Initial acceptance tolerances should be derived from
