@@ -9,5 +9,12 @@ license.workspace = true
 readme.workspace = true
 publish = false
 
+[dependencies]
+faer = { version = "=0.24.4", default-features = false, features = ["linalg", "rayon", "std"] }
+
+[[bench]]
+name = "fixed_raw_throughput"
+harness = false
+
 [lints]
 workspace = true
