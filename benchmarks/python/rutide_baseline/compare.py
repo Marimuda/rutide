@@ -24,11 +24,13 @@ DEFAULT_TOLERANCES = {
     "mean": 3e-12,
     "slope_per_day": 3e-12,
     "frequency_cph": 1e-15,
+    "reference_time_mjd": 1e-12,
     "reconstruction": 1e-9,
 }
 BASE_PHASE_TOLERANCE_DEGREES = 3e-9
 SIGNAL_TO_NOISE_ABSOLUTE_TOLERANCE = 1e-6
 SIGNAL_TO_NOISE_RELATIVE_TOLERANCE = 1e-8
+MJD_TO_PYTHON_DATENUM = 678_576.0
 
 
 def circular_phase_error(actual: np.ndarray, expected: np.ndarray) -> np.ndarray:
@@ -52,6 +54,14 @@ def _finite(values: Any, description: str) -> np.ndarray:
     result = np.asarray(array, dtype=np.float64)
     if not np.isfinite(result).all():
         raise ValueError(f"{description} contains non-finite values")
+    return result
+
+
+def _observations_with_nan(values: Any, description: str) -> np.ndarray:
+    array = np.ma.asarray(values, dtype=np.float64)
+    result = np.asarray(array.filled(np.nan), dtype=np.float64)
+    if np.isinf(result).any():
+        raise ValueError(f"{description} contains infinite values")
     return result
 
 
@@ -169,6 +179,16 @@ def compare_with_oracle(
         means = _finite(result_dataset.variables["mean"][:], "output mean")
         slopes = _finite(result_dataset.variables["slope"][:], "output slope")
         frequencies = _finite(result_dataset.variables["frequency"][:], "output frequency")
+        observation_counts = (
+            np.asarray(result_dataset.variables["observation_count"][:], dtype=np.int64)
+            if "observation_count" in result_dataset.variables
+            else None
+        )
+        reference_times = (
+            _finite(result_dataset.variables["reference_time"][:], "output reference time")
+            if "reference_time" in result_dataset.variables
+            else None
+        )
         result_digest = str(result_dataset.getncattr("result_sha256"))
         if confidence_interval == "linear":
             amplitude_ci = _finite(
@@ -240,8 +260,16 @@ def compare_with_oracle(
             raise ValueError(f"unexpected {description} shape: {values.shape}")
     if means.shape != (series_count,) or slopes.shape != (series_count,):
         raise ValueError("unexpected mean or slope shape")
-    if latitudes.shape != (series_count,) or frequencies.shape != (constituent_count,):
-        raise ValueError("unexpected latitude or frequency shape")
+    if latitudes.shape != (series_count,):
+        raise ValueError("unexpected latitude shape")
+    if frequencies.shape == (constituent_count,):
+        frequencies = np.broadcast_to(frequencies, (series_count, constituent_count))
+    elif frequencies.shape != (series_count, constituent_count):
+        raise ValueError(f"unexpected frequency shape: {frequencies.shape}")
+    if observation_counts is not None and observation_counts.shape != (series_count,):
+        raise ValueError("unexpected observation-count shape")
+    if reference_times is not None and reference_times.shape != (series_count,):
+        raise ValueError("unexpected reference-time shape")
     if reconstruction is not None:
         if reconstruction_time.ndim != 1 or reconstruction_time.size == 0:
             raise ValueError("unexpected reconstruction time shape")
@@ -264,6 +292,8 @@ def compare_with_oracle(
         raise ValueError(f"unsupported confidence interval: {confidence_interval}")
     if reconstruction is not None:
         metric_names.append("reconstruction")
+    if reference_times is not None:
+        metric_names.append("reference_time_mjd")
     errors: dict[str, list[tuple[float, int, str | None]]] = {name: [] for name in metric_names}
     phase_errors: list[tuple[float, float, int, str]] = []
     snr_errors: list[tuple[float, float, int, str]] = []
@@ -296,10 +326,16 @@ def compare_with_oracle(
             source_latitude = float(source_dataset.variables["lat"][node_index])
             if latitudes[position] != source_latitude:
                 raise ValueError(f"output latitude differs from source at node {node_index}")
-            observations = _finite(
+            observations = _observations_with_nan(
                 source_dataset.variables["zeta"][:, node_index],
                 f"source zeta at node {node_index}",
             )
+            expected_observation_count = int(np.isfinite(observations).sum())
+            if (
+                observation_counts is not None
+                and observation_counts[position] != expected_observation_count
+            ):
+                raise ValueError(f"output observation count differs at node {node_index}")
             coefficient = oracle.solve(
                 time,
                 observations,
@@ -395,7 +431,7 @@ def compare_with_oracle(
                 errors["frequency_cph"].append(
                     (
                         abs(
-                            frequencies[constituent_position]
+                            frequencies[position, constituent_position]
                             - expected_frequency[constituent_position]
                         ),
                         node_index,
@@ -408,6 +444,11 @@ def compare_with_oracle(
             errors["slope_per_day"].append(
                 (abs(slopes[position] - float(coefficient.slope)), node_index, None)
             )
+            if reference_times is not None:
+                expected_reference_mjd = float(coefficient.aux.reftime) - MJD_TO_PYTHON_DATENUM
+                errors["reference_time_mjd"].append(
+                    (abs(reference_times[position] - expected_reference_mjd), node_index, None)
+                )
             if reconstruction is not None:
                 selected_names = _reconstruction_names(
                     reconstruction_filter,

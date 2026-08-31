@@ -387,6 +387,82 @@ fn matches_python_utide_reconstruction_and_filters_at_original_and_held_out_time
 }
 
 #[test]
+fn matches_python_utide_for_gappy_equidistant_scalar_observations() {
+    let time = oracle_times();
+    let mut observations = oracle_observations();
+    for index in [0, 137, 411] {
+        observations[index] = f64::NAN;
+    }
+    let batch = GreenwichNodalBatch::prepare_modified_julian_days(&time, &CONSTITUENTS)
+        .expect("valid corrected oracle batch");
+    let solution = batch
+        .solve_time_major_with_missing_and_linear_confidence(
+            &observations,
+            &[LATITUDE_DEGREES_NORTH],
+            LinearConfidence::Colored,
+        )
+        .expect("valid gappy colored solution")
+        .pop()
+        .expect("one solution");
+
+    for (label, actual, expected, tolerance) in [
+        (
+            "gappy amplitude",
+            &solution.amplitude,
+            &[
+                0.654_472_399_747_378_1,
+                0.225_234_032_280_502_12,
+                0.157_231_287_210_143_68,
+                0.111_716_028_794_704_59,
+                0.067_578_131_538_407_5,
+            ],
+            3e-12,
+        ),
+        (
+            "gappy colored amplitude CI",
+            solution.amplitude_ci.as_ref().expect("amplitude CI"),
+            &[
+                0.015_585_131_683_005_718,
+                0.015_561_465_937_189_782,
+                0.015_555_229_620_349_435,
+                0.010_021_657_250_895_571,
+                0.010_042_170_306_974_657,
+            ],
+            2e-11,
+        ),
+        (
+            "gappy colored phase CI",
+            solution.phase_ci_degrees.as_ref().expect("phase CI"),
+            &[
+                1.360_097_443_107_087_4,
+                3.958_124_784_909_186_3,
+                5.672_291_016_064_416,
+                5.154_105_365_276_658,
+                8.503_072_256_489_247,
+            ],
+            1e-8,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{label}[{index}]"), *actual, *expected, tolerance);
+        }
+    }
+    assert_close("gappy mean", solution.mean, 0.091_441_800_298_683_73, 3e-12);
+    assert_close(
+        "gappy slope",
+        solution.slope_per_day,
+        0.001_680_389_880_195_352_6,
+        3e-12,
+    );
+    assert_close(
+        "gappy reference time",
+        solution.reference_time_days,
+        58_128.5,
+        0.0,
+    );
+}
+
+#[test]
 fn matches_python_utide_for_expanded_base_and_shallow_constituents() {
     let time = oracle_times();
     let observations = oracle_observations();

@@ -1,6 +1,7 @@
 //! Fixed-frequency scalar harmonic analysis.
 
 use std::{
+    borrow::Cow,
     cmp::Ordering,
     collections::HashMap,
     f64::consts::{PI, TAU},
@@ -63,6 +64,8 @@ pub struct ScalarSolution {
     pub mean: f64,
     /// Fitted linear trend per day.
     pub slope_per_day: f64,
+    /// Epoch at which `mean` is defined, in the same day coordinate as the fit.
+    pub reference_time_days: f64,
 }
 
 impl ScalarSolution {
@@ -113,6 +116,9 @@ pub struct FixedRawOls {
     time_span_days: f64,
     effective_record_length_days: f64,
     sample_interval_hours: Option<f64>,
+    spectrum_time_count: usize,
+    spectrum_observation_positions: Option<Vec<usize>>,
+    reference_time_days: f64,
     design: Mat<f64>,
     decomposition: ColPivQr<f64>,
 }
@@ -153,7 +159,8 @@ impl FixedRawOls {
             constituents.to_vec(),
             time_days.len(),
             time_span_days,
-            equidistant_sample_interval_hours(time_days),
+            reference_time_days,
+            ConfidenceSampling::complete(time_days, time_span_days),
             design,
         ))
     }
@@ -162,17 +169,20 @@ impl FixedRawOls {
         constituents: Vec<Constituent>,
         time_count: usize,
         time_span_days: f64,
-        sample_interval_hours: Option<f64>,
+        reference_time_days: f64,
+        confidence_sampling: ConfidenceSampling,
         design: Mat<f64>,
     ) -> Self {
         let decomposition = design.col_piv_qr();
-        let time_count_f64 = usize_to_f64(time_count);
         Self {
             constituents,
             time_count,
             time_span_days,
-            effective_record_length_days: time_span_days * time_count_f64 / (time_count_f64 - 1.0),
-            sample_interval_hours,
+            effective_record_length_days: confidence_sampling.effective_record_length_days,
+            sample_interval_hours: confidence_sampling.sample_interval_hours,
+            spectrum_time_count: confidence_sampling.spectrum_time_count,
+            spectrum_observation_positions: confidence_sampling.observation_positions,
+            reference_time_days,
             design,
             decomposition,
         }
@@ -337,6 +347,7 @@ impl FixedRawOls {
                     mean: coefficients[(harmonic_columns, series)],
                     slope_per_day: coefficients[(harmonic_columns + 1, series)]
                         / self.time_span_days,
+                    reference_time_days: self.reference_time_days,
                 }
             })
             .collect())
@@ -380,6 +391,7 @@ impl FixedRawOls {
         let white_variance = (observation_energy - model_observation_product)
             / usize_to_f64(self.time_count - self.design.ncols());
         let colored_power = (noise == LinearConfidence::Colored).then(|| {
+            let residual = self.residual_on_regular_spectrum_grid(&residual);
             band_averaged_residual_power(
                 &residual,
                 self.sample_interval_hours
@@ -420,6 +432,56 @@ impl FixedRawOls {
         LinearIntervals {
             amplitude,
             phase_degrees,
+        }
+    }
+
+    fn residual_on_regular_spectrum_grid<'residual>(
+        &self,
+        residual: &'residual [f64],
+    ) -> Cow<'residual, [f64]> {
+        let Some(positions) = &self.spectrum_observation_positions else {
+            return Cow::Borrowed(residual);
+        };
+        debug_assert_eq!(positions.len(), residual.len());
+        let mut interpolated = vec![residual[0]; self.spectrum_time_count];
+        let mut valid = 0;
+        for (grid_index, value) in interpolated.iter_mut().enumerate() {
+            while valid + 1 < positions.len() && positions[valid + 1] <= grid_index {
+                valid += 1;
+            }
+            *value = if positions[valid] == grid_index || valid + 1 == positions.len() {
+                residual[valid]
+            } else if grid_index < positions[0] {
+                residual[0]
+            } else {
+                let left_position = positions[valid];
+                let right_position = positions[valid + 1];
+                let fraction = usize_to_f64(grid_index - left_position)
+                    / usize_to_f64(right_position - left_position);
+                residual[valid] + fraction * (residual[valid + 1] - residual[valid])
+            };
+        }
+        Cow::Owned(interpolated)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ConfidenceSampling {
+    pub(crate) sample_interval_hours: Option<f64>,
+    pub(crate) effective_record_length_days: f64,
+    pub(crate) spectrum_time_count: usize,
+    pub(crate) observation_positions: Option<Vec<usize>>,
+}
+
+impl ConfidenceSampling {
+    pub(crate) fn complete(time_days: &[f64], time_span_days: f64) -> Self {
+        let time_count = time_days.len();
+        let time_count_f64 = usize_to_f64(time_count);
+        Self {
+            sample_interval_hours: equidistant_sample_interval_hours(time_days),
+            effective_record_length_days: time_span_days * time_count_f64 / (time_count_f64 - 1.0),
+            spectrum_time_count: time_count,
+            observation_positions: None,
         }
     }
 }

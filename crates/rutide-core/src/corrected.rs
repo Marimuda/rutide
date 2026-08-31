@@ -1,6 +1,6 @@
 //! Exact Greenwich phase and nodal corrections for catalog constituents.
 
-use std::f64::consts::TAU;
+use std::{collections::HashMap, f64::consts::TAU};
 
 use faer::Mat;
 use rayon::prelude::*;
@@ -9,7 +9,7 @@ use crate::{
     AnalysisError, Constituent, FixedRawOls, LinearConfidence, ScalarSolution, TidalConstituent,
     astronomy::at_modified_julian_day,
     catalog::{CONSTITUENT_COUNT, Metadata},
-    scalar::{equidistant_sample_interval_hours, validate_time},
+    scalar::{ConfidenceSampling, equidistant_sample_interval_hours, validate_time},
 };
 
 /// A reusable fixed-constituent OLS model with exact Greenwich and nodal terms.
@@ -255,7 +255,7 @@ impl GreenwichNodalReconstructor {
                             precompute_nodal_terms(constituent.metadata(), astronomy.cycles)
                         })
                         .collect(),
-                    days_from_reference: time - reference_time_modified_julian_day,
+                    modified_julian_day: time,
                 }
             })
             .collect();
@@ -325,7 +325,10 @@ impl GreenwichNodalReconstructor {
                 })
                 .sum::<f64>();
             reconstruction.push(
-                solution.mean + solution.slope_per_day * terms.days_from_reference + harmonics,
+                solution.mean
+                    + solution.slope_per_day
+                        * (terms.modified_julian_day - solution.reference_time_days)
+                    + harmonics,
             );
         }
         Ok(reconstruction)
@@ -405,6 +408,29 @@ impl GreenwichNodalBatch {
         &self.basis.scalar_constituents
     }
 
+    /// Return constituent frequencies at an arbitrary finite reference MJD.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for a non-finite epoch or a degenerate derived
+    /// frequency set.
+    pub fn constituents_at_reference_modified_julian_day(
+        &self,
+        reference_time: f64,
+    ) -> Result<Vec<Constituent>, AnalysisError> {
+        if !reference_time.is_finite() {
+            return Err(AnalysisError::NonFiniteReferenceTime);
+        }
+        let constituents = scalar_constituents_at_reference(
+            &self.basis.tidal_constituents,
+            &self.basis.base_constituents,
+            &self.basis.recipes,
+            reference_time,
+        );
+        validate_derived_frequencies(&constituents)?;
+        Ok(constituents)
+    }
+
     /// Return the midpoint epoch used for fitted trends, as an MJD.
     #[must_use]
     pub const fn reference_time_modified_julian_day(&self) -> f64 {
@@ -462,26 +488,111 @@ impl GreenwichNodalBatch {
         self.solve_time_major_impl(observations, latitudes, Some(noise))
     }
 
+    /// Fit scalar series while treating `NaN` observations as missing.
+    ///
+    /// Series sharing a valid-time mask reuse the same prepared record metadata.
+    /// Infinite values remain invalid. Each series must retain enough samples to
+    /// overdetermine the requested harmonic model.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid shapes, latitudes, infinities, or
+    /// underdetermined masked records.
+    pub fn solve_time_major_with_missing(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_with_missing_impl(observations, latitudes, None)
+    }
+
+    /// Fit possibly gappy scalar series with linearized confidence intervals.
+    ///
+    /// Colored intervals interpolate residuals from gappy observations onto an
+    /// originally equidistant timestamp grid, matching Python `UTide`. Truly
+    /// irregular input timestamps are rejected until Lomb–Scargle spectra are
+    /// implemented. White intervals support either sampling pattern.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid inputs or unsupported irregular
+    /// colored spectra.
+    pub fn solve_time_major_with_missing_and_linear_confidence(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_with_missing_impl(observations, latitudes, Some(noise))
+    }
+
+    fn solve_time_major_with_missing_impl(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        confidence: Option<LinearConfidence>,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        validate_batch_shape_and_latitudes(self.time_count(), observations, latitudes)?;
+        for (index, value) in observations.iter().copied().enumerate() {
+            if value.is_infinite() {
+                return Err(AnalysisError::NonFiniteObservation {
+                    series: index % latitudes.len(),
+                    time: index / latitudes.len(),
+                });
+            }
+        }
+        if observations.iter().all(|value| value.is_finite()) {
+            return self.solve_time_major_impl(observations, latitudes, confidence);
+        }
+
+        let series_count = latitudes.len();
+        let mut records = Vec::<RecordSubset>::new();
+        let mut record_by_positions = HashMap::<Vec<usize>, usize>::new();
+        let mut record_for_series = Vec::with_capacity(series_count);
+        for series in 0..series_count {
+            let positions = (0..self.time_count())
+                .filter(|time| observations[time * series_count + series].is_finite())
+                .collect::<Vec<_>>();
+            let record_index = if let Some(index) = record_by_positions.get(&positions) {
+                *index
+            } else {
+                let index = records.len();
+                records.push(self.basis.record_subset(positions.clone())?);
+                record_by_positions.insert(positions, index);
+                index
+            };
+            record_for_series.push(record_index);
+        }
+
+        (0..series_count)
+            .into_par_iter()
+            .map(|series| {
+                let record = &records[record_for_series[series]];
+                let model = self
+                    .basis
+                    .model_at_latitude_for_record(latitudes[series], record)?;
+                let series_observations = record
+                    .positions
+                    .iter()
+                    .copied()
+                    .map(|time| observations[time * series_count + series])
+                    .collect::<Vec<_>>();
+                match confidence {
+                    Some(noise) => model.solve_with_linear_confidence(&series_observations, noise),
+                    None => model.solve(&series_observations),
+                }
+            })
+            .collect()
+    }
+
     fn solve_time_major_impl(
         &self,
         observations: &[f64],
         latitudes: &[f64],
         confidence: Option<LinearConfidence>,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        if latitudes.is_empty() {
-            return Err(AnalysisError::EmptySeries);
-        }
-        for latitude in latitudes.iter().copied() {
-            validate_latitude(latitude)?;
-        }
+        validate_batch_shape_and_latitudes(self.time_count(), observations, latitudes)?;
         let series_count = latitudes.len();
-        let expected = self.time_count().saturating_mul(series_count);
-        if observations.len() != expected {
-            return Err(AnalysisError::ObservationShape {
-                actual: observations.len(),
-                expected,
-            });
-        }
         for (index, value) in observations.iter().copied().enumerate() {
             if !value.is_finite() {
                 return Err(AnalysisError::NonFiniteObservation {
@@ -541,31 +652,12 @@ impl CorrectionBasis {
         let (reference_time, time_span_days) =
             validate_time(modified_julian_days, constituents.len())?;
         let (base_constituents, recipes) = dependency_recipes(constituents);
-        let reference_astronomy = at_modified_julian_day(reference_time);
-        let base_frequencies = base_constituents
-            .iter()
-            .copied()
-            .map(|constituent| {
-                let metadata = constituent.metadata();
-                dot6(
-                    metadata
-                        .doodson
-                        .expect("base catalog constituent has Doodson multipliers"),
-                    reference_astronomy.cycles_per_day,
-                ) / 24.0
-            })
-            .collect::<Vec<_>>();
-        let scalar_constituents = constituents
-            .iter()
-            .copied()
-            .zip(&recipes)
-            .map(|(constituent, recipe)| {
-                Constituent::new(
-                    constituent.name(),
-                    recipe.combine_frequency(&base_frequencies),
-                )
-            })
-            .collect::<Vec<_>>();
+        let scalar_constituents = scalar_constituents_at_reference(
+            constituents,
+            &base_constituents,
+            &recipes,
+            reference_time,
+        );
         validate_derived_frequencies(&scalar_constituents)?;
         let time_terms = modified_julian_days
             .iter()
@@ -589,7 +681,7 @@ impl CorrectionBasis {
                             precompute_nodal_terms(constituent.metadata(), astronomy.cycles)
                         })
                         .collect(),
-                    normalized_trend: (time - reference_time) / time_span_days,
+                    modified_julian_day: time,
                 }
             })
             .collect();
@@ -606,11 +698,78 @@ impl CorrectionBasis {
     }
 
     fn model_at_latitude(&self, latitude: f64) -> Result<FixedRawOls, AnalysisError> {
+        let positions = (0..self.time_terms.len()).collect::<Vec<_>>();
+        let record = self.record_subset(positions)?;
+        self.model_at_latitude_for_record(latitude, &record)
+    }
+
+    fn record_subset(&self, positions: Vec<usize>) -> Result<RecordSubset, AnalysisError> {
+        let modified_julian_days = positions
+            .iter()
+            .copied()
+            .map(|position| self.time_terms[position].modified_julian_day)
+            .collect::<Vec<_>>();
+        let (subset_reference, subset_span) =
+            validate_time(&modified_julian_days, self.tidal_constituents.len())?;
+        let original_is_equidistant = self.sample_interval_hours.is_some();
+        let (reference_time, time_span_days, scalar_constituents, confidence_sampling) =
+            if original_is_equidistant {
+                let full_count = self.time_terms.len();
+                let full_count_f64 = usize_to_f64(full_count);
+                (
+                    self.reference_time_modified_julian_day,
+                    self.time_span_days,
+                    self.scalar_constituents.clone(),
+                    ConfidenceSampling {
+                        sample_interval_hours: self.sample_interval_hours,
+                        effective_record_length_days: self.time_span_days * full_count_f64
+                            / (full_count_f64 - 1.0),
+                        spectrum_time_count: full_count,
+                        observation_positions: (positions.len() != full_count)
+                            .then_some(positions.clone()),
+                    },
+                )
+            } else {
+                let count = positions.len();
+                let count_f64 = usize_to_f64(count);
+                (
+                    subset_reference,
+                    subset_span,
+                    scalar_constituents_at_reference(
+                        &self.tidal_constituents,
+                        &self.base_constituents,
+                        &self.recipes,
+                        subset_reference,
+                    ),
+                    ConfidenceSampling {
+                        sample_interval_hours: None,
+                        effective_record_length_days: subset_span * count_f64 / (count_f64 - 1.0),
+                        spectrum_time_count: count,
+                        observation_positions: None,
+                    },
+                )
+            };
+        validate_derived_frequencies(&scalar_constituents)?;
+        Ok(RecordSubset {
+            positions,
+            scalar_constituents,
+            reference_time,
+            time_span_days,
+            confidence_sampling,
+        })
+    }
+
+    fn model_at_latitude_for_record(
+        &self,
+        latitude: f64,
+        record: &RecordSubset,
+    ) -> Result<FixedRawOls, AnalysisError> {
         validate_latitude(latitude)?;
         let harmonic_columns = self.tidal_constituents.len() * 2;
-        let mut design = Mat::zeros(self.time_terms.len(), harmonic_columns + 2);
+        let mut design = Mat::zeros(record.positions.len(), harmonic_columns + 2);
         let latitude_factors = latitude_factors(latitude);
-        for (time_index, terms) in self.time_terms.iter().enumerate() {
+        for (time_index, position) in record.positions.iter().copied().enumerate() {
+            let terms = &self.time_terms[position];
             let base_corrections = terms
                 .base_nodal_terms
                 .iter()
@@ -625,13 +784,15 @@ impl CorrectionBasis {
                 design[(time_index, constituent_index * 2 + 1)] = nodal_amplitude * angle.sin();
             }
             design[(time_index, harmonic_columns)] = 1.0;
-            design[(time_index, harmonic_columns + 1)] = terms.normalized_trend;
+            design[(time_index, harmonic_columns + 1)] =
+                (terms.modified_julian_day - record.reference_time) / record.time_span_days;
         }
         Ok(FixedRawOls::from_design(
-            self.scalar_constituents.clone(),
-            self.time_terms.len(),
-            self.time_span_days,
-            self.sample_interval_hours,
+            record.scalar_constituents.clone(),
+            record.positions.len(),
+            record.time_span_days,
+            record.reference_time,
+            record.confidence_sampling.clone(),
             design,
         ))
     }
@@ -641,14 +802,23 @@ impl CorrectionBasis {
 struct TimeTerms {
     greenwich_phase: Vec<f64>,
     base_nodal_terms: Vec<NodalTerms>,
-    normalized_trend: f64,
+    modified_julian_day: f64,
+}
+
+#[derive(Clone, Debug)]
+struct RecordSubset {
+    positions: Vec<usize>,
+    scalar_constituents: Vec<Constituent>,
+    reference_time: f64,
+    time_span_days: f64,
+    confidence_sampling: ConfidenceSampling,
 }
 
 #[derive(Debug)]
 struct ReconstructionTimeTerms {
     greenwich_phase: Vec<f64>,
     base_nodal_terms: Vec<NodalTerms>,
-    days_from_reference: f64,
+    modified_julian_day: f64,
 }
 
 impl CorrectionRecipe {
@@ -750,6 +920,39 @@ fn validate_derived_frequencies(constituents: &[Constituent]) -> Result<(), Anal
         }
     }
     Ok(())
+}
+
+fn scalar_constituents_at_reference(
+    constituents: &[TidalConstituent],
+    base_constituents: &[TidalConstituent],
+    recipes: &[CorrectionRecipe],
+    reference_time: f64,
+) -> Vec<Constituent> {
+    let reference_astronomy = at_modified_julian_day(reference_time);
+    let base_frequencies = base_constituents
+        .iter()
+        .copied()
+        .map(|constituent| {
+            let metadata = constituent.metadata();
+            dot6(
+                metadata
+                    .doodson
+                    .expect("base catalog constituent has Doodson multipliers"),
+                reference_astronomy.cycles_per_day,
+            ) / 24.0
+        })
+        .collect::<Vec<_>>();
+    constituents
+        .iter()
+        .copied()
+        .zip(recipes)
+        .map(|(constituent, recipe)| {
+            Constituent::new(
+                constituent.name(),
+                recipe.combine_frequency(&base_frequencies),
+            )
+        })
+        .collect()
 }
 
 fn validate_reconstruction_times(
@@ -875,6 +1078,27 @@ fn validate_latitude(latitude: f64) -> Result<(), AnalysisError> {
     Ok(())
 }
 
+fn validate_batch_shape_and_latitudes(
+    time_count: usize,
+    observations: &[f64],
+    latitudes: &[f64],
+) -> Result<(), AnalysisError> {
+    if latitudes.is_empty() {
+        return Err(AnalysisError::EmptySeries);
+    }
+    for latitude in latitudes.iter().copied() {
+        validate_latitude(latitude)?;
+    }
+    let expected = time_count.saturating_mul(latitudes.len());
+    if observations.len() != expected {
+        return Err(AnalysisError::ObservationShape {
+            actual: observations.len(),
+            expected,
+        });
+    }
+    Ok(())
+}
+
 fn validate_tidal_constituents(constituents: &[TidalConstituent]) -> Result<(), AnalysisError> {
     if constituents.is_empty() {
         return Err(AnalysisError::EmptyConstituents);
@@ -947,10 +1171,18 @@ fn dot6(left: [i8; 6], right: [f64; 6]) -> f64 {
         + f64::from(left[5]) * right[5]
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "practical record lengths are exactly representable as f64"
+)]
+fn usize_to_f64(value: usize) -> f64 {
+    value as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::{GreenwichNodalBatch, GreenwichNodalOls};
-    use crate::{AnalysisError, TidalConstituent};
+    use crate::{AnalysisError, LinearConfidence, TidalConstituent};
 
     fn times() -> Vec<f64> {
         (0_u32..745)
@@ -1021,5 +1253,36 @@ mod tests {
             let expected = model.solve(&values).expect("valid individual series");
             assert_eq!(actual[series], expected);
         }
+    }
+
+    #[test]
+    fn irregular_gappy_records_support_white_but_reject_colored_confidence() {
+        let mut time = times();
+        time[20] += 0.001;
+        let constituents = [TidalConstituent::M2, TidalConstituent::K1];
+        let mut observations = (0_u32..745)
+            .map(|index| (f64::from(index) / 13.0).sin())
+            .collect::<Vec<_>>();
+        observations[0] = f64::NAN;
+        let batch = GreenwichNodalBatch::prepare_modified_julian_days(&time, &constituents)
+            .expect("valid irregular batch");
+        let white = batch
+            .solve_time_major_with_missing_and_linear_confidence(
+                &observations,
+                &[60.0],
+                LinearConfidence::White,
+            )
+            .expect("white confidence supports irregular gappy data");
+        assert!(
+            (white[0].reference_time_days - time[1].midpoint(time[time.len() - 1])).abs() < 1e-12
+        );
+        assert_eq!(
+            batch.solve_time_major_with_missing_and_linear_confidence(
+                &observations,
+                &[60.0],
+                LinearConfidence::Colored,
+            ),
+            Err(AnalysisError::UnevenTimeForColoredConfidence)
+        );
     }
 }

@@ -20,7 +20,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
-const OUTPUT_SCHEMA_VERSION: u32 = 4;
+const OUTPUT_SCHEMA_VERSION: u32 = 5;
 /// Backward-compatible benchmark constituent set used when none is specified.
 pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -147,6 +147,10 @@ pub struct SampleResult {
     pub mean: f64,
     /// Fitted trend per day.
     pub slope_per_day: f64,
+    /// Number of finite observations used by this fit.
+    pub observation_count: usize,
+    /// Epoch at which the fitted mean is defined, as an MJD.
+    pub reference_time_modified_julian_day: f64,
 }
 
 /// Constituent-selection details retained in a completed run report.
@@ -202,6 +206,8 @@ pub struct RunReport {
     pub time_count: usize,
     /// Number of analyzed nodes.
     pub series_count: usize,
+    /// Number of series containing at least one missing observation.
+    pub series_with_missing_observations: usize,
     /// Number of outer spatial workers.
     pub workers: usize,
     /// Auditable constituent-selection method and threshold.
@@ -216,6 +222,8 @@ pub struct RunReport {
     pub constituents: Vec<String>,
     /// Reference-time frequencies in cycles per hour.
     pub frequency_cph: Vec<f64>,
+    /// Whether reference frequencies differ across fitted series.
+    pub frequency_varies_by_series: bool,
     /// SHA-256 over canonical node metadata and every numeric result.
     pub result_sha256: String,
     /// Separately measured application stages.
@@ -309,6 +317,7 @@ struct InputData {
     node_indices: Vec<usize>,
     latitudes: Vec<f64>,
     observations: Vec<f64>,
+    observation_counts: Vec<usize>,
     input_file_bytes: u64,
     logical_input_bytes: u64,
 }
@@ -377,10 +386,12 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
     let reconstruction_seconds = reconstruction_start.elapsed().as_secs_f64();
 
     let result_start = Instant::now();
+    let series_frequency_cph = solution_frequencies(&batch, &solutions)?;
     let result_sha256 = result_digest(
         &input.node_indices,
         &input.latitudes,
         batch.constituents(),
+        &series_frequency_cph,
         &solutions,
         config.confidence_interval,
         config
@@ -388,7 +399,12 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             .as_ref()
             .zip(reconstruction.as_deref()),
     )?;
-    let sample_results = retained_samples(&input.node_indices, &input.latitudes, &solutions);
+    let sample_results = retained_samples(
+        &input.node_indices,
+        &input.latitudes,
+        &input.observation_counts,
+        &solutions,
+    );
     let result_processing_seconds = result_start.elapsed().as_secs_f64();
 
     let output_start = Instant::now();
@@ -398,7 +414,9 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         &OutputData {
             node_indices: &input.node_indices,
             latitudes: &input.latitudes,
+            observation_counts: &input.observation_counts,
             constituents: batch.constituents(),
+            series_frequency_cph: &series_frequency_cph,
             solutions: &solutions,
             result_sha256: &result_sha256,
             selection: &selection,
@@ -431,6 +449,11 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         output_file_bytes,
         time_count: input.modified_julian_days.len(),
         series_count: input.node_indices.len(),
+        series_with_missing_observations: input
+            .observation_counts
+            .iter()
+            .filter(|count| **count != input.modified_julian_days.len())
+            .count(),
         workers: config.workers,
         constituent_selection: selection.report,
         confidence_interval: config.confidence_interval.method(),
@@ -449,6 +472,9 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             .iter()
             .map(|constituent| constituent.frequency_cph)
             .collect(),
+        frequency_varies_by_series: series_frequency_cph
+            .windows(2)
+            .any(|pair| pair[0] != pair[1]),
         result_sha256,
         timings: StageTimings {
             input_seconds,
@@ -475,13 +501,35 @@ fn solve_input(
     confidence_interval: ConfidenceInterval,
 ) -> Result<Vec<ScalarSolution>, AnalysisError> {
     worker_pool.install(|| match confidence_interval {
-        ConfidenceInterval::None => batch.solve_time_major(&input.observations, &input.latitudes),
-        ConfidenceInterval::Linear(noise) => batch.solve_time_major_with_linear_confidence(
-            &input.observations,
-            &input.latitudes,
-            noise,
-        ),
+        ConfidenceInterval::None => {
+            batch.solve_time_major_with_missing(&input.observations, &input.latitudes)
+        }
+        ConfidenceInterval::Linear(noise) => batch
+            .solve_time_major_with_missing_and_linear_confidence(
+                &input.observations,
+                &input.latitudes,
+                noise,
+            ),
     })
+}
+
+fn solution_frequencies(
+    batch: &GreenwichNodalBatch,
+    solutions: &[ScalarSolution],
+) -> Result<Vec<Vec<f64>>, AnalysisError> {
+    solutions
+        .iter()
+        .map(|solution| {
+            batch
+                .constituents_at_reference_modified_julian_day(solution.reference_time_days)
+                .map(|constituents| {
+                    constituents
+                        .into_iter()
+                        .map(|constituent| constituent.frequency_cph)
+                        .collect()
+                })
+        })
+        .collect()
 }
 
 fn reconstruct_input(
@@ -699,7 +747,7 @@ fn read_fvcom_scalar(path: &Path, selection: &NodeSelection) -> Result<InputData
     let zeta_fill = zeta_variable.fill_value::<f32>()?;
 
     let is_prefix = node_indices.iter().copied().eq(0..node_indices.len());
-    let (latitude_values, observation_values) = if is_prefix {
+    let (latitude_values, mut observation_values) = if is_prefix {
         (
             latitude_variable.get_values::<f64, _>(0..series_count)?,
             zeta_variable.get_values::<f64, _>((.., 0..series_count))?,
@@ -720,15 +768,25 @@ fn read_fvcom_scalar(path: &Path, selection: &NodeSelection) -> Result<InputData
     for (series, value) in latitude_values.iter().copied().enumerate() {
         validate_source_value("lat", value, latitude_fill, series, 0)?;
     }
-    for (index, value) in observation_values.iter().copied().enumerate() {
-        validate_source_value(
+    for (index, value) in observation_values.iter_mut().enumerate() {
+        *value = normalize_source_observation(
             "zeta",
-            value,
+            *value,
             zeta_fill,
             index % series_count,
             index / series_count,
         )?;
     }
+    let observation_counts = (0..series_count)
+        .map(|series| {
+            observation_values
+                .iter()
+                .skip(series)
+                .step_by(series_count)
+                .filter(|value| value.is_finite())
+                .count()
+        })
+        .collect();
 
     let observation_count = time_count
         .checked_mul(series_count)
@@ -757,6 +815,7 @@ fn read_fvcom_scalar(path: &Path, selection: &NodeSelection) -> Result<InputData
         node_indices,
         latitudes: latitude_values,
         observations: observation_values,
+        observation_counts,
         input_file_bytes,
         logical_input_bytes,
     })
@@ -860,16 +919,36 @@ fn validate_source_value(
     Ok(())
 }
 
+fn normalize_source_observation(
+    variable: &str,
+    value: f64,
+    fill_value: Option<f32>,
+    series: usize,
+    time: usize,
+) -> Result<f64, AppError> {
+    let is_fill = fill_value.is_some_and(|fill| value.to_bits() == f64::from(fill).to_bits());
+    if value.is_nan() || is_fill {
+        return Ok(f64::NAN);
+    }
+    if value.is_infinite() {
+        return Err(AppError::Invalid(format!(
+            "{variable} contains an infinite value at series {series}, time {time}"
+        )));
+    }
+    Ok(value)
+}
+
 fn result_digest(
     node_indices: &[usize],
     latitudes: &[f64],
     constituents: &[Constituent],
+    series_frequency_cph: &[Vec<f64>],
     solutions: &[ScalarSolution],
     confidence_interval: ConfidenceInterval,
     reconstruction: Option<(&ReconstructionFilter, &[Vec<f64>])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-scalar-greenwich-nodal-v4\0");
+    digest.update(b"rutide-scalar-greenwich-nodal-v5\0");
     digest.update(confidence_interval.method().as_bytes());
     digest.update([0]);
     if let Some(noise) = confidence_interval.noise() {
@@ -879,18 +958,22 @@ fn result_digest(
     for constituent in constituents {
         digest.update(constituent.name.as_bytes());
         digest.update([0]);
-        digest.update(constituent.frequency_cph.to_bits().to_le_bytes());
     }
-    for ((node_index, latitude), solution) in node_indices
+    for (((node_index, latitude), frequency_cph), solution) in node_indices
         .iter()
         .copied()
         .zip(latitudes.iter().copied())
+        .zip(series_frequency_cph)
         .zip(solutions)
     {
         let node_index = u64::try_from(node_index)
             .map_err(|_| AppError::Invalid("node index exceeds u64".to_owned()))?;
         digest.update(node_index.to_le_bytes());
         digest.update(latitude.to_bits().to_le_bytes());
+        digest.update(solution.reference_time_days.to_bits().to_le_bytes());
+        for frequency in frequency_cph {
+            digest.update(frequency.to_bits().to_le_bytes());
+        }
         for value in &solution.amplitude {
             digest.update(value.to_bits().to_le_bytes());
         }
@@ -985,16 +1068,18 @@ fn encode_hex(bytes: &[u8]) -> String {
 fn retained_samples(
     node_indices: &[usize],
     latitudes: &[f64],
+    observation_counts: &[usize],
     solutions: &[ScalarSolution],
 ) -> Vec<SampleResult> {
     node_indices
         .iter()
         .copied()
         .zip(latitudes.iter().copied())
+        .zip(observation_counts.iter().copied())
         .zip(solutions)
         .take(3)
         .map(
-            |((node_index, latitude_degrees_north), solution)| SampleResult {
+            |(((node_index, latitude_degrees_north), observation_count), solution)| SampleResult {
                 node_index,
                 latitude_degrees_north,
                 amplitude: solution.amplitude.clone(),
@@ -1005,6 +1090,8 @@ fn retained_samples(
                 signal_to_noise: solution.signal_to_noise.clone(),
                 mean: solution.mean,
                 slope_per_day: solution.slope_per_day,
+                observation_count,
+                reference_time_modified_julian_day: solution.reference_time_days,
             },
         )
         .collect()
@@ -1013,7 +1100,9 @@ fn retained_samples(
 struct OutputData<'data> {
     node_indices: &'data [usize],
     latitudes: &'data [f64],
+    observation_counts: &'data [usize],
     constituents: &'data [Constituent],
+    series_frequency_cph: &'data [Vec<f64>],
     solutions: &'data [ScalarSolution],
     result_sha256: &'data str,
     selection: &'data ResolvedConstituentSelection,
@@ -1038,11 +1127,17 @@ fn write_output(path: &Path, overwrite: bool, data: &OutputData<'_>) -> Result<(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the NetCDF schema is written in one visible, auditable transaction"
+)]
 fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError> {
     let OutputData {
         node_indices,
         latitudes,
+        observation_counts,
         constituents,
+        series_frequency_cph,
         solutions,
         result_sha256,
         selection,
@@ -1104,12 +1199,44 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         latitudes,
         "degrees_north",
     )?;
-    let frequency = constituents
+    let observation_counts = observation_counts
         .iter()
-        .map(|constituent| constituent.frequency_cph)
+        .copied()
+        .map(|count| {
+            i64::try_from(count)
+                .map_err(|_| AppError::Invalid("observation count exceeds i64".to_owned()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    write_variable(
+        &mut output.add_variable::<i64>("observation_count", &["series"])?,
+        &observation_counts,
+        "1",
+    )?;
+    let reference_times = solutions
+        .iter()
+        .map(|solution| solution.reference_time_days)
         .collect::<Vec<_>>();
     write_variable(
-        &mut output.add_variable::<f64>("frequency", &["constituent"])?,
+        &mut output.add_variable::<f64>("reference_time", &["series"])?,
+        &reference_times,
+        "days since 1858-11-17 00:00:00 UTC",
+    )?;
+    if series_frequency_cph.len() != solutions.len()
+        || series_frequency_cph
+            .iter()
+            .any(|values| values.len() != constituents.len())
+    {
+        return Err(AppError::Invalid(
+            "frequency result shape does not match output dimensions".to_owned(),
+        ));
+    }
+    let frequency = series_frequency_cph
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    write_variable(
+        &mut output.add_variable::<f64>("frequency", &["series", "constituent"])?,
         &frequency,
         "cycles per hour",
     )?;
@@ -1297,8 +1424,8 @@ mod tests {
     use std::fs;
 
     use super::{
-        NodeSelection, encode_hex, read_fvcom_scalar, resolve_node_selection, temporary_sibling,
-        write_reconstruction_variables,
+        NodeSelection, encode_hex, normalize_source_observation, read_fvcom_scalar,
+        resolve_node_selection, temporary_sibling, write_reconstruction_variables,
     };
     use rutide_core::{ReconstructionFilter, TidalConstituent};
 
@@ -1378,7 +1505,21 @@ mod tests {
             ]
         );
         assert_eq!(input.logical_input_bytes, 40);
+        assert_eq!(input.observation_counts, [2, 2]);
         fs::remove_file(path).expect("remove test NetCDF");
+    }
+
+    #[test]
+    fn source_fill_and_nan_observations_are_normalized_as_missing() {
+        let fill = -999.0_f32;
+        for value in [f64::NAN, f64::from(fill)] {
+            assert!(
+                normalize_source_observation("zeta", value, Some(fill), 2, 3)
+                    .expect("supported missing value")
+                    .is_nan()
+            );
+        }
+        assert!(normalize_source_observation("zeta", f64::INFINITY, Some(fill), 2, 3).is_err());
     }
 
     #[test]
