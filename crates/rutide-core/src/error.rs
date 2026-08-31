@@ -32,6 +32,8 @@ pub enum AnalysisError {
     EmptyConstituents,
     /// The Rayleigh criterion is not finite and strictly positive.
     InvalidRayleighMinimum,
+    /// Colored confidence intervals currently require equidistant timestamps.
+    UnevenTimeForColoredConfidence,
     /// A constituent name is empty.
     EmptyConstituentName {
         /// Position of the invalid constituent.
@@ -89,6 +91,8 @@ impl fmt::Display for AnalysisError {
             Self::InvalidRayleighMinimum => {
                 formatter.write_str("Rayleigh minimum must be finite and greater than zero")
             }
+            Self::UnevenTimeForColoredConfidence => formatter
+                .write_str("colored linear confidence intervals require equidistant timestamps"),
             Self::EmptyConstituentName { index } => {
                 write!(formatter, "constituent at index {index} has an empty name")
             }

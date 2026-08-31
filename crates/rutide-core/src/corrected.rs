@@ -6,10 +6,10 @@ use faer::Mat;
 use rayon::prelude::*;
 
 use crate::{
-    AnalysisError, Constituent, FixedRawOls, ScalarSolution, TidalConstituent,
+    AnalysisError, Constituent, FixedRawOls, LinearConfidence, ScalarSolution, TidalConstituent,
     astronomy::at_modified_julian_day,
     catalog::{CONSTITUENT_COUNT, Metadata},
-    scalar::validate_time,
+    scalar::{equidistant_sample_interval_hours, validate_time},
 };
 
 /// A reusable fixed-constituent OLS model with exact Greenwich and nodal terms.
@@ -84,6 +84,20 @@ impl GreenwichNodalOls {
         self.model.solve(observations)
     }
 
+    /// Fit one series with linearized 95% confidence intervals and SNR.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid observations or when colored noise
+    /// is requested for non-equidistant timestamps.
+    pub fn solve_with_linear_confidence(
+        &self,
+        observations: &[f64],
+        noise: LinearConfidence,
+    ) -> Result<ScalarSolution, AnalysisError> {
+        self.model.solve_with_linear_confidence(observations, noise)
+    }
+
     /// Fit complete series at the prepared latitude in time-major order.
     ///
     /// # Errors
@@ -96,6 +110,22 @@ impl GreenwichNodalOls {
         series_count: usize,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         self.model.solve_many_time_major(observations, series_count)
+    }
+
+    /// Fit complete series with linearized 95% confidence intervals and SNR.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid observations or when colored noise
+    /// is requested for non-equidistant timestamps.
+    pub fn solve_many_time_major_with_linear_confidence(
+        &self,
+        observations: &[f64],
+        series_count: usize,
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.model
+            .solve_many_time_major_with_linear_confidence(observations, series_count, noise)
     }
 }
 
@@ -159,6 +189,30 @@ impl GreenwichNodalBatch {
         observations: &[f64],
         latitudes: &[f64],
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_impl(observations, latitudes, None)
+    }
+
+    /// Fit varying-latitude series with linearized confidence intervals and SNR.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input or when colored noise is
+    /// requested for non-equidistant timestamps.
+    pub fn solve_time_major_with_linear_confidence(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_impl(observations, latitudes, Some(noise))
+    }
+
+    fn solve_time_major_impl(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        confidence: Option<LinearConfidence>,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         if latitudes.is_empty() {
             return Err(AnalysisError::EmptySeries);
         }
@@ -190,7 +244,10 @@ impl GreenwichNodalBatch {
                 for time in 0..self.time_count() {
                     series_observations.push(observations[time * series_count + series]);
                 }
-                model.solve(&series_observations)
+                match confidence {
+                    Some(noise) => model.solve_with_linear_confidence(&series_observations, noise),
+                    None => model.solve(&series_observations),
+                }
             })
             .collect()
     }
@@ -203,6 +260,7 @@ struct CorrectionBasis {
     recipes: Vec<CorrectionRecipe>,
     time_terms: Vec<TimeTerms>,
     time_span_days: f64,
+    sample_interval_hours: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -295,6 +353,7 @@ impl CorrectionBasis {
             recipes,
             time_terms,
             time_span_days,
+            sample_interval_hours: equidistant_sample_interval_hours(modified_julian_days),
         })
     }
 
@@ -324,7 +383,8 @@ impl CorrectionBasis {
             self.scalar_constituents.clone(),
             self.time_terms.len(),
             self.time_span_days,
-            &design,
+            self.sample_interval_hours,
+            design,
         ))
     }
 }

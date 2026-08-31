@@ -19,11 +19,15 @@ DEFAULT_TOLERANCES = {
     "amplitude": 3e-12,
     "complex_coefficient": 3e-12,
     "percent_energy": 1e-10,
+    "amplitude_ci": 1e-10,
+    "phase_ci_degrees": 1e-7,
     "mean": 3e-12,
     "slope_per_day": 3e-12,
     "frequency_cph": 1e-15,
 }
 BASE_PHASE_TOLERANCE_DEGREES = 3e-9
+SIGNAL_TO_NOISE_ABSOLUTE_TOLERANCE = 1e-6
+SIGNAL_TO_NOISE_RELATIVE_TOLERANCE = 1e-8
 
 
 def circular_phase_error(actual: np.ndarray, expected: np.ndarray) -> np.ndarray:
@@ -86,6 +90,38 @@ def _maximum_phase_error(values: list[tuple[float, float, int, str]]) -> dict[st
     }
 
 
+def _maximum_snr_error(values: list[tuple[float, float, int, str]]) -> dict[str, Any]:
+    error, expected, node_index, constituent = max(
+        values,
+        key=lambda item: (
+            item[0]
+            / (
+                SIGNAL_TO_NOISE_ABSOLUTE_TOLERANCE
+                + SIGNAL_TO_NOISE_RELATIVE_TOLERANCE * abs(item[1])
+            )
+        ),
+    )
+    tolerance = SIGNAL_TO_NOISE_ABSOLUTE_TOLERANCE + (
+        SIGNAL_TO_NOISE_RELATIVE_TOLERANCE * abs(expected)
+    )
+    return {
+        "maximum_absolute_error": float(max(item[0] for item in values)),
+        "absolute_tolerance": SIGNAL_TO_NOISE_ABSOLUTE_TOLERANCE,
+        "relative_tolerance": SIGNAL_TO_NOISE_RELATIVE_TOLERANCE,
+        "worst_tolerance_ratio": float(error / tolerance),
+        "within_tolerance": bool(
+            all(
+                item[0]
+                <= SIGNAL_TO_NOISE_ABSOLUTE_TOLERANCE
+                + SIGNAL_TO_NOISE_RELATIVE_TOLERANCE * abs(item[1])
+                for item in values
+            )
+        ),
+        "worst_node_index": int(node_index),
+        "worst_constituent": constituent,
+    }
+
+
 def compare_with_oracle(
     rust_output: Path,
     fixture: Path,
@@ -108,6 +144,16 @@ def compare_with_oracle(
             if "constituent_selection" in result_dataset.ncattrs()
             else "explicit"
         )
+        confidence_interval = (
+            str(result_dataset.getncattr("confidence_interval"))
+            if "confidence_interval" in result_dataset.ncattrs()
+            else "none"
+        )
+        confidence_noise = (
+            str(result_dataset.getncattr("confidence_noise"))
+            if confidence_interval == "linear"
+            else None
+        )
         names = str(result_dataset.getncattr("constituent_names")).split(",")
         if not names or len(set(names)) != len(names):
             raise ValueError(f"constituent names must be non-empty and unique: {names}")
@@ -123,6 +169,21 @@ def compare_with_oracle(
         slopes = _finite(result_dataset.variables["slope"][:], "output slope")
         frequencies = _finite(result_dataset.variables["frequency"][:], "output frequency")
         result_digest = str(result_dataset.getncattr("result_sha256"))
+        if confidence_interval == "linear":
+            amplitude_ci = _finite(
+                result_dataset.variables["amplitude_ci"][:],
+                "output amplitude CI",
+            )
+            phase_ci = _finite(
+                result_dataset.variables["phase_ci"][:],
+                "output phase CI",
+            )
+            signal_to_noise = _finite(
+                result_dataset.variables["signal_to_noise"][:],
+                "output signal-to-noise ratio",
+            )
+        else:
+            amplitude_ci = phase_ci = signal_to_noise = None
         rayleigh_min = (
             float(result_dataset.getncattr("rayleigh_min"))
             if selection_method == "rayleigh"
@@ -139,16 +200,38 @@ def compare_with_oracle(
         raise ValueError(f"unexpected phase shape: {phases.shape}")
     if percent_energy.shape != amplitudes.shape:
         raise ValueError(f"unexpected percent-energy shape: {percent_energy.shape}")
+    for description, values in (
+        ("amplitude CI", amplitude_ci),
+        ("phase CI", phase_ci),
+        ("signal-to-noise ratio", signal_to_noise),
+    ):
+        if values is not None and values.shape != amplitudes.shape:
+            raise ValueError(f"unexpected {description} shape: {values.shape}")
     if means.shape != (series_count,) or slopes.shape != (series_count,):
         raise ValueError("unexpected mean or slope shape")
     if latitudes.shape != (series_count,) or frequencies.shape != (constituent_count,):
         raise ValueError("unexpected latitude or frequency shape")
 
-    errors: dict[str, list[tuple[float, int, str | None]]] = {
-        name: [] for name in DEFAULT_TOLERANCES
-    }
+    metric_names = [
+        "amplitude",
+        "complex_coefficient",
+        "percent_energy",
+        "mean",
+        "slope_per_day",
+        "frequency_cph",
+    ]
+    if confidence_interval == "linear":
+        metric_names.extend(["amplitude_ci", "phase_ci_degrees"])
+    elif confidence_interval != "none":
+        raise ValueError(f"unsupported confidence interval: {confidence_interval}")
+    errors: dict[str, list[tuple[float, int, str | None]]] = {name: [] for name in metric_names}
     phase_errors: list[tuple[float, float, int, str]] = []
+    snr_errors: list[tuple[float, float, int, str]] = []
     options = _profile_options("fixed-constituents")
+    options["conf_int"] = confidence_interval
+    options["white"] = confidence_noise == "white"
+    if confidence_interval == "linear" and confidence_noise not in {"white", "colored"}:
+        raise ValueError(f"unsupported confidence noise model: {confidence_noise}")
     if selection_method == "rayleigh":
         if profile != "rayleigh-auto-greenwich-nodal-ols" or rayleigh_min is None:
             raise ValueError("inconsistent Rayleigh selection metadata")
@@ -195,6 +278,10 @@ def compare_with_oracle(
             expected_phase = np.asarray(coefficient.g, dtype=np.float64)[order]
             expected_frequency = np.asarray(coefficient.aux.frq, dtype=np.float64)[order]
             expected_percent_energy = np.asarray(coefficient.PE, dtype=np.float64)[order]
+            if confidence_interval == "linear":
+                expected_amplitude_ci = np.asarray(coefficient.A_ci, dtype=np.float64)[order]
+                expected_phase_ci = np.asarray(coefficient.g_ci, dtype=np.float64)[order]
+                expected_snr = np.asarray(coefficient.SNR, dtype=np.float64)[order]
             for constituent_position, constituent in enumerate(names):
                 errors["amplitude"].append(
                     (
@@ -239,6 +326,32 @@ def compare_with_oracle(
                         constituent,
                     )
                 )
+                if confidence_interval == "linear":
+                    for metric, actual, expected in (
+                        (
+                            "amplitude_ci",
+                            amplitude_ci[position, constituent_position],
+                            expected_amplitude_ci[constituent_position],
+                        ),
+                        (
+                            "phase_ci_degrees",
+                            phase_ci[position, constituent_position],
+                            expected_phase_ci[constituent_position],
+                        ),
+                    ):
+                        errors[metric].append(
+                            (abs(float(actual - expected)), node_index, constituent)
+                        )
+                    actual_snr = signal_to_noise[position, constituent_position]
+                    expected_constituent_snr = expected_snr[constituent_position]
+                    snr_errors.append(
+                        (
+                            abs(float(actual_snr - expected_constituent_snr)),
+                            float(expected_constituent_snr),
+                            node_index,
+                            constituent,
+                        )
+                    )
                 errors["frequency_cph"].append(
                     (
                         abs(
@@ -260,6 +373,8 @@ def compare_with_oracle(
         name: _maximum_error(values, DEFAULT_TOLERANCES[name]) for name, values in errors.items()
     }
     metrics["phase_degrees"] = _maximum_phase_error(phase_errors)
+    if confidence_interval == "linear":
+        metrics["signal_to_noise"] = _maximum_snr_error(snr_errors)
     return {
         "schema_version": 1,
         "created_utc": datetime.now(tz=timezone.utc).isoformat(),
@@ -267,6 +382,8 @@ def compare_with_oracle(
         "oracle": "python-utide",
         "profile": profile,
         "constituent_selection": selection_method,
+        "confidence_interval": confidence_interval,
+        "confidence_noise": confidence_noise,
         "series": series_count,
         "constituents": names,
         "fixture": str(fixture_path),

@@ -12,6 +12,7 @@ publish = false
 [dependencies]
 faer = { version = "=0.24.4", default-features = false, features = ["linalg", "rayon", "std"] }
 rayon = "=1.12.0"
+rustfft = "=6.4.1"
 
 [[bench]]
 name = "fixed_raw_throughput"

@@ -8,9 +8,10 @@ use std::{
 };
 
 use rutide_cli::{
-    AnalyzeConfig, ConstituentSelection, DEFAULT_CONSTITUENTS, NodeSelection, analyze_scalar,
+    AnalyzeConfig, ConfidenceInterval, ConstituentSelection, DEFAULT_CONSTITUENTS, NodeSelection,
+    analyze_scalar,
 };
-use rutide_core::TidalConstituent;
+use rutide_core::{LinearConfidence, TidalConstituent};
 
 // The application repeatedly allocates short-lived QR storage across worker
 // threads; this allocator keeps that full-field pattern bounded and reusable.
@@ -29,6 +30,8 @@ Options:
   --nodes I,J,...     Analyze explicit zero-based node indices
   --constituents LIST Comma-separated names or 'auto' (default: M2,S2,N2,K1,O1)
   --rayleigh-min X    Automatic selection criterion (default with auto: 1.0)
+  --confidence MODE   Confidence intervals: none or linear (default: none)
+  --white-noise       Use white noise instead of colored residual bands
   --overwrite         Replace existing output and report files
   -h, --help          Show this help
 ";
@@ -101,6 +104,8 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let mut selection = None;
     let mut constituents = None;
     let mut rayleigh_minimum = None;
+    let mut confidence_requested = None;
+    let mut white_noise = false;
     let mut overwrite = false;
     while let Some(argument) = arguments.next() {
         let option = argument
@@ -140,13 +145,40 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                     option,
                 )?);
             }
+            "--confidence" => {
+                if confidence_requested.is_some() {
+                    return Err("--confidence may only be supplied once".to_owned());
+                }
+                let value = required_value(&mut arguments, option)?;
+                confidence_requested = Some(parse_confidence(&value)?);
+            }
+            "--white-noise" => white_noise = true,
             "--overwrite" => overwrite = true,
             "--help" | "-h" => return Ok(Command::Help),
             _ => return Err(format!("unknown option for analyze-scalar: {option}")),
         }
     }
 
-    let constituent_selection = match constituents {
+    let constituent_selection = resolve_constituent_selection(constituents, rayleigh_minimum)?;
+    let confidence_interval = resolve_confidence_interval(confidence_requested, white_noise)?;
+
+    Ok(Command::Analyze(AnalyzeConfig {
+        input: input.ok_or_else(|| "analyze-scalar requires --input PATH".to_owned())?,
+        output: output.ok_or_else(|| "analyze-scalar requires --output PATH".to_owned())?,
+        report,
+        nodes: selection.unwrap_or(NodeSelection::All),
+        constituent_selection,
+        confidence_interval,
+        workers,
+        overwrite,
+    }))
+}
+
+fn resolve_constituent_selection(
+    constituents: Option<ParsedConstituents>,
+    rayleigh_minimum: Option<f64>,
+) -> Result<ConstituentSelection, String> {
+    Ok(match constituents {
         Some(ParsedConstituents::Auto) => ConstituentSelection::Rayleigh {
             minimum: rayleigh_minimum.unwrap_or(1.0),
         },
@@ -162,17 +194,24 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             }
             ConstituentSelection::Explicit(DEFAULT_CONSTITUENTS.to_vec())
         }
-    };
+    })
+}
 
-    Ok(Command::Analyze(AnalyzeConfig {
-        input: input.ok_or_else(|| "analyze-scalar requires --input PATH".to_owned())?,
-        output: output.ok_or_else(|| "analyze-scalar requires --output PATH".to_owned())?,
-        report,
-        nodes: selection.unwrap_or(NodeSelection::All),
-        constituent_selection,
-        workers,
-        overwrite,
-    }))
+fn resolve_confidence_interval(
+    confidence_requested: Option<bool>,
+    white_noise: bool,
+) -> Result<ConfidenceInterval, String> {
+    if confidence_requested.unwrap_or(false) {
+        Ok(ConfidenceInterval::Linear(if white_noise {
+            LinearConfidence::White
+        } else {
+            LinearConfidence::Colored
+        }))
+    } else if white_noise {
+        Err("--white-noise requires --confidence linear".to_owned())
+    } else {
+        Ok(ConfidenceInterval::None)
+    }
 }
 
 fn required_value(
@@ -208,6 +247,17 @@ fn parse_positive_f64(value: &OsStr, option: &str) -> Result<f64, String> {
         return Err(format!("{option} requires a finite positive number"));
     }
     Ok(parsed)
+}
+
+fn parse_confidence(value: &OsStr) -> Result<bool, String> {
+    match value.to_str() {
+        Some("none") => Ok(false),
+        Some("linear") => Ok(true),
+        Some(value) => Err(format!(
+            "--confidence must be 'none' or 'linear', received {value:?}"
+        )),
+        None => Err("--confidence value must be valid UTF-8".to_owned()),
+    }
 }
 
 fn ensure_selection_is_unset(selection: Option<&NodeSelection>) -> Result<(), String> {
@@ -274,8 +324,10 @@ mod tests {
     use std::ffi::OsString;
 
     use super::{Command, parse_arguments};
-    use rutide_cli::{ConstituentSelection, DEFAULT_CONSTITUENTS, NodeSelection};
-    use rutide_core::TidalConstituent;
+    use rutide_cli::{
+        ConfidenceInterval, ConstituentSelection, DEFAULT_CONSTITUENTS, NodeSelection,
+    };
+    use rutide_core::{LinearConfidence, TidalConstituent};
 
     fn args<'a>(values: &'a [&'a str]) -> impl Iterator<Item = OsString> + 'a {
         values.iter().map(OsString::from)
@@ -303,6 +355,7 @@ mod tests {
             config.constituent_selection,
             ConstituentSelection::Explicit(DEFAULT_CONSTITUENTS.to_vec())
         );
+        assert_eq!(config.confidence_interval, ConfidenceInterval::None);
         assert_eq!(config.workers, 8);
     }
 
@@ -407,5 +460,48 @@ mod tests {
             values.extend_from_slice(extra);
             assert!(parse_arguments(args(&values)).is_err());
         }
+    }
+
+    #[test]
+    fn parses_colored_and_white_linear_confidence() {
+        for (extra, expected) in [
+            (
+                &["--confidence", "linear"][..],
+                ConfidenceInterval::Linear(LinearConfidence::Colored),
+            ),
+            (
+                &["--confidence", "linear", "--white-noise"][..],
+                ConfidenceInterval::Linear(LinearConfidence::White),
+            ),
+        ] {
+            let mut values = vec![
+                "analyze-scalar",
+                "--input",
+                "input.nc",
+                "--output",
+                "output.nc",
+            ];
+            values.extend_from_slice(extra);
+            let command = parse_arguments(args(&values)).expect("valid confidence options");
+            let Command::Analyze(config) = command else {
+                panic!("expected analyze command");
+            };
+            assert_eq!(config.confidence_interval, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_white_noise_without_linear_confidence() {
+        assert!(
+            parse_arguments(args(&[
+                "analyze-scalar",
+                "--input",
+                "input.nc",
+                "--output",
+                "output.nc",
+                "--white-noise",
+            ]))
+            .is_err()
+        );
     }
 }

@@ -29,11 +29,12 @@ API shares latitude-independent astronomy, pre-aggregates satellite terms, and
 parallelizes the latitude-specific factorizations across spatial series. Both
 paths have real-FVCOM parity tests against the pinned Python oracle.
 
-Percent-energy diagnostics and per-solution PE ranking are available. Confidence
-intervals, missing observations, vector currents, and reconstruction are not
-implemented yet. The command-line application can analyze a complete, finite
-FVCOM `zeta(time, node)` field with an explicit or Rayleigh-selected constituent
-list and serialize its coefficients and PE diagnostics to NetCDF.
+Percent-energy diagnostics, linearized 95% amplitude/phase confidence intervals,
+CI-derived signal-to-noise ratio, and per-solution PE/SNR ranking are available.
+Missing observations, vector currents, and reconstruction are not implemented
+yet. The command-line application can analyze a complete, finite FVCOM
+`zeta(time, node)` field with an explicit or Rayleigh-selected constituent list
+and serialize its coefficients and diagnostics to NetCDF.
 
 ## Repository layout
 
@@ -93,6 +94,11 @@ Supply any unique catalog names in output order with, for example,
 benchmark profile shown above. Use `--constituents auto` for UTide-compatible
 record-length selection; its Rayleigh criterion defaults to `1.0` and can be
 changed with `--rayleigh-min X`.
+
+Add `--confidence linear` for UTide-compatible colored-noise linear confidence
+intervals and SNR. `--white-noise` selects the white residual-noise alternative.
+Colored confidence currently requires equidistant timestamps; the white model
+also supports irregular timestamps.
 
 Use `--node-count N` for a prefix or `--nodes 0,10,20` for an explicit
 correctness sample. Existing destinations are preserved unless `--overwrite`

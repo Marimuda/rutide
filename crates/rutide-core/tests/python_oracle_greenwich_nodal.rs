@@ -1,6 +1,6 @@
 //! Exact corrected-basis parity against the pinned Python `UTide` oracle.
 
-use rutide_core::{GreenwichNodalBatch, GreenwichNodalOls, TidalConstituent};
+use rutide_core::{GreenwichNodalBatch, GreenwichNodalOls, LinearConfidence, TidalConstituent};
 
 const CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -30,6 +30,41 @@ const EXPECTED_PERCENT_ENERGY: [f64; 5] = [
     4.791_299_617_550_922,
     2.427_610_428_601_086_7,
     0.908_356_208_911_755_3,
+];
+const EXPECTED_COLORED_AMPLITUDE_CI: [f64; 5] = [
+    0.015_535_798_974_675_425,
+    0.015_537_235_572_573_34,
+    0.015_537_821_673_906_426,
+    0.010_076_433_270_712_83,
+    0.010_093_351_511_400_065,
+];
+const EXPECTED_COLORED_PHASE_CI: [f64; 5] = [
+    1.361_407_136_642_137_4,
+    3.932_726_094_588_971,
+    5.632_810_429_209_694,
+    5.144_722_957_722_21,
+    8.396_448_378_163_738,
+];
+const EXPECTED_COLORED_SNR: [f64; 5] = [
+    6_804.089_537_467_822,
+    815.075_838_563_201_3,
+    397.255_211_785_300_16,
+    478.588_068_898_858_9,
+    178.476_866_307_692_97,
+];
+const EXPECTED_WHITE_AMPLITUDE_CI: [f64; 5] = [
+    0.014_416_494_272_349_716,
+    0.014_786_379_430_783_9,
+    0.014_462_354_328_718_091,
+    0.016_040_024_362_452_69,
+    0.016_925_748_523_369_234,
+];
+const EXPECTED_WHITE_PHASE_CI: [f64; 5] = [
+    1.263_322_100_120_534_1,
+    3.742_672_237_948_587_3,
+    5.242_929_285_933_047,
+    8.189_552_727_926_335,
+    14.080_176_795_362_373,
 ];
 const EXPECTED_MEAN: f64 = 0.091_040_690_255_747_43;
 const EXPECTED_SLOPE_PER_DAY: f64 = 0.001_734_852_911_719_784_6;
@@ -160,6 +195,72 @@ fn matches_python_utide_for_real_fvcom_elevation() {
         solution.slope_per_day,
         EXPECTED_SLOPE_PER_DAY,
         3e-12,
+    );
+}
+
+#[test]
+fn matches_python_utide_linear_confidence_and_derived_snr() {
+    let time = oracle_times();
+    let observations = oracle_observations();
+    let model = GreenwichNodalOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE_DEGREES_NORTH,
+        &CONSTITUENTS,
+    )
+    .expect("valid corrected oracle model");
+
+    let colored = model
+        .solve_with_linear_confidence(&observations, LinearConfidence::Colored)
+        .expect("valid colored confidence model");
+    for (label, actual, expected, tolerance) in [
+        (
+            "colored amplitude CI",
+            colored.amplitude_ci.as_ref().expect("amplitude CI"),
+            &EXPECTED_COLORED_AMPLITUDE_CI,
+            2e-11,
+        ),
+        (
+            "colored phase CI",
+            colored.phase_ci_degrees.as_ref().expect("phase CI"),
+            &EXPECTED_COLORED_PHASE_CI,
+            1e-8,
+        ),
+        (
+            "colored SNR",
+            colored.signal_to_noise.as_ref().expect("SNR"),
+            &EXPECTED_COLORED_SNR,
+            2e-5,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{label}[{index}]"), *actual, *expected, tolerance);
+        }
+    }
+
+    let white = model
+        .solve_with_linear_confidence(&observations, LinearConfidence::White)
+        .expect("valid white confidence model");
+    for (label, actual, expected, tolerance) in [
+        (
+            "white amplitude CI",
+            white.amplitude_ci.as_ref().expect("amplitude CI"),
+            &EXPECTED_WHITE_AMPLITUDE_CI,
+            2e-11,
+        ),
+        (
+            "white phase CI",
+            white.phase_ci_degrees.as_ref().expect("phase CI"),
+            &EXPECTED_WHITE_PHASE_CI,
+            1e-8,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{label}[{index}]"), *actual, *expected, tolerance);
+        }
+    }
+    assert_eq!(
+        colored.constituent_indices_by_signal_to_noise(),
+        Some(vec![0, 1, 3, 2, 4])
     );
 }
 

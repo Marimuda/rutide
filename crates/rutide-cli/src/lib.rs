@@ -10,17 +10,17 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use netcdf::{Variable, VariableMut};
+use netcdf::{FileMut, Variable, VariableMut};
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
-    AnalysisError, Constituent, GreenwichNodalBatch, RayleighSelection, ScalarSolution,
-    TidalConstituent, select_constituents_by_rayleigh,
+    AnalysisError, Constituent, GreenwichNodalBatch, LinearConfidence, RayleighSelection,
+    ScalarSolution, TidalConstituent, select_constituents_by_rayleigh,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
-const OUTPUT_SCHEMA_VERSION: u32 = 2;
+const OUTPUT_SCHEMA_VERSION: u32 = 3;
 /// Backward-compatible benchmark constituent set used when none is specified.
 pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -53,6 +53,32 @@ pub enum ConstituentSelection {
     },
 }
 
+/// Confidence-interval calculation requested for an analysis run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfidenceInterval {
+    /// Do not calculate confidence intervals or SNR.
+    None,
+    /// Calculate linearized 95% intervals using the selected noise model.
+    Linear(LinearConfidence),
+}
+
+impl ConfidenceInterval {
+    const fn method(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Linear(_) => "linear",
+        }
+    }
+
+    const fn noise(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Linear(LinearConfidence::White) => Some("white"),
+            Self::Linear(LinearConfidence::Colored) => Some("colored"),
+        }
+    }
+}
+
 /// Configuration for one scalar FVCOM analysis run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnalyzeConfig {
@@ -66,6 +92,8 @@ pub struct AnalyzeConfig {
     pub nodes: NodeSelection,
     /// Explicit or record-length-based constituent selection.
     pub constituent_selection: ConstituentSelection,
+    /// Optional linearized confidence intervals and their noise model.
+    pub confidence_interval: ConfidenceInterval,
     /// Number of outer spatial worker threads.
     pub workers: usize,
     /// Permit replacing existing output and report files.
@@ -102,6 +130,15 @@ pub struct SampleResult {
     pub phase_degrees: Vec<f64>,
     /// Percent energy in the report's constituent order.
     pub percent_energy: Vec<f64>,
+    /// Linearized 95% amplitude CI half-widths, when enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amplitude_ci: Option<Vec<f64>>,
+    /// Linearized 95% phase CI half-widths in degrees, when enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_ci_degrees: Option<Vec<f64>>,
+    /// Signal-to-noise ratio derived from amplitude CI, when enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal_to_noise: Option<Vec<f64>>,
     /// Fitted constant offset.
     pub mean: f64,
     /// Fitted trend per day.
@@ -150,6 +187,10 @@ pub struct RunReport {
     pub workers: usize,
     /// Auditable constituent-selection method and threshold.
     pub constituent_selection: ConstituentSelectionReport,
+    /// Confidence method: `none` or `linear`.
+    pub confidence_interval: &'static str,
+    /// Residual-noise model when confidence intervals are enabled.
+    pub confidence_noise: Option<&'static str>,
     /// Constituent names in coefficient order.
     pub constituents: Vec<String>,
     /// Reference-time frequencies in cycles per hour.
@@ -294,8 +335,14 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         .num_threads(config.workers)
         .build()?;
     let solve_start = Instant::now();
-    let solutions =
-        worker_pool.install(|| batch.solve_time_major(&input.observations, &input.latitudes))?;
+    let solutions = worker_pool.install(|| match config.confidence_interval {
+        ConfidenceInterval::None => batch.solve_time_major(&input.observations, &input.latitudes),
+        ConfidenceInterval::Linear(noise) => batch.solve_time_major_with_linear_confidence(
+            &input.observations,
+            &input.latitudes,
+            noise,
+        ),
+    })?;
     let solve_seconds = solve_start.elapsed().as_secs_f64();
 
     let result_start = Instant::now();
@@ -304,6 +351,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         &input.latitudes,
         batch.constituents(),
         &solutions,
+        config.confidence_interval,
     )?;
     let sample_results = retained_samples(&input.node_indices, &input.latitudes, &solutions);
     let result_processing_seconds = result_start.elapsed().as_secs_f64();
@@ -319,6 +367,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             solutions: &solutions,
             result_sha256: &result_sha256,
             selection: &selection,
+            confidence_interval: config.confidence_interval,
         },
     )?;
     let output_seconds = output_start.elapsed().as_secs_f64();
@@ -343,6 +392,8 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         series_count: input.node_indices.len(),
         workers: config.workers,
         constituent_selection: selection.report,
+        confidence_interval: config.confidence_interval.method(),
+        confidence_noise: config.confidence_interval.noise(),
         constituents: batch
             .constituents()
             .iter()
@@ -646,9 +697,16 @@ fn result_digest(
     latitudes: &[f64],
     constituents: &[Constituent],
     solutions: &[ScalarSolution],
+    confidence_interval: ConfidenceInterval,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-scalar-greenwich-nodal-v2\0");
+    digest.update(b"rutide-scalar-greenwich-nodal-v3\0");
+    digest.update(confidence_interval.method().as_bytes());
+    digest.update([0]);
+    if let Some(noise) = confidence_interval.noise() {
+        digest.update(noise.as_bytes());
+    }
+    digest.update([0]);
     for constituent in constituents {
         digest.update(constituent.name.as_bytes());
         digest.update([0]);
@@ -673,10 +731,41 @@ fn result_digest(
         for value in &solution.percent_energy {
             digest.update(value.to_bits().to_le_bytes());
         }
+        if let Some((amplitude_ci, phase_ci_degrees, signal_to_noise)) =
+            confidence_values(solution, confidence_interval)?
+        {
+            for values in [amplitude_ci, phase_ci_degrees, signal_to_noise] {
+                for value in values {
+                    digest.update(value.to_bits().to_le_bytes());
+                }
+            }
+        }
         digest.update(solution.mean.to_bits().to_le_bytes());
         digest.update(solution.slope_per_day.to_bits().to_le_bytes());
     }
     Ok(encode_hex(&digest.finalize()))
+}
+
+type ConfidenceValues<'solution> = (&'solution [f64], &'solution [f64], &'solution [f64]);
+
+fn confidence_values(
+    solution: &ScalarSolution,
+    requested: ConfidenceInterval,
+) -> Result<Option<ConfidenceValues<'_>>, AppError> {
+    match (
+        requested,
+        solution.amplitude_ci.as_deref(),
+        solution.phase_ci_degrees.as_deref(),
+        solution.signal_to_noise.as_deref(),
+    ) {
+        (ConfidenceInterval::None, None, None, None) => Ok(None),
+        (ConfidenceInterval::Linear(_), Some(amplitude), Some(phase), Some(snr)) => {
+            Ok(Some((amplitude, phase, snr)))
+        }
+        _ => Err(AppError::Invalid(
+            "solver returned inconsistent confidence-interval fields".to_owned(),
+        )),
+    }
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -707,6 +796,9 @@ fn retained_samples(
                 amplitude: solution.amplitude.clone(),
                 phase_degrees: solution.phase_degrees.clone(),
                 percent_energy: solution.percent_energy.clone(),
+                amplitude_ci: solution.amplitude_ci.clone(),
+                phase_ci_degrees: solution.phase_ci_degrees.clone(),
+                signal_to_noise: solution.signal_to_noise.clone(),
                 mean: solution.mean,
                 slope_per_day: solution.slope_per_day,
             },
@@ -721,6 +813,7 @@ struct OutputData<'data> {
     solutions: &'data [ScalarSolution],
     result_sha256: &'data str,
     selection: &'data ResolvedConstituentSelection,
+    confidence_interval: ConfidenceInterval,
 }
 
 fn write_output(path: &Path, overwrite: bool, data: &OutputData<'_>) -> Result<(), AppError> {
@@ -746,6 +839,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         solutions,
         result_sha256,
         selection,
+        confidence_interval,
     } = *data;
     let mut output = netcdf::create(path)?;
     output.add_dimension("series", node_indices.len())?;
@@ -753,6 +847,10 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
     output.add_attribute("title", "RUTide scalar harmonic coefficients")?;
     output.add_attribute("rutide_version", rutide_core::VERSION)?;
     output.add_attribute("profile", selection.profile())?;
+    output.add_attribute("confidence_interval", confidence_interval.method())?;
+    if let Some(noise) = confidence_interval.noise() {
+        output.add_attribute("confidence_noise", noise)?;
+    }
     output.add_attribute("constituent_selection", selection.report.method)?;
     if let Some(rayleigh_min) = selection.report.rayleigh_min {
         output.add_attribute("rayleigh_min", rayleigh_min)?;
@@ -798,15 +896,36 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         "cycles per hour",
     )?;
 
+    write_solution_variables(&mut output, constituents, solutions, confidence_interval)?;
+    output.close()?;
+    Ok(())
+}
+
+fn write_solution_variables(
+    output: &mut FileMut,
+    constituents: &[Constituent],
+    solutions: &[ScalarSolution],
+    confidence_interval: ConfidenceInterval,
+) -> Result<(), AppError> {
     let mut amplitude = Vec::with_capacity(solutions.len() * constituents.len());
     let mut phase = Vec::with_capacity(solutions.len() * constituents.len());
     let mut percent_energy = Vec::with_capacity(solutions.len() * constituents.len());
+    let mut amplitude_ci = Vec::new();
+    let mut phase_ci_degrees = Vec::new();
+    let mut signal_to_noise = Vec::new();
     let mut mean = Vec::with_capacity(solutions.len());
     let mut slope = Vec::with_capacity(solutions.len());
     for solution in solutions {
         amplitude.extend_from_slice(&solution.amplitude);
         phase.extend_from_slice(&solution.phase_degrees);
         percent_energy.extend_from_slice(&solution.percent_energy);
+        if let Some((solution_amplitude_ci, solution_phase_ci, solution_snr)) =
+            confidence_values(solution, confidence_interval)?
+        {
+            amplitude_ci.extend_from_slice(solution_amplitude_ci);
+            phase_ci_degrees.extend_from_slice(solution_phase_ci);
+            signal_to_noise.extend_from_slice(solution_snr);
+        }
         mean.push(solution.mean);
         slope.push(solution.slope_per_day);
     }
@@ -825,6 +944,23 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         &percent_energy,
         "percent",
     )?;
+    if confidence_interval != ConfidenceInterval::None {
+        write_variable(
+            &mut output.add_variable::<f64>("amplitude_ci", &["series", "constituent"])?,
+            &amplitude_ci,
+            "source variable units",
+        )?;
+        write_variable(
+            &mut output.add_variable::<f64>("phase_ci", &["series", "constituent"])?,
+            &phase_ci_degrees,
+            "degrees",
+        )?;
+        write_variable(
+            &mut output.add_variable::<f64>("signal_to_noise", &["series", "constituent"])?,
+            &signal_to_noise,
+            "1",
+        )?;
+    }
     write_variable(
         &mut output.add_variable::<f64>("mean", &["series"])?,
         &mean,
@@ -835,7 +971,6 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         &slope,
         "source variable units per day",
     )?;
-    output.close()?;
     Ok(())
 }
 
