@@ -1,0 +1,1112 @@
+//! FVCOM depth-averaged vector-current application path.
+
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+
+use netcdf::{FileMut, Variable};
+use rayon::ThreadPoolBuilder;
+use rutide_core::{
+    AnalysisError, Constituent, GreenwichNodalBatch, ReconstructionFilter, VectorReconstruction,
+    VectorSolution,
+};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+use super::{
+    AnalyzeConfig, AppError, ConfidenceInterval, ConstituentSelection, ConstituentSelectionReport,
+    MILLISECONDS_PER_DAY, NodeSelection, ReconstructionReport, ResolvedConstituentSelection,
+    StageTimings, encode_hex, normalize_source_observation, reconstruction_report,
+    required_dimension_length, required_variable, resolve_constituent_selection, temporary_sibling,
+    update_reconstruction_filter_digest, validate_config, validate_dimensions,
+    validate_reconstruction_filter, validate_source_value, write_json_report, write_variable,
+};
+
+const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 1;
+
+/// Configuration for one depth-averaged FVCOM current analysis.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorAnalyzeConfig {
+    /// Read-only source FVCOM `NetCDF` path.
+    pub input: PathBuf,
+    /// Destination `NetCDF` ellipse-coefficient path.
+    pub output: PathBuf,
+    /// Optional JSON run-report path.
+    pub report: Option<PathBuf>,
+    /// Element subset to analyze.
+    pub elements: NodeSelection,
+    /// Explicit or record-length-based constituent selection.
+    pub constituent_selection: ConstituentSelection,
+    /// Optional linearized ellipse intervals and their noise model.
+    pub confidence_interval: ConfidenceInterval,
+    /// Optional complete-series reconstruction and constituent filter.
+    pub reconstruction: Option<ReconstructionFilter>,
+    /// Number of outer spatial worker threads.
+    pub workers: usize,
+    /// Permit replacing existing output and report files.
+    pub overwrite: bool,
+}
+
+/// A small retained vector-current sample in the JSON run report.
+#[derive(Clone, Debug, Serialize)]
+pub struct VectorSampleResult {
+    /// Original zero-based FVCOM element index.
+    pub element_index: usize,
+    /// Element-center latitude in degrees north.
+    pub latitude_degrees_north: f64,
+    /// Semi-major axes in constituent order.
+    pub semi_major: Vec<f64>,
+    /// Signed semi-minor axes in constituent order.
+    pub semi_minor: Vec<f64>,
+    /// Major-axis inclinations in degrees.
+    pub inclination_degrees: Vec<f64>,
+    /// Greenwich phases in degrees.
+    pub phase_degrees: Vec<f64>,
+    /// Percent ellipse energy in constituent order.
+    pub percent_energy: Vec<f64>,
+    /// Linearized semi-major 95% confidence half-widths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semi_major_ci: Option<Vec<f64>>,
+    /// Linearized semi-minor 95% confidence half-widths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semi_minor_ci: Option<Vec<f64>>,
+    /// Linearized inclination 95% confidence half-widths in degrees.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inclination_ci_degrees: Option<Vec<f64>>,
+    /// Linearized phase 95% confidence half-widths in degrees.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_ci_degrees: Option<Vec<f64>>,
+    /// Ellipse-energy signal-to-noise ratios.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal_to_noise: Option<Vec<f64>>,
+    /// Fitted eastward constant offset.
+    pub eastward_mean: f64,
+    /// Fitted northward constant offset.
+    pub northward_mean: f64,
+    /// Fitted eastward trend per day.
+    pub eastward_slope_per_day: f64,
+    /// Fitted northward trend per day.
+    pub northward_slope_per_day: f64,
+    /// Number of joint finite component samples used by the fit.
+    pub observation_count: usize,
+    /// Epoch at which fitted means are defined, as an MJD.
+    pub reference_time_modified_julian_day: f64,
+}
+
+/// Machine-readable summary of one completed vector-current run.
+#[derive(Clone, Debug, Serialize)]
+pub struct VectorRunReport {
+    /// Vector report schema version.
+    pub schema_version: u32,
+    /// Unix timestamp at report construction.
+    pub created_unix_seconds: u64,
+    /// `RUTide` package version.
+    pub rutide_version: &'static str,
+    /// Frozen solver profile name.
+    pub profile: &'static str,
+    /// Source path as supplied to the application.
+    pub input_path: String,
+    /// Source container size, not bytes physically read.
+    pub input_file_bytes: u64,
+    /// Logical payload bytes requested from the five input variables.
+    pub logical_input_bytes: u64,
+    /// Output coefficient path.
+    pub output_path: String,
+    /// Completed output file size.
+    pub output_file_bytes: u64,
+    /// Number of timestamps.
+    pub time_count: usize,
+    /// Number of analyzed elements.
+    pub series_count: usize,
+    /// Number of elements with at least one missing component sample.
+    pub series_with_missing_observations: usize,
+    /// Number of outer spatial workers.
+    pub workers: usize,
+    /// Auditable constituent-selection method and threshold.
+    pub constituent_selection: ConstituentSelectionReport,
+    /// Confidence method: `none` or `linear`.
+    pub confidence_interval: &'static str,
+    /// Residual-noise model when confidence intervals are enabled.
+    pub confidence_noise: Option<&'static str>,
+    /// Complete-series reconstruction configuration, when enabled.
+    pub reconstruction: Option<ReconstructionReport>,
+    /// Constituent names in coefficient order.
+    pub constituents: Vec<String>,
+    /// Reference-time frequencies in cycles per hour.
+    pub frequency_cph: Vec<f64>,
+    /// Whether reference frequencies differ across fitted series.
+    pub frequency_varies_by_series: bool,
+    /// SHA-256 over canonical element metadata and every numeric result.
+    pub result_sha256: String,
+    /// Separately measured application stages.
+    pub timings: StageTimings,
+    /// First three results in output order.
+    pub sample_results: Vec<VectorSampleResult>,
+}
+
+struct VectorInputData {
+    modified_julian_days: Vec<f64>,
+    element_indices: Vec<usize>,
+    latitudes: Vec<f64>,
+    eastward: Vec<f64>,
+    northward: Vec<f64>,
+    observation_counts: Vec<usize>,
+    input_file_bytes: u64,
+    logical_input_bytes: u64,
+}
+
+/// Analyze FVCOM `ua(time, nele)` and `va(time, nele)` currents.
+///
+/// A time sample is omitted from both components when either source component
+/// is missing. Infinities remain hard input errors.
+///
+/// # Errors
+///
+/// Returns [`AppError`] when configuration, source schema, observations,
+/// numerical analysis, or output serialization fails.
+#[allow(
+    clippy::too_many_lines,
+    reason = "top-level orchestration keeps separately timed stages visible"
+)]
+pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, AppError> {
+    validate_vector_config(config)?;
+    faer::set_global_parallelism(faer::Par::Seq);
+    let total_start = Instant::now();
+
+    let input_start = Instant::now();
+    let input = read_fvcom_vector(&config.input, &config.elements)?;
+    let input_seconds = input_start.elapsed().as_secs_f64();
+
+    let preparation_start = Instant::now();
+    let selection =
+        resolve_constituent_selection(&config.constituent_selection, &input.modified_julian_days)?;
+    let batch = GreenwichNodalBatch::prepare_modified_julian_days(
+        &input.modified_julian_days,
+        &selection.constituents,
+    )?;
+    if let Some(filter) = &config.reconstruction {
+        validate_reconstruction_filter(filter, &selection.constituents)?;
+    }
+    let preparation_seconds = preparation_start.elapsed().as_secs_f64();
+
+    let worker_pool = ThreadPoolBuilder::new()
+        .num_threads(config.workers)
+        .build()?;
+    let solve_start = Instant::now();
+    let solutions = worker_pool.install(|| match config.confidence_interval {
+        ConfidenceInterval::None => batch.solve_vector_time_major_with_missing(
+            &input.eastward,
+            &input.northward,
+            &input.latitudes,
+        ),
+        ConfidenceInterval::Linear(noise) => batch
+            .solve_vector_time_major_with_missing_and_linear_confidence(
+                &input.eastward,
+                &input.northward,
+                &input.latitudes,
+                noise,
+            ),
+    })?;
+    let solve_seconds = solve_start.elapsed().as_secs_f64();
+
+    let reconstruction_start = Instant::now();
+    let reconstruction = if let Some(filter) = config.reconstruction.as_ref() {
+        let reconstructor =
+            batch.reconstructor_modified_julian_days(&input.modified_julian_days)?;
+        Some(worker_pool.install(|| {
+            reconstructor.reconstruct_many_vectors_series_major(
+                &solutions,
+                &input.latitudes,
+                filter,
+            )
+        })?)
+    } else {
+        None
+    };
+    let reconstruction_seconds = reconstruction_start.elapsed().as_secs_f64();
+
+    let result_start = Instant::now();
+    let series_frequency_cph = vector_solution_frequencies(&batch, &solutions)?;
+    let result_sha256 = vector_result_digest(
+        &input.element_indices,
+        &input.latitudes,
+        batch.constituents(),
+        &series_frequency_cph,
+        &solutions,
+        config.confidence_interval,
+        config
+            .reconstruction
+            .as_ref()
+            .zip(reconstruction.as_deref()),
+    )?;
+    let sample_results = retained_vector_samples(&input, &solutions);
+    let result_processing_seconds = result_start.elapsed().as_secs_f64();
+
+    let output_start = Instant::now();
+    write_vector_output(
+        &config.output,
+        config.overwrite,
+        &VectorOutputData {
+            input: &input,
+            constituents: batch.constituents(),
+            series_frequency_cph: &series_frequency_cph,
+            solutions: &solutions,
+            result_sha256: &result_sha256,
+            selection: &selection,
+            confidence_interval: config.confidence_interval,
+            reference_time_modified_julian_day: batch.reference_time_modified_julian_day(),
+            reconstruction: config
+                .reconstruction
+                .as_ref()
+                .zip(reconstruction.as_deref()),
+        },
+    )?;
+    let output_seconds = output_start.elapsed().as_secs_f64();
+    let total_seconds = total_start.elapsed().as_secs_f64();
+    let output_file_bytes = fs::metadata(&config.output)?.len();
+    let created_unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(std::io::Error::other)?
+        .as_secs();
+    let report = VectorRunReport {
+        schema_version: VECTOR_OUTPUT_SCHEMA_VERSION,
+        created_unix_seconds,
+        rutide_version: rutide_core::VERSION,
+        profile: vector_profile(&selection),
+        input_path: config.input.to_string_lossy().into_owned(),
+        input_file_bytes: input.input_file_bytes,
+        logical_input_bytes: input.logical_input_bytes,
+        output_path: config.output.to_string_lossy().into_owned(),
+        output_file_bytes,
+        time_count: input.modified_julian_days.len(),
+        series_count: input.element_indices.len(),
+        series_with_missing_observations: input
+            .observation_counts
+            .iter()
+            .filter(|count| **count != input.modified_julian_days.len())
+            .count(),
+        workers: config.workers,
+        constituent_selection: selection.report,
+        confidence_interval: config.confidence_interval.method(),
+        confidence_noise: config.confidence_interval.noise(),
+        reconstruction: config
+            .reconstruction
+            .as_ref()
+            .map(|filter| reconstruction_report(filter, input.modified_julian_days.len())),
+        constituents: batch
+            .constituents()
+            .iter()
+            .map(|constituent| constituent.name.clone())
+            .collect(),
+        frequency_cph: batch
+            .constituents()
+            .iter()
+            .map(|constituent| constituent.frequency_cph)
+            .collect(),
+        frequency_varies_by_series: series_frequency_cph
+            .windows(2)
+            .any(|pair| pair[0] != pair[1]),
+        result_sha256,
+        timings: StageTimings {
+            input_seconds,
+            preparation_seconds,
+            solve_seconds,
+            reconstruction_seconds,
+            result_processing_seconds,
+            output_seconds,
+            total_seconds,
+        },
+        sample_results,
+    };
+    if let Some(path) = &config.report {
+        write_json_report(path, config.overwrite, &report)?;
+    }
+    Ok(report)
+}
+
+fn validate_vector_config(config: &VectorAnalyzeConfig) -> Result<(), AppError> {
+    validate_config(&AnalyzeConfig {
+        input: config.input.clone(),
+        output: config.output.clone(),
+        report: config.report.clone(),
+        nodes: config.elements.clone(),
+        constituent_selection: config.constituent_selection.clone(),
+        confidence_interval: config.confidence_interval,
+        reconstruction: config.reconstruction.clone(),
+        workers: config.workers,
+        overwrite: config.overwrite,
+    })
+}
+
+fn vector_profile(selection: &ResolvedConstituentSelection) -> &'static str {
+    match selection.report.method {
+        "explicit" => "fixed-constituents-greenwich-nodal-vector-ols",
+        "rayleigh" => "rayleigh-auto-greenwich-nodal-vector-ols",
+        _ => unreachable!("selection methods are constructed internally"),
+    }
+}
+
+fn read_fvcom_vector(path: &Path, selection: &NodeSelection) -> Result<VectorInputData, AppError> {
+    let input_file_bytes = fs::metadata(path)?.len();
+    let dataset = netcdf::open(path)?;
+    let time_count = required_dimension_length(&dataset, "time")?;
+    let element_count = required_dimension_length(&dataset, "nele")?;
+    let element_indices = resolve_element_selection(selection, element_count)?;
+    let series_count = element_indices.len();
+
+    let integer_day_variable = required_variable(&dataset, "Itime")?;
+    validate_dimensions(&integer_day_variable, &[("time", time_count)])?;
+    let integer_days = integer_day_variable.get_values::<i32, _>(..)?;
+    let millisecond_variable = required_variable(&dataset, "Itime2")?;
+    validate_dimensions(&millisecond_variable, &[("time", time_count)])?;
+    let integer_milliseconds = millisecond_variable.get_values::<i32, _>(..)?;
+    let modified_julian_days = integer_days
+        .into_iter()
+        .zip(integer_milliseconds)
+        .map(|(day, milliseconds)| f64::from(day) + f64::from(milliseconds) / MILLISECONDS_PER_DAY)
+        .collect::<Vec<_>>();
+
+    let latitude_variable = required_variable(&dataset, "latc")?;
+    validate_dimensions(&latitude_variable, &[("nele", element_count)])?;
+    let latitude_fill = latitude_variable.fill_value::<f32>()?;
+    let eastward_variable = required_vector_variable(&dataset, "ua", time_count, element_count)?;
+    let northward_variable = required_vector_variable(&dataset, "va", time_count, element_count)?;
+    let eastward_fill = eastward_variable.fill_value::<f32>()?;
+    let northward_fill = northward_variable.fill_value::<f32>()?;
+
+    let is_prefix = element_indices.iter().copied().eq(0..series_count);
+    let (latitude_values, mut eastward, mut northward) = if is_prefix {
+        (
+            latitude_variable.get_values::<f64, _>(0..series_count)?,
+            eastward_variable.get_values::<f64, _>((.., 0..series_count))?,
+            northward_variable.get_values::<f64, _>((.., 0..series_count))?,
+        )
+    } else {
+        let mut latitude_values = Vec::with_capacity(series_count);
+        let mut eastward = vec![0.0; time_count * series_count];
+        let mut northward = vec![0.0; time_count * series_count];
+        for (series, element) in element_indices.iter().copied().enumerate() {
+            latitude_values.push(latitude_variable.get_value::<f64, _>(element)?);
+            let eastward_column = eastward_variable.get_values::<f64, _>((.., element))?;
+            let northward_column = northward_variable.get_values::<f64, _>((.., element))?;
+            for time in 0..time_count {
+                eastward[time * series_count + series] = eastward_column[time];
+                northward[time * series_count + series] = northward_column[time];
+            }
+        }
+        (latitude_values, eastward, northward)
+    };
+
+    for (series, value) in latitude_values.iter().copied().enumerate() {
+        validate_source_value("latc", value, latitude_fill, series, 0)?;
+    }
+    let mut observation_counts = vec![0; series_count];
+    for index in 0..eastward.len() {
+        let series = index % series_count;
+        let time = index / series_count;
+        eastward[index] =
+            normalize_source_observation("ua", eastward[index], eastward_fill, series, time)?;
+        northward[index] =
+            normalize_source_observation("va", northward[index], northward_fill, series, time)?;
+        if eastward[index].is_finite() && northward[index].is_finite() {
+            observation_counts[series] += 1;
+        } else {
+            eastward[index] = f64::NAN;
+            northward[index] = f64::NAN;
+        }
+    }
+
+    let value_count = time_count
+        .checked_mul(series_count)
+        .ok_or_else(|| AppError::Invalid("logical input size exceeds usize".to_owned()))?;
+    let logical_input_bytes = logical_input_bytes(&[
+        (time_count, integer_day_variable.vartype().size()),
+        (time_count, millisecond_variable.vartype().size()),
+        (series_count, latitude_variable.vartype().size()),
+        (value_count, eastward_variable.vartype().size()),
+        (value_count, northward_variable.vartype().size()),
+    ])?;
+    Ok(VectorInputData {
+        modified_julian_days,
+        element_indices,
+        latitudes: latitude_values,
+        eastward,
+        northward,
+        observation_counts,
+        input_file_bytes,
+        logical_input_bytes,
+    })
+}
+
+fn required_vector_variable<'dataset>(
+    dataset: &'dataset netcdf::File,
+    name: &str,
+    time_count: usize,
+    element_count: usize,
+) -> Result<Variable<'dataset>, AppError> {
+    let variable = required_variable(dataset, name)?;
+    validate_dimensions(&variable, &[("time", time_count), ("nele", element_count)])?;
+    Ok(variable)
+}
+
+fn resolve_element_selection(
+    selection: &NodeSelection,
+    element_count: usize,
+) -> Result<Vec<usize>, AppError> {
+    if element_count == 0 {
+        return Err(AppError::Invalid(
+            "source nele dimension must not be empty".to_owned(),
+        ));
+    }
+    match selection {
+        NodeSelection::All => Ok((0..element_count).collect()),
+        NodeSelection::Prefix(count) => {
+            if *count == 0 || *count > element_count {
+                return Err(AppError::Invalid(format!(
+                    "element prefix must be between 1 and {element_count}, received {count}"
+                )));
+            }
+            Ok((0..*count).collect())
+        }
+        NodeSelection::Indices(indices) => {
+            if indices.is_empty() {
+                return Err(AppError::Invalid(
+                    "explicit element selection must not be empty".to_owned(),
+                ));
+            }
+            let mut unique = BTreeSet::new();
+            for index in indices.iter().copied() {
+                if index >= element_count {
+                    return Err(AppError::Invalid(format!(
+                        "element index {index} is outside source element count {element_count}"
+                    )));
+                }
+                if !unique.insert(index) {
+                    return Err(AppError::Invalid(format!(
+                        "element index {index} appears more than once"
+                    )));
+                }
+            }
+            Ok(indices.clone())
+        }
+    }
+}
+
+fn logical_input_bytes(fields: &[(usize, usize)]) -> Result<u64, AppError> {
+    fields
+        .iter()
+        .copied()
+        .try_fold(0_u64, |total, (count, width)| {
+            let count = u64::try_from(count)
+                .map_err(|_| AppError::Invalid("logical input size exceeds u64".to_owned()))?;
+            let width = u64::try_from(width)
+                .map_err(|_| AppError::Invalid("source element size exceeds u64".to_owned()))?;
+            total
+                .checked_add(count.checked_mul(width).ok_or_else(|| {
+                    AppError::Invalid("logical input byte count overflows u64".to_owned())
+                })?)
+                .ok_or_else(|| {
+                    AppError::Invalid("logical input byte count overflows u64".to_owned())
+                })
+        })
+}
+
+fn vector_solution_frequencies(
+    batch: &GreenwichNodalBatch,
+    solutions: &[VectorSolution],
+) -> Result<Vec<Vec<f64>>, AnalysisError> {
+    solutions
+        .iter()
+        .map(|solution| {
+            batch
+                .constituents_at_reference_modified_julian_day(solution.reference_time_days)
+                .map(|constituents| {
+                    constituents
+                        .into_iter()
+                        .map(|constituent| constituent.frequency_cph)
+                        .collect()
+                })
+        })
+        .collect()
+}
+
+type VectorConfidenceValues<'solution> = (
+    &'solution [f64],
+    &'solution [f64],
+    &'solution [f64],
+    &'solution [f64],
+    &'solution [f64],
+);
+
+fn vector_confidence_values(
+    solution: &VectorSolution,
+    requested: ConfidenceInterval,
+) -> Result<Option<VectorConfidenceValues<'_>>, AppError> {
+    match (
+        requested,
+        solution.semi_major_ci.as_deref(),
+        solution.semi_minor_ci.as_deref(),
+        solution.inclination_ci_degrees.as_deref(),
+        solution.phase_ci_degrees.as_deref(),
+        solution.signal_to_noise.as_deref(),
+    ) {
+        (ConfidenceInterval::None, None, None, None, None, None) => Ok(None),
+        (
+            ConfidenceInterval::Linear(_),
+            Some(major),
+            Some(minor),
+            Some(theta),
+            Some(phase),
+            Some(snr),
+        ) => Ok(Some((major, minor, theta, phase, snr))),
+        _ => Err(AppError::Invalid(
+            "solver returned inconsistent vector confidence fields".to_owned(),
+        )),
+    }
+}
+
+fn vector_result_digest(
+    element_indices: &[usize],
+    latitudes: &[f64],
+    constituents: &[Constituent],
+    series_frequency_cph: &[Vec<f64>],
+    solutions: &[VectorSolution],
+    confidence_interval: ConfidenceInterval,
+    reconstruction: Option<(&ReconstructionFilter, &[VectorReconstruction])>,
+) -> Result<String, AppError> {
+    let mut digest = Sha256::new();
+    digest.update(b"rutide-vector-greenwich-nodal-v1\0");
+    digest.update(confidence_interval.method().as_bytes());
+    digest.update([0]);
+    if let Some(noise) = confidence_interval.noise() {
+        digest.update(noise.as_bytes());
+    }
+    digest.update([0]);
+    for constituent in constituents {
+        digest.update(constituent.name.as_bytes());
+        digest.update([0]);
+    }
+    for (((element_index, latitude), frequency_cph), solution) in element_indices
+        .iter()
+        .copied()
+        .zip(latitudes.iter().copied())
+        .zip(series_frequency_cph)
+        .zip(solutions)
+    {
+        digest.update(
+            u64::try_from(element_index)
+                .map_err(|_| AppError::Invalid("element index exceeds u64".to_owned()))?
+                .to_le_bytes(),
+        );
+        digest.update(latitude.to_bits().to_le_bytes());
+        digest.update(solution.reference_time_days.to_bits().to_le_bytes());
+        for values in [
+            frequency_cph.as_slice(),
+            &solution.semi_major,
+            &solution.semi_minor,
+            &solution.inclination_degrees,
+            &solution.phase_degrees,
+            &solution.percent_energy,
+        ] {
+            for value in values {
+                digest.update(value.to_bits().to_le_bytes());
+            }
+        }
+        if let Some(values) = vector_confidence_values(solution, confidence_interval)? {
+            for values in [values.0, values.1, values.2, values.3, values.4] {
+                for value in values {
+                    digest.update(value.to_bits().to_le_bytes());
+                }
+            }
+        }
+        for value in [
+            solution.eastward_mean,
+            solution.northward_mean,
+            solution.eastward_slope_per_day,
+            solution.northward_slope_per_day,
+        ] {
+            digest.update(value.to_bits().to_le_bytes());
+        }
+    }
+    if let Some((filter, values)) = reconstruction {
+        update_reconstruction_filter_digest(&mut digest, filter);
+        for series in values {
+            for component in [&series.eastward, &series.northward] {
+                for value in component {
+                    digest.update(value.to_bits().to_le_bytes());
+                }
+            }
+        }
+    } else {
+        digest.update(b"no-reconstruction\0");
+    }
+    Ok(encode_hex(&digest.finalize()))
+}
+
+fn retained_vector_samples(
+    input: &VectorInputData,
+    solutions: &[VectorSolution],
+) -> Vec<VectorSampleResult> {
+    input
+        .element_indices
+        .iter()
+        .copied()
+        .zip(input.latitudes.iter().copied())
+        .zip(input.observation_counts.iter().copied())
+        .zip(solutions)
+        .take(3)
+        .map(
+            |(((element_index, latitude_degrees_north), observation_count), solution)| {
+                VectorSampleResult {
+                    element_index,
+                    latitude_degrees_north,
+                    semi_major: solution.semi_major.clone(),
+                    semi_minor: solution.semi_minor.clone(),
+                    inclination_degrees: solution.inclination_degrees.clone(),
+                    phase_degrees: solution.phase_degrees.clone(),
+                    percent_energy: solution.percent_energy.clone(),
+                    semi_major_ci: solution.semi_major_ci.clone(),
+                    semi_minor_ci: solution.semi_minor_ci.clone(),
+                    inclination_ci_degrees: solution.inclination_ci_degrees.clone(),
+                    phase_ci_degrees: solution.phase_ci_degrees.clone(),
+                    signal_to_noise: solution.signal_to_noise.clone(),
+                    eastward_mean: solution.eastward_mean,
+                    northward_mean: solution.northward_mean,
+                    eastward_slope_per_day: solution.eastward_slope_per_day,
+                    northward_slope_per_day: solution.northward_slope_per_day,
+                    observation_count,
+                    reference_time_modified_julian_day: solution.reference_time_days,
+                }
+            },
+        )
+        .collect()
+}
+
+struct VectorOutputData<'data> {
+    input: &'data VectorInputData,
+    constituents: &'data [Constituent],
+    series_frequency_cph: &'data [Vec<f64>],
+    solutions: &'data [VectorSolution],
+    result_sha256: &'data str,
+    selection: &'data ResolvedConstituentSelection,
+    confidence_interval: ConfidenceInterval,
+    reference_time_modified_julian_day: f64,
+    reconstruction: Option<(&'data ReconstructionFilter, &'data [VectorReconstruction])>,
+}
+
+fn write_vector_output(
+    path: &Path,
+    overwrite: bool,
+    data: &VectorOutputData<'_>,
+) -> Result<(), AppError> {
+    let temporary = temporary_sibling(path)?;
+    if let Err(error) = write_vector_output_file(&temporary, data) {
+        let _ignored = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if path.exists() && !overwrite {
+        let _ignored = fs::remove_file(&temporary);
+        return Err(AppError::DestinationExists(path.to_owned()));
+    }
+    fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the vector NetCDF schema is one visible transaction"
+)]
+fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<(), AppError> {
+    let input = data.input;
+    let mut output = netcdf::create(path)?;
+    output.add_dimension("series", input.element_indices.len())?;
+    output.add_dimension("constituent", data.constituents.len())?;
+    if data.reconstruction.is_some() {
+        output.add_dimension("time", input.modified_julian_days.len())?;
+    }
+    output.add_attribute("title", "RUTide depth-averaged current ellipses")?;
+    output.add_attribute(
+        "rutide_schema_version",
+        i64::from(VECTOR_OUTPUT_SCHEMA_VERSION),
+    )?;
+    output.add_attribute("rutide_version", rutide_core::VERSION)?;
+    output.add_attribute("profile", vector_profile(data.selection))?;
+    output.add_attribute("source_eastward_variable", "ua")?;
+    output.add_attribute("source_northward_variable", "va")?;
+    output.add_attribute("confidence_interval", data.confidence_interval.method())?;
+    if let Some(noise) = data.confidence_interval.noise() {
+        output.add_attribute("confidence_noise", noise)?;
+    }
+    output.add_attribute("constituent_selection", data.selection.report.method)?;
+    if let Some(value) = data.selection.report.rayleigh_min {
+        output.add_attribute("rayleigh_min", value)?;
+    }
+    if let Some(value) = data.selection.report.minimum_separation_cph {
+        output.add_attribute("minimum_separation_cph", value)?;
+    }
+    if let Some(value) = data.selection.report.record_span_days {
+        output.add_attribute("record_span_days", value)?;
+    }
+    output.add_attribute(
+        "constituent_names",
+        data.constituents
+            .iter()
+            .map(|constituent| constituent.name.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+    )?;
+    output.add_attribute(
+        "reference_time_modified_julian_day",
+        data.reference_time_modified_julian_day,
+    )?;
+    output.add_attribute("result_sha256", data.result_sha256)?;
+
+    let element_indices = input
+        .element_indices
+        .iter()
+        .copied()
+        .map(|index| {
+            i64::try_from(index)
+                .map_err(|_| AppError::Invalid("element index exceeds i64".to_owned()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    write_variable(
+        &mut output.add_variable::<i64>("element_index", &["series"])?,
+        &element_indices,
+        "1",
+    )?;
+    write_variable(
+        &mut output.add_variable::<f64>("latitude", &["series"])?,
+        &input.latitudes,
+        "degrees_north",
+    )?;
+    let observation_counts = input
+        .observation_counts
+        .iter()
+        .copied()
+        .map(|count| {
+            i64::try_from(count)
+                .map_err(|_| AppError::Invalid("observation count exceeds i64".to_owned()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    write_variable(
+        &mut output.add_variable::<i64>("observation_count", &["series"])?,
+        &observation_counts,
+        "1",
+    )?;
+    let reference_times = data
+        .solutions
+        .iter()
+        .map(|solution| solution.reference_time_days)
+        .collect::<Vec<_>>();
+    write_variable(
+        &mut output.add_variable::<f64>("reference_time", &["series"])?,
+        &reference_times,
+        "days since 1858-11-17 00:00:00 UTC",
+    )?;
+    if data.series_frequency_cph.len() != data.solutions.len()
+        || data
+            .series_frequency_cph
+            .iter()
+            .any(|values| values.len() != data.constituents.len())
+    {
+        return Err(AppError::Invalid(
+            "frequency result shape does not match output dimensions".to_owned(),
+        ));
+    }
+    write_variable(
+        &mut output.add_variable::<f64>("frequency", &["series", "constituent"])?,
+        &data
+            .series_frequency_cph
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>(),
+        "cycles per hour",
+    )?;
+    write_vector_solution_variables(
+        &mut output,
+        data.constituents.len(),
+        data.solutions,
+        data.confidence_interval,
+    )?;
+    if let Some((filter, values)) = data.reconstruction {
+        write_vector_reconstruction_variables(&mut output, input, filter, values)?;
+    }
+    output.close()?;
+    Ok(())
+}
+
+fn write_vector_solution_variables(
+    output: &mut FileMut,
+    constituent_count: usize,
+    solutions: &[VectorSolution],
+    confidence_interval: ConfidenceInterval,
+) -> Result<(), AppError> {
+    let capacity = solutions.len() * constituent_count;
+    let mut semi_major = Vec::with_capacity(capacity);
+    let mut semi_minor = Vec::with_capacity(capacity);
+    let mut inclination = Vec::with_capacity(capacity);
+    let mut phase = Vec::with_capacity(capacity);
+    let mut percent_energy = Vec::with_capacity(capacity);
+    let mut semi_major_ci = Vec::new();
+    let mut semi_minor_ci = Vec::new();
+    let mut inclination_ci = Vec::new();
+    let mut phase_ci = Vec::new();
+    let mut signal_to_noise = Vec::new();
+    let mut eastward_mean = Vec::with_capacity(solutions.len());
+    let mut northward_mean = Vec::with_capacity(solutions.len());
+    let mut eastward_slope = Vec::with_capacity(solutions.len());
+    let mut northward_slope = Vec::with_capacity(solutions.len());
+    for solution in solutions {
+        for values in [
+            (&mut semi_major, &solution.semi_major),
+            (&mut semi_minor, &solution.semi_minor),
+            (&mut inclination, &solution.inclination_degrees),
+            (&mut phase, &solution.phase_degrees),
+            (&mut percent_energy, &solution.percent_energy),
+        ] {
+            values.0.extend_from_slice(values.1);
+        }
+        if let Some(values) = vector_confidence_values(solution, confidence_interval)? {
+            semi_major_ci.extend_from_slice(values.0);
+            semi_minor_ci.extend_from_slice(values.1);
+            inclination_ci.extend_from_slice(values.2);
+            phase_ci.extend_from_slice(values.3);
+            signal_to_noise.extend_from_slice(values.4);
+        }
+        eastward_mean.push(solution.eastward_mean);
+        northward_mean.push(solution.northward_mean);
+        eastward_slope.push(solution.eastward_slope_per_day);
+        northward_slope.push(solution.northward_slope_per_day);
+    }
+    for (name, values, units) in [
+        ("semi_major", &semi_major, "source velocity units"),
+        ("semi_minor", &semi_minor, "source velocity units"),
+        ("inclination", &inclination, "degrees"),
+        ("phase", &phase, "degrees"),
+        ("percent_energy", &percent_energy, "percent"),
+    ] {
+        write_variable(
+            &mut output.add_variable::<f64>(name, &["series", "constituent"])?,
+            values,
+            units,
+        )?;
+    }
+    if confidence_interval != ConfidenceInterval::None {
+        for (name, values, units) in [
+            ("semi_major_ci", &semi_major_ci, "source velocity units"),
+            ("semi_minor_ci", &semi_minor_ci, "source velocity units"),
+            ("inclination_ci", &inclination_ci, "degrees"),
+            ("phase_ci", &phase_ci, "degrees"),
+            ("signal_to_noise", &signal_to_noise, "1"),
+        ] {
+            write_variable(
+                &mut output.add_variable::<f64>(name, &["series", "constituent"])?,
+                values,
+                units,
+            )?;
+        }
+    }
+    for (name, values, units) in [
+        ("eastward_mean", &eastward_mean, "source velocity units"),
+        ("northward_mean", &northward_mean, "source velocity units"),
+        (
+            "eastward_slope",
+            &eastward_slope,
+            "source velocity units per day",
+        ),
+        (
+            "northward_slope",
+            &northward_slope,
+            "source velocity units per day",
+        ),
+    ] {
+        write_variable(
+            &mut output.add_variable::<f64>(name, &["series"])?,
+            values,
+            units,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_vector_reconstruction_variables(
+    output: &mut FileMut,
+    input: &VectorInputData,
+    filter: &ReconstructionFilter,
+    values: &[VectorReconstruction],
+) -> Result<(), AppError> {
+    if values.len() != input.element_indices.len()
+        || values.iter().any(|series| {
+            series.eastward.len() != input.modified_julian_days.len()
+                || series.northward.len() != input.modified_julian_days.len()
+        })
+    {
+        return Err(AppError::Invalid(
+            "vector reconstruction shape does not match output dimensions".to_owned(),
+        ));
+    }
+    let report = reconstruction_report(filter, input.modified_julian_days.len());
+    output.add_attribute("reconstruction_filter", report.filter)?;
+    if let Some(constituents) = report.constituents {
+        output.add_attribute("reconstruction_constituents", constituents.join(","))?;
+    }
+    if let Some(value) = report.minimum_percent_energy {
+        output.add_attribute("reconstruction_minimum_percent_energy", value)?;
+    }
+    if let Some(value) = report.minimum_signal_to_noise {
+        output.add_attribute("reconstruction_minimum_signal_to_noise", value)?;
+    }
+    write_variable(
+        &mut output.add_variable::<f64>("time", &["time"])?,
+        &input.modified_julian_days,
+        "days since 1858-11-17 00:00:00 UTC",
+    )?;
+    for (name, eastward) in [
+        ("eastward_reconstruction", true),
+        ("northward_reconstruction", false),
+    ] {
+        let mut variable = output.add_variable::<f64>(name, &["time", "series"])?;
+        variable.put_attribute("units", "source velocity units")?;
+        for (series, reconstruction) in values.iter().enumerate() {
+            let component = if eastward {
+                &reconstruction.eastward
+            } else {
+                &reconstruction.northward
+            };
+            variable.put_values(component, (.., series))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use rutide_core::{LinearConfidence, ReconstructionFilter, TidalConstituent};
+
+    use super::{
+        ConfidenceInterval, ConstituentSelection, NodeSelection, VectorAnalyzeConfig,
+        analyze_vector, read_fvcom_vector, temporary_sibling,
+    };
+
+    #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::too_many_lines,
+        reason = "the f32 NetCDF integration fixture intentionally exercises source precision"
+    )]
+    fn vector_application_uses_joint_missing_mask_and_writes_ellipses() {
+        let input_destination = std::env::temp_dir().join("rutide-vector-input-test.nc");
+        let input_path = temporary_sibling(&input_destination).expect("valid input path");
+        let output_destination = std::env::temp_dir().join("rutide-vector-output-test.nc");
+        let output_path = temporary_sibling(&output_destination).expect("valid output path");
+        let time_count = 49_usize;
+        let fill = -999.0_f32;
+        let mut dataset = netcdf::create(&input_path).expect("create vector fixture");
+        dataset.add_dimension("time", time_count).expect("add time");
+        dataset.add_dimension("nele", 2).expect("add elements");
+        dataset
+            .add_variable::<i32>("Itime", &["time"])
+            .expect("add Itime")
+            .put_values(&vec![58_113; time_count], ..)
+            .expect("write Itime");
+        dataset
+            .add_variable::<i32>("Itime2", &["time"])
+            .expect("add Itime2")
+            .put_values(
+                &(0..time_count)
+                    .map(|index| i32::try_from(index).expect("small index") * 3_600_000)
+                    .collect::<Vec<_>>(),
+                ..,
+            )
+            .expect("write Itime2");
+        dataset
+            .add_variable::<f32>("latc", &["nele"])
+            .expect("add latc")
+            .put_values(&[60.0, 61.0], ..)
+            .expect("write latc");
+        let mut eastward = Vec::with_capacity(time_count * 2);
+        let mut northward = Vec::with_capacity(time_count * 2);
+        for index in 0..time_count {
+            let position = f64::from(u32::try_from(index).expect("small fixture index"));
+            eastward.extend([
+                (0.2 + (position / 4.0).sin()) as f32,
+                (-0.1 + (position / 7.0).cos()) as f32,
+            ]);
+            northward.extend([
+                (0.3 + (position / 5.0).cos()) as f32,
+                (0.05 + (position / 9.0).sin()) as f32,
+            ]);
+        }
+        eastward[3 * 2] = fill;
+        northward[4 * 2 + 1] = fill;
+        {
+            let mut variable = dataset
+                .add_variable::<f32>("ua", &["time", "nele"])
+                .expect("add ua");
+            variable.set_fill_value(fill).expect("set ua fill");
+            variable.put_values(&eastward, ..).expect("write ua");
+        }
+        {
+            let mut variable = dataset
+                .add_variable::<f32>("va", &["time", "nele"])
+                .expect("add va");
+            variable.set_fill_value(fill).expect("set va fill");
+            variable.put_values(&northward, ..).expect("write va");
+        }
+        dataset.close().expect("close vector fixture");
+
+        let input = read_fvcom_vector(&input_path, &NodeSelection::Indices(vec![1, 0]))
+            .expect("read vector fixture");
+        assert_eq!(input.element_indices, [1, 0]);
+        assert_eq!(input.observation_counts, [48, 48]);
+        assert!(input.eastward[4 * 2].is_nan());
+        assert!(input.northward[4 * 2].is_nan());
+        assert!(input.eastward[3 * 2 + 1].is_nan());
+        assert!(input.northward[3 * 2 + 1].is_nan());
+
+        let report = analyze_vector(&VectorAnalyzeConfig {
+            input: input_path.clone(),
+            output: output_path.clone(),
+            report: None,
+            elements: NodeSelection::Indices(vec![1, 0]),
+            constituent_selection: ConstituentSelection::Explicit(vec![
+                TidalConstituent::M2,
+                TidalConstituent::K1,
+            ]),
+            confidence_interval: ConfidenceInterval::Linear(LinearConfidence::White),
+            reconstruction: Some(ReconstructionFilter::All),
+            workers: 2,
+            overwrite: false,
+        })
+        .expect("analyze vector fixture");
+        assert_eq!(report.series_count, 2);
+        assert_eq!(report.series_with_missing_observations, 2);
+        let output = netcdf::open(&output_path).expect("open vector output");
+        assert_eq!(
+            output
+                .variable("observation_count")
+                .expect("observation count")
+                .get_values::<i64, _>(..)
+                .expect("read observation count"),
+            [48, 48]
+        );
+        assert_eq!(output.variable("semi_major").expect("semi-major").len(), 4);
+        assert_eq!(
+            output
+                .variable("eastward_reconstruction")
+                .expect("eastward reconstruction")
+                .len(),
+            time_count * 2
+        );
+        drop(output);
+        fs::remove_file(input_path).expect("remove vector fixture");
+        fs::remove_file(output_path).expect("remove vector output");
+    }
+}

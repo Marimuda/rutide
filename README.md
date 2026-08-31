@@ -34,11 +34,13 @@ CI-derived signal-to-noise ratio, per-solution PE/SNR ranking, and exact scalar
 reconstruction are available. Reconstruction supports arbitrary target times in
 the core API and an opt-in complete original-time series in the FVCOM command.
 Scalar `_FillValue` and `NaN` observations are omitted per series, with shared
-valid-time masks grouped before fitting. Vector currents are not implemented yet.
-The command-line application can analyze an FVCOM `zeta(time, node)` field with
-an explicit or Rayleigh-selected constituent list and serialize its coefficients,
-diagnostics, observation counts, per-series reference epochs, and optional
-reconstruction to NetCDF.
+valid-time masks grouped before fitting. Depth-averaged vector currents now use
+the same machinery with a joint `ua`/`va` validity mask and return current
+ellipses, all four linearized ellipse confidence intervals, SNR, PE, and optional
+eastward/northward reconstruction. The command-line application accepts either
+FVCOM `zeta(time, node)` or `ua(time, nele)` plus `va(time, nele)` and serializes
+the corresponding analysis, diagnostics, observation counts, per-series
+reference epochs, and optional reconstruction to NetCDF.
 
 ## Repository layout
 
@@ -147,6 +149,39 @@ uv run --project benchmarks/python --locked \
 Each series must retain enough finite observations to overdetermine its selected
 model. Infinite observations remain invalid; missing samples are reported rather
 than silently replaced in the fit.
+
+## FVCOM vector-current analysis
+
+Use `analyze-vector` for FVCOM depth-averaged eastward/northward currents. The
+source schema is `ua(time, nele)`, `va(time, nele)`, and `latc(nele)`. A sample is
+removed from both components when either is `_FillValue` or `NaN`; this preserves
+a single current ellipse fit on a joint time base.
+
+```console
+cargo run --release --bin rutide -- analyze-vector \
+  --input /path/to/fvcom.nc \
+  --output current-ellipses.nc \
+  --report current-run.json \
+  --constituents M2,S2,N2,K1,O1 \
+  --confidence linear \
+  --reconstruct \
+  --workers 64
+```
+
+The output includes semi-major and signed semi-minor axes, inclination, Greenwich
+phase, PE, and—when enabled—the four ellipse CIs and SNR. Reconstruction is
+written as `eastward_reconstruction(time, series)` and
+`northward_reconstruction(time, series)`. Use `--element-count N` or
+`--elements 0,10,20` for subsets. Dynamic constituent selection and reconstruction
+filters behave as in scalar mode.
+
+For compatibility, colored two-dimensional linear intervals reproduce the
+pinned Python UTide implementation exactly, including its asymmetric variance
+rescaling: the eastward coefficient pair retains the white estimate while the
+northward pair uses its colored residual band. White intervals support irregular
+timestamps. Colored intervals support gaps on an originally regular grid, but
+truly irregular colored spectra are rejected explicitly until the planned
+Lomb–Scargle path is implemented.
 
 ## Working principles
 

@@ -9,7 +9,7 @@ use std::{
 
 use rutide_cli::{
     AnalyzeConfig, ConfidenceInterval, ConstituentSelection, DEFAULT_CONSTITUENTS, NodeSelection,
-    analyze_scalar,
+    VectorAnalyzeConfig, analyze_scalar, analyze_vector,
 };
 use rutide_core::ReconstructionFilter;
 use rutide_core::{LinearConfidence, TidalConstituent};
@@ -23,12 +23,15 @@ const USAGE: &str = "\
 Usage:
   rutide --version
   rutide analyze-scalar --input PATH --output PATH [OPTIONS]
+  rutide analyze-vector --input PATH --output PATH [OPTIONS]
 
 Options:
   --report PATH       Write the machine-readable JSON run report
   --workers N         Outer spatial workers (default: available CPUs)
   --node-count N      Analyze the first N nodes
   --nodes I,J,...     Analyze explicit zero-based node indices
+  --element-count N   Analyze the first N elements (vector mode)
+  --elements I,J,...  Analyze explicit zero-based element indices (vector mode)
   --constituents LIST Comma-separated names or 'auto' (default: M2,S2,N2,K1,O1)
   --rayleigh-min X    Automatic selection criterion (default with auto: 1.0)
   --confidence MODE   Confidence intervals: none or linear (default: none)
@@ -45,7 +48,8 @@ Options:
 enum Command {
     Help,
     Version,
-    Analyze(AnalyzeConfig),
+    AnalyzeScalar(AnalyzeConfig),
+    AnalyzeVector(VectorAnalyzeConfig),
 }
 
 fn main() -> ExitCode {
@@ -66,22 +70,33 @@ fn main() -> ExitCode {
             println!("rutide {}", rutide_core::VERSION);
             ExitCode::SUCCESS
         }
-        Command::Analyze(config) => match analyze_scalar(&config) {
-            Ok(report) => match serde_json::to_string_pretty(&report) {
-                Ok(json) => {
-                    println!("{json}");
-                    ExitCode::SUCCESS
-                }
-                Err(error) => {
-                    eprintln!("error: could not serialize completed run report: {error}");
-                    ExitCode::FAILURE
-                }
-            },
+        Command::AnalyzeScalar(config) => match analyze_scalar(&config) {
+            Ok(report) => print_report(&report),
             Err(error) => {
                 eprintln!("error: {error}");
                 ExitCode::FAILURE
             }
         },
+        Command::AnalyzeVector(config) => match analyze_vector(&config) {
+            Ok(report) => print_report(&report),
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
+
+fn print_report(report: &impl serde::Serialize) -> ExitCode {
+    match serde_json::to_string_pretty(report) {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: could not serialize completed run report: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -103,9 +118,11 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     if command == "--help" || command == "-h" {
         return Ok(Command::Help);
     }
-    if command != "analyze-scalar" {
-        return Err(format!("unknown command: {}", command.to_string_lossy()));
-    }
+    let vector = match command.to_str() {
+        Some("analyze-scalar") => false,
+        Some("analyze-vector") => true,
+        _ => return Err(format!("unknown command: {}", command.to_string_lossy())),
+    };
 
     let mut input = None;
     let mut output = None;
@@ -133,11 +150,32 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                 workers = parse_positive_usize(&required_value(&mut arguments, option)?, option)?;
             }
             "--node-count" => {
+                if vector {
+                    return Err("--node-count is only valid for analyze-scalar".to_owned());
+                }
                 ensure_selection_is_unset(selection.as_ref())?;
                 let count = parse_positive_usize(&required_value(&mut arguments, option)?, option)?;
                 selection = Some(NodeSelection::Prefix(count));
             }
             "--nodes" => {
+                if vector {
+                    return Err("--nodes is only valid for analyze-scalar".to_owned());
+                }
+                ensure_selection_is_unset(selection.as_ref())?;
+                selection = Some(parse_nodes(&required_value(&mut arguments, option)?)?);
+            }
+            "--element-count" => {
+                if !vector {
+                    return Err("--element-count is only valid for analyze-vector".to_owned());
+                }
+                ensure_selection_is_unset(selection.as_ref())?;
+                let count = parse_positive_usize(&required_value(&mut arguments, option)?, option)?;
+                selection = Some(NodeSelection::Prefix(count));
+            }
+            "--elements" => {
+                if !vector {
+                    return Err("--elements is only valid for analyze-vector".to_owned());
+                }
                 ensure_selection_is_unset(selection.as_ref())?;
                 selection = Some(parse_nodes(&required_value(&mut arguments, option)?)?);
             }
@@ -197,7 +235,14 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             }
             "--overwrite" => overwrite = true,
             "--help" | "-h" => return Ok(Command::Help),
-            _ => return Err(format!("unknown option for analyze-scalar: {option}")),
+            _ => {
+                let command = if vector {
+                    "analyze-vector"
+                } else {
+                    "analyze-scalar"
+                };
+                return Err(format!("unknown option for {command}: {option}"));
+            }
         }
     }
 
@@ -211,17 +256,39 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
         confidence_interval,
     )?;
 
-    Ok(Command::Analyze(AnalyzeConfig {
-        input: input.ok_or_else(|| "analyze-scalar requires --input PATH".to_owned())?,
-        output: output.ok_or_else(|| "analyze-scalar requires --output PATH".to_owned())?,
-        report,
-        nodes: selection.unwrap_or(NodeSelection::All),
-        constituent_selection,
-        confidence_interval,
-        reconstruction,
-        workers,
-        overwrite,
-    }))
+    let command_name = if vector {
+        "analyze-vector"
+    } else {
+        "analyze-scalar"
+    };
+    let input = input.ok_or_else(|| format!("{command_name} requires --input PATH"))?;
+    let output = output.ok_or_else(|| format!("{command_name} requires --output PATH"))?;
+    let selection = selection.unwrap_or(NodeSelection::All);
+    if vector {
+        Ok(Command::AnalyzeVector(VectorAnalyzeConfig {
+            input,
+            output,
+            report,
+            elements: selection,
+            constituent_selection,
+            confidence_interval,
+            reconstruction,
+            workers,
+            overwrite,
+        }))
+    } else {
+        Ok(Command::AnalyzeScalar(AnalyzeConfig {
+            input,
+            output,
+            report,
+            nodes: selection,
+            constituent_selection,
+            confidence_interval,
+            reconstruction,
+            workers,
+            overwrite,
+        }))
+    }
 }
 
 fn resolve_reconstruction(
@@ -459,7 +526,7 @@ mod tests {
             "8",
         ]))
         .expect("valid arguments");
-        let Command::Analyze(config) = command else {
+        let Command::AnalyzeScalar(config) = command else {
             panic!("expected analyze command");
         };
         assert_eq!(config.nodes, NodeSelection::Indices(vec![4, 1, 3]));
@@ -470,6 +537,44 @@ mod tests {
         assert_eq!(config.confidence_interval, ConfidenceInterval::None);
         assert_eq!(config.reconstruction, None);
         assert_eq!(config.workers, 8);
+    }
+
+    #[test]
+    fn parses_vector_element_selection_and_shared_options() {
+        let command = parse_arguments(args(&[
+            "analyze-vector",
+            "--input",
+            "input.nc",
+            "--output",
+            "output.nc",
+            "--elements",
+            "4,1,3",
+            "--confidence",
+            "linear",
+            "--reconstruct",
+        ]))
+        .expect("valid vector arguments");
+        let Command::AnalyzeVector(config) = command else {
+            panic!("expected vector analyze command");
+        };
+        assert_eq!(config.elements, NodeSelection::Indices(vec![4, 1, 3]));
+        assert_eq!(
+            config.confidence_interval,
+            ConfidenceInterval::Linear(LinearConfidence::Colored)
+        );
+        assert_eq!(config.reconstruction, Some(ReconstructionFilter::All));
+        assert!(
+            parse_arguments(args(&[
+                "analyze-vector",
+                "--input",
+                "input.nc",
+                "--output",
+                "output.nc",
+                "--nodes",
+                "1",
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -502,7 +607,7 @@ mod tests {
             "Q1,M2,M4,MK3",
         ]))
         .expect("valid arguments");
-        let Command::Analyze(config) = command else {
+        let Command::AnalyzeScalar(config) = command else {
             panic!("expected analyze command");
         };
         assert_eq!(
@@ -547,7 +652,7 @@ mod tests {
             "0.95",
         ]))
         .expect("valid arguments");
-        let Command::Analyze(config) = command else {
+        let Command::AnalyzeScalar(config) = command else {
             panic!("expected analyze command");
         };
         assert_eq!(
@@ -596,7 +701,7 @@ mod tests {
             ];
             values.extend_from_slice(extra);
             let command = parse_arguments(args(&values)).expect("valid confidence options");
-            let Command::Analyze(config) = command else {
+            let Command::AnalyzeScalar(config) = command else {
                 panic!("expected analyze command");
             };
             assert_eq!(config.confidence_interval, expected);
@@ -654,7 +759,7 @@ mod tests {
             ];
             values.extend_from_slice(extra);
             let command = parse_arguments(args(&values)).expect("valid reconstruction options");
-            let Command::Analyze(config) = command else {
+            let Command::AnalyzeScalar(config) = command else {
                 panic!("expected analyze command");
             };
             assert_eq!(config.reconstruction, Some(expected));

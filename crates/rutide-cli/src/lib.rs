@@ -19,6 +19,10 @@ use rutide_core::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+mod vector;
+
+pub use vector::{VectorAnalyzeConfig, VectorRunReport, VectorSampleResult, analyze_vector};
+
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
 const OUTPUT_SCHEMA_VERSION: u32 = 5;
 /// Backward-compatible benchmark constituent set used when none is specified.
@@ -1382,7 +1386,11 @@ where
     Ok(())
 }
 
-fn write_json_report(path: &Path, overwrite: bool, report: &RunReport) -> Result<(), AppError> {
+fn write_json_report<T: Serialize>(
+    path: &Path,
+    overwrite: bool,
+    report: &T,
+) -> Result<(), AppError> {
     let temporary = temporary_sibling(path)?;
     let file = File::create(&temporary)?;
     let mut writer = BufWriter::new(file);
