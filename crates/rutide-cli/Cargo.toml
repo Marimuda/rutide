@@ -1,0 +1,20 @@
+[package]
+name = "rutide-cli"
+description = "Command-line interface and benchmark application for RUTide"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+readme.workspace = true
+publish = false
+
+[[bin]]
+name = "rutide"
+path = "src/main.rs"
+
+[dependencies]
+rutide-core = { path = "../rutide-core" }
+
+[lints]
+workspace = true

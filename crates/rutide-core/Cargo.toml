@@ -1,0 +1,13 @@
+[package]
+name = "rutide-core"
+description = "Numerical core for RUTide harmonic analysis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+readme.workspace = true
+publish = false
+
+[lints]
+workspace = true

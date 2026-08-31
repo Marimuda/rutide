@@ -1,0 +1,17 @@
+# Rust build output
+/target/
+
+# Project-local developer toolchains and benchmark artifacts
+/.tools/
+/benchmark-results/
+/perf.data*
+/*.profraw
+
+# The pinned Python implementation is an external compatibility oracle.
+/UTide/
+
+# Editor and operating-system noise
+.DS_Store
+*.swp
+*.swo
+*~
