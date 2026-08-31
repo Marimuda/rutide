@@ -47,3 +47,9 @@ N2, K1, and O1 with ordinary least squares, a mean and trend, raw phase, no noda
 corrections, and no confidence intervals. This deliberately isolates harmonic
 basis construction and least squares before the Greenwich/nodal machinery is
 ported.
+
+The `fixed-constituents` profile is the next Rust parity target. It keeps the same
+five constituents and OLS configuration while enabling exact Greenwich phase and
+nodal/satellite corrections. The corresponding Rust batch path shares only the
+time-dependent terms; it still constructs a distinct design and factorization for
+each latitude.

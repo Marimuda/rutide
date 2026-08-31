@@ -1,7 +1,20 @@
 # RUTide feasibility and benchmark plan
 
-Status: pre-implementation plan  
+Status: implementation underway
+
 Date: 2026-08-31
+
+## Progress snapshot
+
+The baseline, fixed raw-kernel, and fixed corrected bulk gates have been reached
+for the initial five-constituent scalar profile. Real FVCOM node-zero results
+match the pinned Python oracle, and the corrected field API scales across cores
+by separating shared time-only satellite terms from latitude-specific designs.
+
+The application gate remains open. Current Rust timings are solve-only
+microbenchmarks with in-memory synthetic spatial repetition; they do not include
+reading distinct values from NetCDF, missing-data handling, or result
+serialization. See the curated snapshots under `benchmarks/results/`.
 
 ## Objective
 
@@ -303,13 +316,11 @@ replacement.
 
 ## Immediate next steps
 
-1. Pin a reproducible Python environment and record its BLAS/LAPACK backend.
-2. Implement a read-only fixture inspector and deterministic index manifest.
-3. Build the canonical and multiprocessing Python benchmark harness first.
-4. Freeze result schemas, solver profiles, and numeric tolerances from reference
-   cases.
-5. Profile the baseline to estimate the upper bound from removing Python overhead
-   and reusing setup work.
-6. Install/pin Rust only after the baseline is trustworthy, then prototype the
-   scalar fixed-constituent OLS path.
-
+1. Add a Rust NetCDF input path for `Itime`, `Itime2`, `lat`, and `zeta` without
+   coupling file-format concerns into `rutide-core`.
+2. Run the exact corrected batch on the 32 frozen correctness nodes and all
+   75,160 distinct elevation series.
+3. Measure warm-cache application throughput, peak memory, and result
+   serialization against the tuned Python process pool.
+4. Decide the application gate before expanding the catalog or implementing
+   confidence intervals, vector currents, reconstruction, and gappy series.

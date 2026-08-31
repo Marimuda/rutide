@@ -10,11 +10,15 @@ rewrite, a smaller native kernel used from Python, or no rewrite at all. See the
 [benchmark and decision plan](BENCHMARK_PLAN.md) for the fixture, comparison
 protocol, correctness contract, and decision gates.
 
-The first implemented kernel fits fixed scalar constituents with OLS, mean, trend,
-raw phase, and no nodal corrections. It reuses one pivoted-QR factorization across
-many time-major spatial series and is covered by a real-FVCOM Python-oracle parity
-test. Greenwich/nodal corrections and the broader UTide API are not implemented
-yet.
+The implemented scalar kernels now cover fixed-constituent OLS with mean and
+trend in both raw-phase mode and exact Greenwich/nodal mode. The corrected bulk
+API shares latitude-independent astronomy, pre-aggregates satellite terms, and
+parallelizes the latitude-specific factorizations across spatial series. Both
+paths have real-FVCOM parity tests against the pinned Python oracle.
+
+The current exact-correction catalog contains M2, S2, N2, K1, and O1. Automatic
+selection, confidence intervals, missing observations, vector currents,
+reconstruction, and end-to-end NetCDF processing are not implemented yet.
 
 ## Repository layout
 
