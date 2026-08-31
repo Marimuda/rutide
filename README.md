@@ -10,6 +10,13 @@ rewrite, a smaller native kernel used from Python, or no rewrite at all. See the
 [benchmark and decision plan](BENCHMARK_PLAN.md) for the fixture, comparison
 protocol, correctness contract, and decision gates.
 
+The first complete scalar application measurement passes the provisional gate:
+3.15 seconds median whole-process wall time for Rust versus 64.69 seconds for the
+32-process Python baseline on all 75,160 nodes. See the
+[application benchmark snapshot](benchmarks/results/fvcom-scalar-application-2026-08-31.md)
+for the exact profile, correctness errors, worker scaling, resource caveats, and
+scope limits.
+
 The implemented scalar kernels now cover fixed-constituent OLS with mean and
 trend in both raw-phase mode and exact Greenwich/nodal mode. The corrected bulk
 API shares latitude-independent astronomy, pre-aggregates satellite terms, and

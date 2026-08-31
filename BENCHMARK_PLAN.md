@@ -11,12 +11,15 @@ for the initial five-constituent scalar profile. Real FVCOM node-zero results
 match the pinned Python oracle, and the corrected field API scales across cores
 by separating shared time-only satellite terms from latitude-specific designs.
 
-Application integration is underway. The Rust path now reads distinct FVCOM
-`zeta` values, reconstructs exact time, fits varying latitudes, writes every
-coefficient to NetCDF, and emits per-stage timings and a result digest. The 32
-frozen nodes pass an automated comparison against Python UTide. Full-field Rust
-and Python measurements are still being collected, so the application gate
-remains open. See the curated snapshots under `benchmarks/results/`.
+The initial fixed-profile application gate has passed. The Rust path reads
+distinct FVCOM `zeta` values, reconstructs exact time, fits varying latitudes,
+writes every coefficient to NetCDF, and emits per-stage timings and a result
+digest. The 32 frozen nodes pass an automated comparison against Python UTide.
+On the full 75,160-node field, retained whole-process medians were 3.15 seconds
+for Rust and 64.69 seconds for the tuned 32-process Python baseline. The 20.5x
+application speedup passes the provisional 3x target for this narrow profile.
+Peak Rust RSS was about 5.4 GiB and is the next optimization target. See the
+curated snapshots under `benchmarks/results/`.
 
 ## Objective
 
@@ -318,8 +321,9 @@ replacement.
 
 ## Immediate next steps
 
-1. Complete repeated full-field application measurements for Rust and the tuned
-   Python process pool.
-2. Investigate and document the parallel Rust process's peak resident memory.
-3. Decide the application gate before expanding the catalog or implementing
-   confidence intervals, vector currents, reconstruction, and gappy series.
+1. Reduce or reuse the short-lived QR allocations responsible for the parallel
+   Rust process's roughly 5.4 GiB high-water mark.
+2. Add complete-series reconstruction and validate it against the oracle before
+   moving to confidence intervals or automatic constituent selection.
+3. Design missing-value grouping so gappy FVCOM series can share prepared
+   factorizations without silently changing the scientific sample set.
