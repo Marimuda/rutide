@@ -130,6 +130,18 @@ impl GreenwichNodalBatch {
         self.basis.time_terms.len()
     }
 
+    /// Return the prepared catalog constituents in coefficient order.
+    #[must_use]
+    pub fn tidal_constituents(&self) -> &[TidalConstituent] {
+        &self.basis.tidal_constituents
+    }
+
+    /// Return constituent names and reference-time frequencies.
+    #[must_use]
+    pub fn constituents(&self) -> &[Constituent] {
+        &self.basis.scalar_constituents
+    }
+
     /// Fit varying-latitude scalar series stored in time-major order.
     ///
     /// `observations[time * latitudes.len() + series]` corresponds to one

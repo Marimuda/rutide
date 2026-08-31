@@ -18,13 +18,15 @@ paths have real-FVCOM parity tests against the pinned Python oracle.
 
 The current exact-correction catalog contains M2, S2, N2, K1, and O1. Automatic
 selection, confidence intervals, missing observations, vector currents,
-reconstruction, and end-to-end NetCDF processing are not implemented yet.
+and reconstruction are not implemented yet. The command-line application can
+now analyze a complete, finite FVCOM `zeta(time, node)` field and serialize its
+coefficients to NetCDF.
 
 ## Repository layout
 
 ```text
 crates/rutide-core/  Numerical library; no file-format or CLI concerns
-crates/rutide-cli/   Thin application and future NetCDF benchmark entry point
+crates/rutide-cli/   FVCOM NetCDF application and benchmark entry point
 benchmarks/           Locked Python oracle harness and fixture manifests
 BENCHMARK_PLAN.md    Frozen experimental intent and measurement protocol
 ```
@@ -35,8 +37,9 @@ Large FVCOM data and generated benchmark results also remain outside Git.
 
 ## Development
 
-Install [rustup](https://rustup.rs/) and run commands from the repository root.
-The checked-in toolchain file selects Rust 1.98.0 with rustfmt and Clippy.
+Install [rustup](https://rustup.rs/) and the NetCDF C development library, then
+run commands from the repository root. The checked-in toolchain file selects
+Rust 1.98.0 with rustfmt and Clippy.
 
 ```console
 cargo fmt --all -- --check
@@ -57,6 +60,37 @@ Performance measurements must use release or benchmark profiles. Machine-specifi
 compiler flags, CPU affinity, worker counts, and library thread settings belong in
 the generated result manifest; they are intentionally not hidden in the default
 Cargo configuration.
+
+## FVCOM scalar analysis
+
+The current application profile is deliberately frozen: M2, S2, N2, K1, and O1;
+ordinary least squares; mean and trend; exact Greenwich phase and nodal
+corrections; and no confidence intervals. Run it with:
+
+```console
+cargo run --release --bin rutide -- analyze-scalar \
+  --input /path/to/fvcom.nc \
+  --output coefficients.nc \
+  --report run.json \
+  --workers 64
+```
+
+Use `--node-count N` for a prefix or `--nodes 0,10,20` for an explicit
+correctness sample. Existing destinations are preserved unless `--overwrite`
+is supplied. The source is opened read-only, all coefficients are written to a
+temporary sibling file before installation, and the JSON report records
+per-stage timings and a canonical result digest.
+
+The pinned Python comparison command checks every series in a Rust output and
+returns nonzero if any frozen tolerance is exceeded:
+
+```console
+uv run --project benchmarks/python --locked \
+  python -m rutide_baseline.compare --rust-output coefficients.nc
+```
+
+This path currently rejects missing or non-finite observations rather than
+silently changing the fitted sample set.
 
 ## Working principles
 

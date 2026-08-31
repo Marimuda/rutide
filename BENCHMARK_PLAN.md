@@ -11,10 +11,12 @@ for the initial five-constituent scalar profile. Real FVCOM node-zero results
 match the pinned Python oracle, and the corrected field API scales across cores
 by separating shared time-only satellite terms from latitude-specific designs.
 
-The application gate remains open. Current Rust timings are solve-only
-microbenchmarks with in-memory synthetic spatial repetition; they do not include
-reading distinct values from NetCDF, missing-data handling, or result
-serialization. See the curated snapshots under `benchmarks/results/`.
+Application integration is underway. The Rust path now reads distinct FVCOM
+`zeta` values, reconstructs exact time, fits varying latitudes, writes every
+coefficient to NetCDF, and emits per-stage timings and a result digest. The 32
+frozen nodes pass an automated comparison against Python UTide. Full-field Rust
+and Python measurements are still being collected, so the application gate
+remains open. See the curated snapshots under `benchmarks/results/`.
 
 ## Objective
 
@@ -316,11 +318,8 @@ replacement.
 
 ## Immediate next steps
 
-1. Add a Rust NetCDF input path for `Itime`, `Itime2`, `lat`, and `zeta` without
-   coupling file-format concerns into `rutide-core`.
-2. Run the exact corrected batch on the 32 frozen correctness nodes and all
-   75,160 distinct elevation series.
-3. Measure warm-cache application throughput, peak memory, and result
-   serialization against the tuned Python process pool.
-4. Decide the application gate before expanding the catalog or implementing
+1. Complete repeated full-field application measurements for Rust and the tuned
+   Python process pool.
+2. Investigate and document the parallel Rust process's peak resident memory.
+3. Decide the application gate before expanding the catalog or implementing
    confidence intervals, vector currents, reconstruction, and gappy series.
