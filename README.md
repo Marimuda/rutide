@@ -29,10 +29,11 @@ API shares latitude-independent astronomy, pre-aggregates satellite terms, and
 parallelizes the latitude-specific factorizations across spatial series. Both
 paths have real-FVCOM parity tests against the pinned Python oracle.
 
-Confidence intervals, missing observations, vector currents, and reconstruction
-are not implemented yet. The command-line application can analyze a complete,
-finite FVCOM `zeta(time, node)` field with an explicit or Rayleigh-selected
-constituent list and serialize its coefficients to NetCDF.
+Percent-energy diagnostics and per-solution PE ranking are available. Confidence
+intervals, missing observations, vector currents, and reconstruction are not
+implemented yet. The command-line application can analyze a complete, finite
+FVCOM `zeta(time, node)` field with an explicit or Rayleigh-selected constituent
+list and serialize its coefficients and PE diagnostics to NetCDF.
 
 ## Repository layout
 

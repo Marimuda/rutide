@@ -24,6 +24,13 @@ const EXPECTED_PHASE_DEGREES: [f64; 5] = [
     154.311_435_223_673_04,
     20.062_605_139_407_12,
 ];
+const EXPECTED_PERCENT_ENERGY: [f64; 5] = [
+    82.042_836_434_238_57,
+    9.829_897_310_697_666,
+    4.791_299_617_550_922,
+    2.427_610_428_601_086_7,
+    0.908_356_208_911_755_3,
+];
 const EXPECTED_MEAN: f64 = 0.091_040_690_255_747_43;
 const EXPECTED_SLOPE_PER_DAY: f64 = 0.001_734_852_911_719_784_6;
 const EXPANDED_NAMES: [&str; 10] = ["Q1", "O1", "P1", "K1", "N2", "M2", "S2", "K2", "MK3", "M4"];
@@ -130,6 +137,23 @@ fn matches_python_utide_for_real_fvcom_elevation() {
     {
         assert_close(&format!("phase[{index}]"), *actual, expected, 3e-9);
     }
+    for (index, (actual, expected)) in solution
+        .percent_energy
+        .iter()
+        .zip(EXPECTED_PERCENT_ENERGY)
+        .enumerate()
+    {
+        assert_close(
+            &format!("percent_energy[{index}]"),
+            *actual,
+            expected,
+            1e-11,
+        );
+    }
+    assert_eq!(
+        solution.constituent_indices_by_percent_energy(),
+        [0, 1, 2, 3, 4]
+    );
     assert_close("mean", solution.mean, EXPECTED_MEAN, 3e-12);
     assert_close(
         "slope_per_day",

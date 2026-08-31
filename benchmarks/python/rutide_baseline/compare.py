@@ -18,6 +18,7 @@ from .runner import _profile_options, load_oracle
 DEFAULT_TOLERANCES = {
     "amplitude": 3e-12,
     "complex_coefficient": 3e-12,
+    "percent_energy": 1e-10,
     "mean": 3e-12,
     "slope_per_day": 3e-12,
     "frequency_cph": 1e-15,
@@ -114,6 +115,10 @@ def compare_with_oracle(
         latitudes = _finite(result_dataset.variables["latitude"][:], "output latitude")
         amplitudes = _finite(result_dataset.variables["amplitude"][:], "output amplitude")
         phases = _finite(result_dataset.variables["phase"][:], "output phase")
+        percent_energy = _finite(
+            result_dataset.variables["percent_energy"][:],
+            "output percent energy",
+        )
         means = _finite(result_dataset.variables["mean"][:], "output mean")
         slopes = _finite(result_dataset.variables["slope"][:], "output slope")
         frequencies = _finite(result_dataset.variables["frequency"][:], "output frequency")
@@ -132,6 +137,8 @@ def compare_with_oracle(
         raise ValueError(f"unexpected amplitude shape: {amplitudes.shape}")
     if phases.shape != amplitudes.shape:
         raise ValueError(f"unexpected phase shape: {phases.shape}")
+    if percent_energy.shape != amplitudes.shape:
+        raise ValueError(f"unexpected percent-energy shape: {percent_energy.shape}")
     if means.shape != (series_count,) or slopes.shape != (series_count,):
         raise ValueError("unexpected mean or slope shape")
     if latitudes.shape != (series_count,) or frequencies.shape != (constituent_count,):
@@ -187,6 +194,7 @@ def compare_with_oracle(
             expected_amplitude = np.asarray(coefficient.A, dtype=np.float64)[order]
             expected_phase = np.asarray(coefficient.g, dtype=np.float64)[order]
             expected_frequency = np.asarray(coefficient.aux.frq, dtype=np.float64)[order]
+            expected_percent_energy = np.asarray(coefficient.PE, dtype=np.float64)[order]
             for constituent_position, constituent in enumerate(names):
                 errors["amplitude"].append(
                     (
@@ -220,6 +228,16 @@ def compare_with_oracle(
                 )
                 errors["complex_coefficient"].append(
                     (abs(actual_complex - expected_complex), node_index, constituent)
+                )
+                errors["percent_energy"].append(
+                    (
+                        abs(
+                            percent_energy[position, constituent_position]
+                            - expected_percent_energy[constituent_position]
+                        ),
+                        node_index,
+                        constituent,
+                    )
                 )
                 errors["frequency_cph"].append(
                     (

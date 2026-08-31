@@ -36,10 +36,30 @@ pub struct ScalarSolution {
     pub amplitude: Vec<f64>,
     /// Raw phase in degrees in the half-open range `[0, 360)`.
     pub phase_degrees: Vec<f64>,
+    /// Percentage of total resolved harmonic energy for each constituent.
+    pub percent_energy: Vec<f64>,
     /// Fitted constant offset.
     pub mean: f64,
     /// Fitted linear trend per day.
     pub slope_per_day: f64,
+}
+
+impl ScalarSolution {
+    /// Return constituent indices ranked by descending percent energy.
+    ///
+    /// Coefficient arrays remain in prepared constituent order. This index view
+    /// provides Python `UTide`-style PE presentation without losing stable
+    /// constituent identity in multi-series outputs.
+    #[must_use]
+    pub fn constituent_indices_by_percent_energy(&self) -> Vec<usize> {
+        let mut indices = (0..self.amplitude.len()).collect::<Vec<_>>();
+        indices.sort_by(|left, right| {
+            self.amplitude[*right]
+                .total_cmp(&self.amplitude[*left])
+                .then_with(|| left.cmp(right))
+        });
+        indices
+    }
 }
 
 /// A reusable fixed-constituent, raw-phase ordinary least-squares model.
@@ -183,9 +203,15 @@ impl FixedRawOls {
                     amplitude.push(cosine.hypot(sine));
                     phase_degrees.push(sine.atan2(cosine).to_degrees().rem_euclid(360.0));
                 }
+                let total_energy = amplitude.iter().map(|value| value * value).sum::<f64>();
+                let percent_energy = amplitude
+                    .iter()
+                    .map(|value| 100.0 * (value * value) / total_energy)
+                    .collect();
                 ScalarSolution {
                     amplitude,
                     phase_degrees,
+                    percent_energy,
                     mean: coefficients[(harmonic_columns, series)],
                     slope_per_day: coefficients[(harmonic_columns + 1, series)]
                         / self.time_span_days,
@@ -320,6 +346,8 @@ mod tests {
         for (actual, expected) in solution.phase_degrees.iter().zip(expected_phase) {
             assert_close(*actual, expected, 1e-10);
         }
+        assert_close(solution.percent_energy.iter().sum(), 100.0, 1e-12);
+        assert_eq!(solution.constituent_indices_by_percent_energy(), [0, 1, 2]);
         assert_close(solution.mean, 0.09, 1e-12);
         assert_close(solution.slope_per_day, 0.0017, 1e-12);
     }

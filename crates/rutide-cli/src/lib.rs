@@ -20,7 +20,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
-const OUTPUT_SCHEMA_VERSION: u32 = 1;
+const OUTPUT_SCHEMA_VERSION: u32 = 2;
 /// Backward-compatible benchmark constituent set used when none is specified.
 pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -100,6 +100,8 @@ pub struct SampleResult {
     pub amplitude: Vec<f64>,
     /// Greenwich phases in degrees in the report's constituent order.
     pub phase_degrees: Vec<f64>,
+    /// Percent energy in the report's constituent order.
+    pub percent_energy: Vec<f64>,
     /// Fitted constant offset.
     pub mean: f64,
     /// Fitted trend per day.
@@ -646,7 +648,7 @@ fn result_digest(
     solutions: &[ScalarSolution],
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-scalar-greenwich-nodal-v1\0");
+    digest.update(b"rutide-scalar-greenwich-nodal-v2\0");
     for constituent in constituents {
         digest.update(constituent.name.as_bytes());
         digest.update([0]);
@@ -666,6 +668,9 @@ fn result_digest(
             digest.update(value.to_bits().to_le_bytes());
         }
         for value in &solution.phase_degrees {
+            digest.update(value.to_bits().to_le_bytes());
+        }
+        for value in &solution.percent_energy {
             digest.update(value.to_bits().to_le_bytes());
         }
         digest.update(solution.mean.to_bits().to_le_bytes());
@@ -701,6 +706,7 @@ fn retained_samples(
                 latitude_degrees_north,
                 amplitude: solution.amplitude.clone(),
                 phase_degrees: solution.phase_degrees.clone(),
+                percent_energy: solution.percent_energy.clone(),
                 mean: solution.mean,
                 slope_per_day: solution.slope_per_day,
             },
@@ -794,11 +800,13 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
 
     let mut amplitude = Vec::with_capacity(solutions.len() * constituents.len());
     let mut phase = Vec::with_capacity(solutions.len() * constituents.len());
+    let mut percent_energy = Vec::with_capacity(solutions.len() * constituents.len());
     let mut mean = Vec::with_capacity(solutions.len());
     let mut slope = Vec::with_capacity(solutions.len());
     for solution in solutions {
         amplitude.extend_from_slice(&solution.amplitude);
         phase.extend_from_slice(&solution.phase_degrees);
+        percent_energy.extend_from_slice(&solution.percent_energy);
         mean.push(solution.mean);
         slope.push(solution.slope_per_day);
     }
@@ -811,6 +819,11 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         &mut output.add_variable::<f64>("phase", &["series", "constituent"])?,
         &phase,
         "degrees",
+    )?;
+    write_variable(
+        &mut output.add_variable::<f64>("percent_energy", &["series", "constituent"])?,
+        &percent_energy,
+        "percent",
     )?;
     write_variable(
         &mut output.add_variable::<f64>("mean", &["series"])?,
