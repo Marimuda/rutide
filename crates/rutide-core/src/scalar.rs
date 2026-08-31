@@ -88,12 +88,26 @@ impl FixedRawOls {
             }
         });
 
-        Ok(Self {
-            constituents: constituents.to_vec(),
-            time_count: time_days.len(),
+        Ok(Self::from_design(
+            constituents.to_vec(),
+            time_days.len(),
+            time_span_days,
+            &design,
+        ))
+    }
+
+    pub(crate) fn from_design(
+        constituents: Vec<Constituent>,
+        time_count: usize,
+        time_span_days: f64,
+        design: &Mat<f64>,
+    ) -> Self {
+        Self {
+            constituents,
+            time_count,
             time_span_days,
             decomposition: design.col_piv_qr(),
-        })
+        }
     }
 
     /// Return the prepared constituents in coefficient order.
@@ -202,7 +216,10 @@ fn validate_constituents(constituents: &[Constituent]) -> Result<(), AnalysisErr
     Ok(())
 }
 
-fn validate_time(time_days: &[f64], constituent_count: usize) -> Result<(f64, f64), AnalysisError> {
+pub(crate) fn validate_time(
+    time_days: &[f64],
+    constituent_count: usize,
+) -> Result<(f64, f64), AnalysisError> {
     if time_days.is_empty() {
         return Err(AnalysisError::EmptyTime);
     }

@@ -4,9 +4,14 @@
 //! command-line behavior, Python bindings, and benchmark orchestration belong in
 //! separate workspace crates.
 
+mod astronomy;
+mod catalog;
+mod corrected;
 mod error;
 mod scalar;
 
+pub use catalog::TidalConstituent;
+pub use corrected::{GreenwichNodalBatch, GreenwichNodalOls};
 pub use error::AnalysisError;
 pub use scalar::{Constituent, FixedRawOls, ScalarSolution};
 

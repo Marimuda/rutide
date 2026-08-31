@@ -24,6 +24,10 @@ pub enum AnalysisError {
         /// Position of the latter timestamp in the invalid pair.
         index: usize,
     },
+    /// Latitude is non-finite or outside the physical range.
+    InvalidLatitude,
+    /// Python `UTide`'s exact nodal formula is singular at precisely zero latitude.
+    EquatorialLatitude,
     /// No constituents were requested.
     EmptyConstituents,
     /// A constituent name is empty.
@@ -73,6 +77,11 @@ impl fmt::Display for AnalysisError {
             Self::NonIncreasingTime { index } => write!(
                 formatter,
                 "timestamps must be strictly increasing; violation at index {index}"
+            ),
+            Self::InvalidLatitude => formatter
+                .write_str("latitude must be finite and between -90 and 90 degrees inclusive"),
+            Self::EquatorialLatitude => formatter.write_str(
+                "exact UTide nodal corrections are undefined at precisely zero latitude",
             ),
             Self::EmptyConstituents => formatter.write_str("at least one constituent is required"),
             Self::EmptyConstituentName { index } => {

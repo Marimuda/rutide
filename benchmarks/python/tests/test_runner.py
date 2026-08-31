@@ -7,6 +7,15 @@ from rutide_baseline.runner import _profile_options, aggregate_result_digest
 
 
 class ResultDigestTests(unittest.TestCase):
+    def test_fixed_constituents_profile_freezes_corrected_rust_target(self) -> None:
+        options = _profile_options("fixed-constituents")
+        self.assertEqual(options["constit"], list(FIXED_CONSTITUENTS))
+        self.assertEqual(options["method"], "ols")
+        self.assertEqual(options["conf_int"], "none")
+        self.assertEqual(options["phase"], "Greenwich")
+        self.assertTrue(options["nodal"])
+        self.assertTrue(options["trend"])
+
     def test_fixed_raw_profile_freezes_first_rust_parity_target(self) -> None:
         options = _profile_options("fixed-raw")
         self.assertEqual(options["constit"], list(FIXED_CONSTITUENTS))
