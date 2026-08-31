@@ -22,16 +22,17 @@ reduced 64-worker peak RSS from 5.40 GiB to 0.690 GiB and whole-process wall tim
 to 1.51 seconds without changing either correctness digest.
 
 The implemented scalar kernels now cover fixed-constituent OLS with mean and
-trend in both raw-phase mode and exact Greenwich/nodal mode. The corrected bulk
+trend in both raw-phase mode and exact Greenwich/nodal mode. The exact-correction
+catalog contains all 146 constituents, 162 satellite corrections, and 251
+shallow-water relationships from the pinned Python oracle. The corrected bulk
 API shares latitude-independent astronomy, pre-aggregates satellite terms, and
 parallelizes the latitude-specific factorizations across spatial series. Both
 paths have real-FVCOM parity tests against the pinned Python oracle.
 
-The current exact-correction catalog contains M2, S2, N2, K1, and O1. Automatic
-selection, confidence intervals, missing observations, vector currents,
-and reconstruction are not implemented yet. The command-line application can
-now analyze a complete, finite FVCOM `zeta(time, node)` field and serialize its
-coefficients to NetCDF.
+Automatic selection, confidence intervals, missing observations, vector
+currents, and reconstruction are not implemented yet. The command-line
+application can analyze a complete, finite FVCOM `zeta(time, node)` field with
+an explicit constituent list and serialize its coefficients to NetCDF.
 
 ## Repository layout
 
@@ -85,6 +86,10 @@ cargo run --release --bin rutide -- analyze-scalar \
   --report run.json \
   --workers 64
 ```
+
+Supply any unique catalog names in output order with, for example,
+`--constituents Q1,O1,K1,M2,S2,K2,M4`. The default remains the frozen five-name
+benchmark profile shown above.
 
 Use `--node-count N` for a prefix or `--nodes 0,10,20` for an explicit
 correctness sample. Existing destinations are preserved unless `--overwrite`

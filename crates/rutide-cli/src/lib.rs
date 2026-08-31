@@ -20,7 +20,8 @@ use sha2::{Digest, Sha256};
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
 const OUTPUT_SCHEMA_VERSION: u32 = 1;
-const CONSTITUENTS: [TidalConstituent; 5] = [
+/// Backward-compatible benchmark constituent set used when none is specified.
+pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
     TidalConstituent::S2,
     TidalConstituent::N2,
@@ -50,6 +51,8 @@ pub struct AnalyzeConfig {
     pub report: Option<PathBuf>,
     /// Spatial subset to analyze.
     pub nodes: NodeSelection,
+    /// Catalog constituents to solve, in output order.
+    pub constituents: Vec<TidalConstituent>,
     /// Number of outer spatial worker threads.
     pub workers: usize,
     /// Permit replacing existing output and report files.
@@ -236,7 +239,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
     let preparation_start = Instant::now();
     let batch = GreenwichNodalBatch::prepare_modified_julian_days(
         &input.modified_julian_days,
-        &CONSTITUENTS,
+        &config.constituents,
     )?;
     let preparation_seconds = preparation_start.elapsed().as_secs_f64();
 
@@ -327,6 +330,19 @@ fn validate_config(config: &AnalyzeConfig) -> Result<(), AppError> {
         return Err(AppError::Invalid(
             "input and output paths must differ".to_owned(),
         ));
+    }
+    if config.constituents.is_empty() {
+        return Err(AppError::Invalid(
+            "constituent list must not be empty".to_owned(),
+        ));
+    }
+    let mut unique_constituents = BTreeSet::new();
+    for constituent in config.constituents.iter().copied() {
+        if !unique_constituents.insert(constituent) {
+            return Err(AppError::Invalid(format!(
+                "constituent {constituent} appears more than once"
+            )));
+        }
     }
     if config.output.exists() && !config.overwrite {
         return Err(AppError::DestinationExists(config.output.clone()));
@@ -651,7 +667,12 @@ fn write_output_file(
     output.add_attribute("title", "RUTide scalar harmonic coefficients")?;
     output.add_attribute("rutide_version", rutide_core::VERSION)?;
     output.add_attribute("profile", "fixed-constituents-greenwich-nodal-ols")?;
-    output.add_attribute("constituent_names", "M2,S2,N2,K1,O1")?;
+    let constituent_names = constituents
+        .iter()
+        .map(|constituent| constituent.name.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    output.add_attribute("constituent_names", constituent_names)?;
     output.add_attribute("result_sha256", result_sha256)?;
 
     let node_indices = node_indices

@@ -11,7 +11,7 @@ from typing import Any
 import netCDF4
 import numpy as np
 
-from .constants import DEFAULT_FIXTURE, DEFAULT_UTIDE_ROOT, FIXED_CONSTITUENTS
+from .constants import DEFAULT_FIXTURE, DEFAULT_UTIDE_ROOT
 from .fixture import reconstruct_mjd
 from .runner import _profile_options, load_oracle
 
@@ -69,8 +69,8 @@ def compare_with_oracle(
         if result_dataset.getncattr("profile") != "fixed-constituents-greenwich-nodal-ols":
             raise ValueError("RUTide output uses an unsupported analysis profile")
         names = str(result_dataset.getncattr("constituent_names")).split(",")
-        if set(names) != set(FIXED_CONSTITUENTS) or len(names) != len(FIXED_CONSTITUENTS):
-            raise ValueError(f"unexpected constituent set: {names}")
+        if not names or len(set(names)) != len(names):
+            raise ValueError(f"constituent names must be non-empty and unique: {names}")
         indices = np.asarray(result_dataset.variables["node_index"][:], dtype=np.int64)
         latitudes = _finite(result_dataset.variables["latitude"][:], "output latitude")
         amplitudes = _finite(result_dataset.variables["amplitude"][:], "output amplitude")
@@ -97,6 +97,7 @@ def compare_with_oracle(
         name: [] for name in DEFAULT_TOLERANCES
     }
     options = _profile_options("fixed-constituents")
+    options["constit"] = names
     with netCDF4.Dataset(fixture_path, mode="r") as source_dataset:
         time = reconstruct_mjd(
             source_dataset.variables["Itime"][:],
