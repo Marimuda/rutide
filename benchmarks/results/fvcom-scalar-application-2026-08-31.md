@@ -11,6 +11,11 @@ the implemented subset replaces all of UTide. Automatic constituent selection,
 confidence intervals, gappy series, vector currents, and reconstruction remain
 outside this measurement.
 
+Follow-up: the [memory optimization snapshot](memory-optimization-2026-08-31.md)
+reduces the 64-worker peak from 5.40 GiB to 0.690 GiB and process wall time from
+3.15 to 1.51 seconds without changing results. The measurements below remain the
+frozen pre-optimization application baseline.
+
 ## Revisions, workload, and environment
 
 - RUTide: `febdefcebc8346b45b4deed8f64d9fd3452c9627`

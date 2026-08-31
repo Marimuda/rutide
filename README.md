@@ -17,6 +17,10 @@ The first complete scalar application measurement passes the provisional gate:
 for the exact profile, correctness errors, worker scaling, resource caveats, and
 scope limits.
 
+The subsequent [memory optimization](benchmarks/results/memory-optimization-2026-08-31.md)
+reduced 64-worker peak RSS from 5.40 GiB to 0.690 GiB and whole-process wall time
+to 1.51 seconds without changing either correctness digest.
+
 The implemented scalar kernels now cover fixed-constituent OLS with mean and
 trend in both raw-phase mode and exact Greenwich/nodal mode. The corrected bulk
 API shares latitude-independent astronomy, pre-aggregates satellite terms, and

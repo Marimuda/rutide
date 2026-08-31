@@ -18,8 +18,9 @@ digest. The 32 frozen nodes pass an automated comparison against Python UTide.
 On the full 75,160-node field, retained whole-process medians were 3.15 seconds
 for Rust and 64.69 seconds for the tuned 32-process Python baseline. The 20.5x
 application speedup passes the provisional 3x target for this narrow profile.
-Peak Rust RSS was about 5.4 GiB and is the next optimization target. See the
-curated snapshots under `benchmarks/results/`.
+A follow-up allocator and input-buffer optimization reduced peak Rust RSS from
+about 5.4 GiB to 0.690 GiB and the whole-process median to 1.51 seconds without
+changing results. See the curated snapshots under `benchmarks/results/`.
 
 ## Objective
 
@@ -321,9 +322,12 @@ replacement.
 
 ## Immediate next steps
 
-1. Reduce or reuse the short-lived QR allocations responsible for the parallel
-   Rust process's roughly 5.4 GiB high-water mark.
-2. Add complete-series reconstruction and validate it against the oracle before
-   moving to confidence intervals or automatic constituent selection.
-3. Design missing-value grouping so gappy FVCOM series can share prepared
-   factorizations without silently changing the scientific sample set.
+1. Generate a checked-in Rust catalog from the pinned oracle's 146 constituent,
+   162 satellite, and 251 shallow-water relationship records.
+2. Generalize the corrected solver to explicit dynamic constituent lists, then
+   reproduce Python's Rayleigh-based automatic selection at several record spans.
+3. Add percent energy, followed by linear amplitude/phase confidence intervals;
+   signal-to-noise ratio depends on those intervals and must not be presented as
+   an independent amplitude-only diagnostic.
+4. Add complete-series reconstruction with constituent, PE, and SNR filtering,
+   then design missing-value grouping and vector-current support.
