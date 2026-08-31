@@ -9,6 +9,11 @@ use std::{
 
 use rutide_cli::{AnalyzeConfig, NodeSelection, analyze_scalar};
 
+// The application repeatedly allocates short-lived QR storage across worker
+// threads; this allocator keeps that full-field pattern bounded and reusable.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const USAGE: &str = "\
 Usage:
   rutide --version

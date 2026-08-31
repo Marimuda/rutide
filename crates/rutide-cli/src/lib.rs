@@ -379,15 +379,15 @@ fn read_fvcom_scalar(path: &Path, selection: &NodeSelection) -> Result<InputData
     let is_prefix = node_indices.iter().copied().eq(0..node_indices.len());
     let (latitude_values, observation_values) = if is_prefix {
         (
-            latitude_variable.get_values::<f32, _>(0..series_count)?,
-            zeta_variable.get_values::<f32, _>((.., 0..series_count))?,
+            latitude_variable.get_values::<f64, _>(0..series_count)?,
+            zeta_variable.get_values::<f64, _>((.., 0..series_count))?,
         )
     } else {
         let mut latitude_values = Vec::with_capacity(series_count);
-        let mut observation_values = vec![0.0_f32; time_count * series_count];
+        let mut observation_values = vec![0.0_f64; time_count * series_count];
         for (series, node) in node_indices.iter().copied().enumerate() {
-            latitude_values.push(latitude_variable.get_value::<f32, _>(node)?);
-            let column = zeta_variable.get_values::<f32, _>((.., node))?;
+            latitude_values.push(latitude_variable.get_value::<f64, _>(node)?);
+            let column = zeta_variable.get_values::<f64, _>((.., node))?;
             for (time, value) in column.into_iter().enumerate() {
                 observation_values[time * series_count + series] = value;
             }
@@ -395,42 +395,46 @@ fn read_fvcom_scalar(path: &Path, selection: &NodeSelection) -> Result<InputData
         (latitude_values, observation_values)
     };
 
-    let latitudes = latitude_values
-        .into_iter()
-        .enumerate()
-        .map(|(series, value)| {
-            validate_source_value("lat", value, latitude_fill, series, 0)?;
-            Ok(f64::from(value))
-        })
-        .collect::<Result<Vec<_>, AppError>>()?;
-    let observations = observation_values
-        .into_iter()
-        .enumerate()
-        .map(|(index, value)| {
-            validate_source_value(
-                "zeta",
-                value,
-                zeta_fill,
-                index % series_count,
-                index / series_count,
-            )?;
-            Ok(f64::from(value))
-        })
-        .collect::<Result<Vec<_>, AppError>>()?;
+    for (series, value) in latitude_values.iter().copied().enumerate() {
+        validate_source_value("lat", value, latitude_fill, series, 0)?;
+    }
+    for (index, value) in observation_values.iter().copied().enumerate() {
+        validate_source_value(
+            "zeta",
+            value,
+            zeta_fill,
+            index % series_count,
+            index / series_count,
+        )?;
+    }
 
-    let logical_values = time_count
-        .saturating_mul(2)
-        .saturating_add(series_count)
-        .saturating_add(time_count.saturating_mul(series_count));
-    let logical_input_bytes = u64::try_from(logical_values)
-        .map_err(|_| AppError::Invalid("logical input size exceeds u64".to_owned()))?
-        .saturating_mul(4);
+    let observation_count = time_count
+        .checked_mul(series_count)
+        .ok_or_else(|| AppError::Invalid("logical input size exceeds usize".to_owned()))?;
+    let logical_input_bytes = [
+        (time_count, integer_day_variable.vartype().size()),
+        (time_count, millisecond_variable.vartype().size()),
+        (series_count, latitude_variable.vartype().size()),
+        (observation_count, zeta_variable.vartype().size()),
+    ]
+    .into_iter()
+    .try_fold(0_u64, |total, (count, element_bytes)| {
+        let count = u64::try_from(count)
+            .map_err(|_| AppError::Invalid("logical input size exceeds u64".to_owned()))?;
+        let element_bytes = u64::try_from(element_bytes)
+            .map_err(|_| AppError::Invalid("source element size exceeds u64".to_owned()))?;
+        total
+            .checked_add(count.checked_mul(element_bytes).ok_or_else(|| {
+                AppError::Invalid("logical input byte count overflows u64".to_owned())
+            })?)
+            .ok_or_else(|| AppError::Invalid("logical input byte count overflows u64".to_owned()))
+    })?;
 
     Ok(InputData {
         modified_julian_days,
         node_indices,
-        latitudes,
-        observations,
+        latitudes: latitude_values,
+        observations: observation_values,
         input_file_bytes,
         logical_input_bytes,
     })
@@ -520,12 +524,12 @@ fn resolve_node_selection(
 
 fn validate_source_value(
     variable: &str,
-    value: f32,
+    value: f64,
     fill_value: Option<f32>,
     series: usize,
     time: usize,
 ) -> Result<(), AppError> {
-    let is_fill = fill_value.is_some_and(|fill| value.to_bits() == fill.to_bits());
+    let is_fill = fill_value.is_some_and(|fill| value.to_bits() == f64::from(fill).to_bits());
     if !value.is_finite() || is_fill {
         return Err(AppError::Invalid(format!(
             "{variable} contains an unsupported missing value at series {series}, time {time}"
@@ -763,7 +767,11 @@ fn temporary_sibling(path: &Path) -> Result<PathBuf, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NodeSelection, encode_hex, resolve_node_selection};
+    use std::fs;
+
+    use super::{
+        NodeSelection, encode_hex, read_fvcom_scalar, resolve_node_selection, temporary_sibling,
+    };
 
     #[test]
     fn selection_preserves_explicit_order() {
@@ -787,5 +795,60 @@ mod tests {
     #[test]
     fn hex_encoding_is_lowercase_and_zero_padded() {
         assert_eq!(encode_hex(&[0, 15, 16, 255]), "000f10ff");
+    }
+
+    #[test]
+    fn fvcom_f32_values_are_promoted_directly_and_reordered_exactly() {
+        let destination = std::env::temp_dir().join("rutide-read-input-test.nc");
+        let path = temporary_sibling(&destination).expect("valid temporary path");
+        let mut dataset = netcdf::create(&path).expect("create test NetCDF");
+        dataset.add_dimension("time", 2).expect("add time");
+        dataset.add_dimension("node", 2).expect("add node");
+        dataset
+            .add_variable::<i32>("Itime", &["time"])
+            .expect("add Itime")
+            .put_values(&[58_113, 58_113], ..)
+            .expect("write Itime");
+        dataset
+            .add_variable::<i32>("Itime2", &["time"])
+            .expect("add Itime2")
+            .put_values(&[0, 3_600_000], ..)
+            .expect("write Itime2");
+        let latitudes = [60.1_f32, 61.2_f32];
+        dataset
+            .add_variable::<f32>("lat", &["node"])
+            .expect("add lat")
+            .put_values(&latitudes, ..)
+            .expect("write lat");
+        let observations = [0.1_f32, -2.5_f32, 3.25_f32, 4.5_f32];
+        dataset
+            .add_variable::<f32>("zeta", &["time", "node"])
+            .expect("add zeta")
+            .put_values(&observations, ..)
+            .expect("write zeta");
+        dataset.close().expect("close test NetCDF");
+
+        let input = read_fvcom_scalar(&path, &NodeSelection::Indices(vec![1, 0]))
+            .expect("read valid FVCOM input");
+        assert_eq!(
+            input.modified_julian_days,
+            [58_113.0, 58_113.0 + 1.0 / 24.0]
+        );
+        assert_eq!(input.node_indices, [1, 0]);
+        assert_eq!(
+            input.latitudes,
+            [f64::from(latitudes[1]), f64::from(latitudes[0])]
+        );
+        assert_eq!(
+            input.observations,
+            [
+                f64::from(observations[1]),
+                f64::from(observations[0]),
+                f64::from(observations[3]),
+                f64::from(observations[2]),
+            ]
+        );
+        assert_eq!(input.logical_input_bytes, 40);
+        fs::remove_file(path).expect("remove test NetCDF");
     }
 }
