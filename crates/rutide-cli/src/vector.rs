@@ -17,15 +17,16 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    AnalyzeConfig, AppError, ConfidenceInterval, ConstituentSelection, ConstituentSelectionReport,
-    MILLISECONDS_PER_DAY, NodeSelection, ReconstructionReport, ResolvedConstituentSelection,
-    StageTimings, encode_hex, normalize_source_observation, reconstruction_report,
-    required_dimension_length, required_variable, resolve_constituent_selection, temporary_sibling,
+    AnalysisMethod, AnalyzeConfig, AppError, ConfidenceInterval, ConstituentSelection,
+    ConstituentSelectionReport, MILLISECONDS_PER_DAY, NodeSelection, ReconstructionReport,
+    ResolvedConstituentSelection, RobustOptionsReport, StageTimings, encode_hex,
+    normalize_source_observation, reconstruction_report, required_dimension_length,
+    required_variable, resolve_constituent_selection, robust_termination_code, temporary_sibling,
     update_reconstruction_filter_digest, validate_config, validate_dimensions,
     validate_reconstruction_filter, validate_source_value, write_json_report, write_variable,
 };
 
-const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 1;
+const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 2;
 
 /// Configuration for one depth-averaged FVCOM current analysis.
 #[derive(Clone, Debug, PartialEq)]
@@ -42,6 +43,8 @@ pub struct VectorAnalyzeConfig {
     pub constituent_selection: ConstituentSelection,
     /// Optional linearized ellipse intervals and their noise model.
     pub confidence_interval: ConfidenceInterval,
+    /// Ordinary or Cauchy robust least squares.
+    pub analysis_method: AnalysisMethod,
     /// Optional complete-series reconstruction and constituent filter.
     pub reconstruction: Option<ReconstructionFilter>,
     /// Number of outer spatial worker threads.
@@ -125,6 +128,10 @@ pub struct VectorRunReport {
     pub series_with_missing_observations: usize,
     /// Number of outer spatial workers.
     pub workers: usize,
+    /// Least-squares method: `ols` or `robust`.
+    pub analysis_method: &'static str,
+    /// Robust options when robust fitting is enabled.
+    pub robust_options: Option<RobustOptionsReport>,
     /// Auditable constituent-selection method and threshold.
     pub constituent_selection: ConstituentSelectionReport,
     /// Confidence method: `none` or `linear`.
@@ -196,20 +203,39 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         .num_threads(config.workers)
         .build()?;
     let solve_start = Instant::now();
-    let solutions = worker_pool.install(|| match config.confidence_interval {
-        ConfidenceInterval::None => batch.solve_vector_time_major_with_missing(
-            &input.eastward,
-            &input.northward,
-            &input.latitudes,
-        ),
-        ConfidenceInterval::Linear(noise) => batch
-            .solve_vector_time_major_with_missing_and_linear_confidence(
-                &input.eastward,
-                &input.northward,
-                &input.latitudes,
-                noise,
-            ),
-    })?;
+    let solutions =
+        worker_pool.install(
+            || match (config.analysis_method, config.confidence_interval) {
+                (AnalysisMethod::Ols, ConfidenceInterval::None) => batch
+                    .solve_vector_time_major_with_missing(
+                        &input.eastward,
+                        &input.northward,
+                        &input.latitudes,
+                    ),
+                (AnalysisMethod::Ols, ConfidenceInterval::Linear(noise)) => batch
+                    .solve_vector_time_major_with_missing_and_linear_confidence(
+                        &input.eastward,
+                        &input.northward,
+                        &input.latitudes,
+                        noise,
+                    ),
+                (AnalysisMethod::Robust(options), ConfidenceInterval::None) => batch
+                    .solve_vector_time_major_with_missing_robust(
+                        &input.eastward,
+                        &input.northward,
+                        &input.latitudes,
+                        options,
+                    ),
+                (AnalysisMethod::Robust(options), ConfidenceInterval::Linear(noise)) => batch
+                    .solve_vector_time_major_with_missing_robust_and_linear_confidence(
+                        &input.eastward,
+                        &input.northward,
+                        &input.latitudes,
+                        options,
+                        noise,
+                    ),
+            },
+        )?;
     let solve_seconds = solve_start.elapsed().as_secs_f64();
 
     let reconstruction_start = Instant::now();
@@ -236,6 +262,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         batch.constituents(),
         &series_frequency_cph,
         &solutions,
+        config.analysis_method,
         config.confidence_interval,
         config
             .reconstruction
@@ -256,6 +283,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             solutions: &solutions,
             result_sha256: &result_sha256,
             selection: &selection,
+            analysis_method: config.analysis_method,
             confidence_interval: config.confidence_interval,
             reference_time_modified_julian_day: batch.reference_time_modified_julian_day(),
             reconstruction: config
@@ -275,7 +303,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         schema_version: VECTOR_OUTPUT_SCHEMA_VERSION,
         created_unix_seconds,
         rutide_version: rutide_core::VERSION,
-        profile: vector_profile(&selection),
+        profile: vector_profile(&selection, config.analysis_method),
         input_path: config.input.to_string_lossy().into_owned(),
         input_file_bytes: input.input_file_bytes,
         logical_input_bytes: input.logical_input_bytes,
@@ -289,6 +317,11 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             .filter(|count| **count != input.modified_julian_days.len())
             .count(),
         workers: config.workers,
+        analysis_method: config.analysis_method.name(),
+        robust_options: match config.analysis_method {
+            AnalysisMethod::Ols => None,
+            AnalysisMethod::Robust(options) => Some(options.into()),
+        },
         constituent_selection: selection.report,
         confidence_interval: config.confidence_interval.method(),
         confidence_noise: config.confidence_interval.noise(),
@@ -335,16 +368,24 @@ fn validate_vector_config(config: &VectorAnalyzeConfig) -> Result<(), AppError> 
         nodes: config.elements.clone(),
         constituent_selection: config.constituent_selection.clone(),
         confidence_interval: config.confidence_interval,
+        analysis_method: config.analysis_method,
         reconstruction: config.reconstruction.clone(),
         workers: config.workers,
         overwrite: config.overwrite,
     })
 }
 
-fn vector_profile(selection: &ResolvedConstituentSelection) -> &'static str {
-    match selection.report.method {
-        "explicit" => "fixed-constituents-greenwich-nodal-vector-ols",
-        "rayleigh" => "rayleigh-auto-greenwich-nodal-vector-ols",
+fn vector_profile(
+    selection: &ResolvedConstituentSelection,
+    analysis_method: AnalysisMethod,
+) -> &'static str {
+    match (selection.report.method, analysis_method) {
+        ("explicit", AnalysisMethod::Ols) => "fixed-constituents-greenwich-nodal-vector-ols",
+        ("rayleigh", AnalysisMethod::Ols) => "rayleigh-auto-greenwich-nodal-vector-ols",
+        ("explicit", AnalysisMethod::Robust(_)) => {
+            "fixed-constituents-greenwich-nodal-vector-robust"
+        }
+        ("rayleigh", AnalysisMethod::Robust(_)) => "rayleigh-auto-greenwich-nodal-vector-robust",
         _ => unreachable!("selection methods are constructed internally"),
     }
 }
@@ -568,17 +609,33 @@ fn vector_confidence_values(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the canonical digest keeps every result-shaping input explicit"
+)]
 fn vector_result_digest(
     element_indices: &[usize],
     latitudes: &[f64],
     constituents: &[Constituent],
     series_frequency_cph: &[Vec<f64>],
     solutions: &[VectorSolution],
+    analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     reconstruction: Option<(&ReconstructionFilter, &[VectorReconstruction])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-vector-greenwich-nodal-v1\0");
+    digest.update(b"rutide-vector-greenwich-nodal-v2\0");
+    digest.update(analysis_method.name().as_bytes());
+    if let AnalysisMethod::Robust(options) = analysis_method {
+        digest.update(options.tuning_constant.to_bits().to_le_bytes());
+        digest.update(options.tolerance.to_bits().to_le_bytes());
+        digest.update(
+            u64::try_from(options.max_iterations)
+                .map_err(|_| AppError::Invalid("robust iteration limit exceeds u64".to_owned()))?
+                .to_le_bytes(),
+        );
+    }
+    digest.update([0]);
     digest.update(confidence_interval.method().as_bytes());
     digest.update([0]);
     if let Some(noise) = confidence_interval.noise() {
@@ -629,6 +686,22 @@ fn vector_result_digest(
             solution.northward_slope_per_day,
         ] {
             digest.update(value.to_bits().to_le_bytes());
+        }
+        if let Some(robust) = &solution.robust {
+            digest.update(
+                u64::try_from(robust.iterations)
+                    .map_err(|_| AppError::Invalid("robust iterations exceed u64".to_owned()))?
+                    .to_le_bytes(),
+            );
+            digest.update(robust.residual_scale.to_bits().to_le_bytes());
+            digest.update(robust.ols_rms_residual.to_bits().to_le_bytes());
+            digest.update(robust.rms_residual.to_bits().to_le_bytes());
+            digest.update(robust_termination_code(robust.termination).to_le_bytes());
+            for values in [&robust.weights, &robust.leverage] {
+                for value in values {
+                    digest.update(value.to_bits().to_le_bytes());
+                }
+            }
         }
     }
     if let Some((filter, values)) = reconstruction {
@@ -692,6 +765,7 @@ struct VectorOutputData<'data> {
     solutions: &'data [VectorSolution],
     result_sha256: &'data str,
     selection: &'data ResolvedConstituentSelection,
+    analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     reference_time_modified_julian_day: f64,
     reconstruction: Option<(&'data ReconstructionFilter, &'data [VectorReconstruction])>,
@@ -733,7 +807,20 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
         i64::from(VECTOR_OUTPUT_SCHEMA_VERSION),
     )?;
     output.add_attribute("rutide_version", rutide_core::VERSION)?;
-    output.add_attribute("profile", vector_profile(data.selection))?;
+    output.add_attribute(
+        "profile",
+        vector_profile(data.selection, data.analysis_method),
+    )?;
+    output.add_attribute("analysis_method", data.analysis_method.name())?;
+    if let AnalysisMethod::Robust(options) = data.analysis_method {
+        output.add_attribute("robust_tuning_constant", options.tuning_constant)?;
+        output.add_attribute("robust_tolerance", options.tolerance)?;
+        output.add_attribute(
+            "robust_max_iterations",
+            i64::try_from(options.max_iterations)
+                .map_err(|_| AppError::Invalid("robust iteration limit exceeds i64".to_owned()))?,
+        )?;
+    }
     output.add_attribute("source_eastward_variable", "ua")?;
     output.add_attribute("source_northward_variable", "va")?;
     output.add_attribute("confidence_interval", data.confidence_interval.method())?;
@@ -831,6 +918,7 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
         &mut output,
         data.constituents.len(),
         data.solutions,
+        data.analysis_method,
         data.confidence_interval,
     )?;
     if let Some((filter, values)) = data.reconstruction {
@@ -844,6 +932,7 @@ fn write_vector_solution_variables(
     output: &mut FileMut,
     constituent_count: usize,
     solutions: &[VectorSolution],
+    analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
 ) -> Result<(), AppError> {
     let capacity = solutions.len() * constituent_count;
@@ -931,6 +1020,111 @@ fn write_vector_solution_variables(
             units,
         )?;
     }
+    write_vector_robust_variables(output, solutions, analysis_method)?;
+    Ok(())
+}
+
+fn write_vector_robust_variables(
+    output: &mut FileMut,
+    solutions: &[VectorSolution],
+    analysis_method: AnalysisMethod,
+) -> Result<(), AppError> {
+    if analysis_method == AnalysisMethod::Ols {
+        if solutions.iter().any(|solution| solution.robust.is_some()) {
+            return Err(AppError::Invalid(
+                "OLS solver returned unexpected robust diagnostics".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    let diagnostics = solutions
+        .iter()
+        .map(|solution| {
+            solution
+                .robust
+                .as_ref()
+                .ok_or_else(|| AppError::Invalid("robust solver omitted diagnostics".to_owned()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let total_observations = diagnostics
+        .iter()
+        .map(|diagnostics| diagnostics.weights.len())
+        .sum();
+    output.add_dimension("robust_observation", total_observations)?;
+    let mut row_size = Vec::with_capacity(diagnostics.len());
+    let mut iterations = Vec::with_capacity(diagnostics.len());
+    let mut termination = Vec::with_capacity(diagnostics.len());
+    let mut residual_scale = Vec::with_capacity(diagnostics.len());
+    let mut ols_rms_residual = Vec::with_capacity(diagnostics.len());
+    let mut rms_residual = Vec::with_capacity(diagnostics.len());
+    let mut weights = Vec::with_capacity(total_observations);
+    let mut leverage = Vec::with_capacity(total_observations);
+    for diagnostics in diagnostics {
+        if diagnostics.weights.len() != diagnostics.leverage.len() {
+            return Err(AppError::Invalid(
+                "robust weight and leverage lengths differ".to_owned(),
+            ));
+        }
+        row_size.push(
+            i64::try_from(diagnostics.weights.len()).map_err(|_| {
+                AppError::Invalid("robust observation count exceeds i64".to_owned())
+            })?,
+        );
+        iterations.push(
+            i64::try_from(diagnostics.iterations)
+                .map_err(|_| AppError::Invalid("robust iteration count exceeds i64".to_owned()))?,
+        );
+        termination.push(robust_termination_code(diagnostics.termination));
+        residual_scale.push(diagnostics.residual_scale);
+        ols_rms_residual.push(diagnostics.ols_rms_residual);
+        rms_residual.push(diagnostics.rms_residual);
+        weights.extend_from_slice(&diagnostics.weights);
+        leverage.extend_from_slice(&diagnostics.leverage);
+    }
+    for (name, values) in [
+        ("robust_weight_row_size", &row_size),
+        ("robust_iterations", &iterations),
+        ("robust_termination", &termination),
+    ] {
+        write_variable(
+            &mut output.add_variable::<i64>(name, &["series"])?,
+            values,
+            "1",
+        )?;
+    }
+    for (name, values, units) in [
+        (
+            "robust_residual_scale",
+            &residual_scale,
+            "source velocity units",
+        ),
+        (
+            "robust_ols_rms_residual",
+            &ols_rms_residual,
+            "source velocity units",
+        ),
+        (
+            "robust_rms_residual",
+            &rms_residual,
+            "source velocity units",
+        ),
+    ] {
+        write_variable(
+            &mut output.add_variable::<f64>(name, &["series"])?,
+            values,
+            units,
+        )?;
+    }
+    write_variable(
+        &mut output.add_variable::<f64>("robust_weight", &["robust_observation"])?,
+        &weights,
+        "1",
+    )?;
+    write_variable(
+        &mut output.add_variable::<f64>("robust_leverage", &["robust_observation"])?,
+        &leverage,
+        "1",
+    )?;
     Ok(())
 }
 
@@ -988,11 +1182,11 @@ fn write_vector_reconstruction_variables(
 mod tests {
     use std::fs;
 
-    use rutide_core::{LinearConfidence, ReconstructionFilter, TidalConstituent};
+    use rutide_core::{LinearConfidence, ReconstructionFilter, RobustOptions, TidalConstituent};
 
     use super::{
-        ConfidenceInterval, ConstituentSelection, NodeSelection, VectorAnalyzeConfig,
-        analyze_vector, read_fvcom_vector, temporary_sibling,
+        AnalysisMethod, ConfidenceInterval, ConstituentSelection, NodeSelection,
+        VectorAnalyzeConfig, analyze_vector, read_fvcom_vector, temporary_sibling,
     };
 
     #[test]
@@ -1081,6 +1275,10 @@ mod tests {
                 TidalConstituent::K1,
             ]),
             confidence_interval: ConfidenceInterval::Linear(LinearConfidence::White),
+            analysis_method: AnalysisMethod::Robust(RobustOptions {
+                tolerance: 0.01,
+                ..RobustOptions::default()
+            }),
             reconstruction: Some(ReconstructionFilter::All),
             workers: 2,
             overwrite: false,
@@ -1088,6 +1286,7 @@ mod tests {
         .expect("analyze vector fixture");
         assert_eq!(report.series_count, 2);
         assert_eq!(report.series_with_missing_observations, 2);
+        assert_eq!(report.analysis_method, "robust");
         let output = netcdf::open(&output_path).expect("open vector output");
         assert_eq!(
             output
@@ -1098,6 +1297,21 @@ mod tests {
             [48, 48]
         );
         assert_eq!(output.variable("semi_major").expect("semi-major").len(), 4);
+        assert_eq!(
+            output
+                .variable("robust_weight_row_size")
+                .expect("robust row sizes")
+                .get_values::<i64, _>(..)
+                .expect("read robust row sizes"),
+            [48, 48]
+        );
+        assert_eq!(
+            output
+                .variable("robust_weight")
+                .expect("robust weights")
+                .len(),
+            96
+        );
         assert_eq!(
             output
                 .variable("eastward_reconstruction")

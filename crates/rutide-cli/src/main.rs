@@ -8,11 +8,10 @@ use std::{
 };
 
 use rutide_cli::{
-    AnalyzeConfig, ConfidenceInterval, ConstituentSelection, DEFAULT_CONSTITUENTS, NodeSelection,
-    VectorAnalyzeConfig, analyze_scalar, analyze_vector,
+    AnalysisMethod, AnalyzeConfig, ConfidenceInterval, ConstituentSelection, DEFAULT_CONSTITUENTS,
+    NodeSelection, VectorAnalyzeConfig, analyze_scalar, analyze_vector,
 };
-use rutide_core::ReconstructionFilter;
-use rutide_core::{LinearConfidence, TidalConstituent};
+use rutide_core::{LinearConfidence, ReconstructionFilter, RobustOptions, TidalConstituent};
 
 // The application repeatedly allocates short-lived QR storage across worker
 // threads; this allocator keeps that full-field pattern bounded and reusable.
@@ -34,6 +33,12 @@ Options:
   --elements I,J,...  Analyze explicit zero-based element indices (vector mode)
   --constituents LIST Comma-separated names or 'auto' (default: M2,S2,N2,K1,O1)
   --rayleigh-min X    Automatic selection criterion (default with auto: 1.0)
+  --method MODE       Least squares: ols or robust (default: ols)
+  --robust-tuning X   Cauchy tuning constant (default: 2.385)
+  --robust-tolerance X
+                      Fractional IRLS tolerance (default: 0.001)
+  --robust-max-iterations N
+                      Maximum IRLS iterations (default: 50)
   --confidence MODE   Confidence intervals: none or linear (default: none)
   --white-noise       Use white noise instead of colored residual bands
   --reconstruct       Write complete original-time reconstruction to the output
@@ -131,6 +136,10 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let mut selection = None;
     let mut constituents = None;
     let mut rayleigh_minimum = None;
+    let mut robust_requested = None;
+    let mut robust_tuning = None;
+    let mut robust_tolerance = None;
+    let mut robust_max_iterations = None;
     let mut confidence_requested = None;
     let mut white_noise = false;
     let mut reconstruct = false;
@@ -197,6 +206,42 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                     option,
                 )?);
             }
+            "--method" => {
+                if robust_requested.is_some() {
+                    return Err("--method may only be supplied once".to_owned());
+                }
+                robust_requested = Some(parse_analysis_method(&required_value(
+                    &mut arguments,
+                    option,
+                )?)?);
+            }
+            "--robust-tuning" => {
+                if robust_tuning.is_some() {
+                    return Err("--robust-tuning may only be supplied once".to_owned());
+                }
+                robust_tuning = Some(parse_positive_f64(
+                    &required_value(&mut arguments, option)?,
+                    option,
+                )?);
+            }
+            "--robust-tolerance" => {
+                if robust_tolerance.is_some() {
+                    return Err("--robust-tolerance may only be supplied once".to_owned());
+                }
+                robust_tolerance = Some(parse_positive_f64(
+                    &required_value(&mut arguments, option)?,
+                    option,
+                )?);
+            }
+            "--robust-max-iterations" => {
+                if robust_max_iterations.is_some() {
+                    return Err("--robust-max-iterations may only be supplied once".to_owned());
+                }
+                robust_max_iterations = Some(parse_positive_usize(
+                    &required_value(&mut arguments, option)?,
+                    option,
+                )?);
+            }
             "--confidence" => {
                 if confidence_requested.is_some() {
                     return Err("--confidence may only be supplied once".to_owned());
@@ -247,6 +292,12 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     }
 
     let constituent_selection = resolve_constituent_selection(constituents, rayleigh_minimum)?;
+    let analysis_method = resolve_analysis_method(
+        robust_requested,
+        robust_tuning,
+        robust_tolerance,
+        robust_max_iterations,
+    )?;
     let confidence_interval = resolve_confidence_interval(confidence_requested, white_noise)?;
     let reconstruction = resolve_reconstruction(
         reconstruct,
@@ -272,6 +323,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             elements: selection,
             constituent_selection,
             confidence_interval,
+            analysis_method,
             reconstruction,
             workers,
             overwrite,
@@ -284,11 +336,32 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             nodes: selection,
             constituent_selection,
             confidence_interval,
+            analysis_method,
             reconstruction,
             workers,
             overwrite,
         }))
     }
+}
+
+fn resolve_analysis_method(
+    robust_requested: Option<bool>,
+    tuning_constant: Option<f64>,
+    tolerance: Option<f64>,
+    max_iterations: Option<usize>,
+) -> Result<AnalysisMethod, String> {
+    if !robust_requested.unwrap_or(false) {
+        if tuning_constant.is_some() || tolerance.is_some() || max_iterations.is_some() {
+            return Err("robust options require --method robust".to_owned());
+        }
+        return Ok(AnalysisMethod::Ols);
+    }
+    let defaults = RobustOptions::default();
+    Ok(AnalysisMethod::Robust(RobustOptions {
+        tuning_constant: tuning_constant.unwrap_or(defaults.tuning_constant),
+        tolerance: tolerance.unwrap_or(defaults.tolerance),
+        max_iterations: max_iterations.unwrap_or(defaults.max_iterations),
+    }))
 }
 
 fn resolve_reconstruction(
@@ -429,6 +502,17 @@ fn parse_confidence(value: &OsStr) -> Result<bool, String> {
     }
 }
 
+fn parse_analysis_method(value: &OsStr) -> Result<bool, String> {
+    match value.to_str() {
+        Some("ols") => Ok(false),
+        Some("robust") => Ok(true),
+        Some(value) => Err(format!(
+            "--method must be 'ols' or 'robust', received {value:?}"
+        )),
+        None => Err("--method value must be valid UTF-8".to_owned()),
+    }
+}
+
 fn ensure_selection_is_unset(selection: Option<&NodeSelection>) -> Result<(), String> {
     if selection.is_some() {
         return Err("--nodes and --node-count are mutually exclusive".to_owned());
@@ -504,9 +588,10 @@ mod tests {
 
     use super::{Command, parse_arguments};
     use rutide_cli::{
-        ConfidenceInterval, ConstituentSelection, DEFAULT_CONSTITUENTS, NodeSelection,
+        AnalysisMethod, ConfidenceInterval, ConstituentSelection, DEFAULT_CONSTITUENTS,
+        NodeSelection,
     };
-    use rutide_core::{LinearConfidence, ReconstructionFilter, TidalConstituent};
+    use rutide_core::{LinearConfidence, ReconstructionFilter, RobustOptions, TidalConstituent};
 
     fn args<'a>(values: &'a [&'a str]) -> impl Iterator<Item = OsString> + 'a {
         values.iter().map(OsString::from)
@@ -535,8 +620,52 @@ mod tests {
             ConstituentSelection::Explicit(DEFAULT_CONSTITUENTS.to_vec())
         );
         assert_eq!(config.confidence_interval, ConfidenceInterval::None);
+        assert_eq!(config.analysis_method, AnalysisMethod::Ols);
         assert_eq!(config.reconstruction, None);
         assert_eq!(config.workers, 8);
+    }
+
+    #[test]
+    fn parses_robust_method_and_options() {
+        let command = parse_arguments(args(&[
+            "analyze-scalar",
+            "--input",
+            "input.nc",
+            "--output",
+            "output.nc",
+            "--method",
+            "robust",
+            "--robust-tuning",
+            "2.5",
+            "--robust-tolerance",
+            "0.0005",
+            "--robust-max-iterations",
+            "75",
+        ]))
+        .expect("valid robust options");
+        let Command::AnalyzeScalar(config) = command else {
+            panic!("expected scalar analyze command");
+        };
+        assert_eq!(
+            config.analysis_method,
+            AnalysisMethod::Robust(RobustOptions {
+                tuning_constant: 2.5,
+                tolerance: 0.0005,
+                max_iterations: 75,
+            })
+        );
+        assert!(
+            parse_arguments(args(&[
+                "analyze-scalar",
+                "--input",
+                "input.nc",
+                "--output",
+                "output.nc",
+                "--robust-tuning",
+                "2.5",
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

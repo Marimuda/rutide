@@ -14,7 +14,8 @@ use netcdf::{FileMut, Variable, VariableMut};
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
     AnalysisError, Constituent, GreenwichNodalBatch, LinearConfidence, RayleighSelection,
-    ReconstructionFilter, ScalarSolution, TidalConstituent, select_constituents_by_rayleigh,
+    ReconstructionFilter, RobustOptions, RobustTermination, ScalarSolution, TidalConstituent,
+    select_constituents_by_rayleigh,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -24,7 +25,7 @@ mod vector;
 pub use vector::{VectorAnalyzeConfig, VectorRunReport, VectorSampleResult, analyze_vector};
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
-const OUTPUT_SCHEMA_VERSION: u32 = 5;
+const OUTPUT_SCHEMA_VERSION: u32 = 6;
 /// Backward-compatible benchmark constituent set used when none is specified.
 pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -66,6 +67,24 @@ pub enum ConfidenceInterval {
     Linear(LinearConfidence),
 }
 
+/// Least-squares method requested for an application run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AnalysisMethod {
+    /// Ordinary least squares.
+    Ols,
+    /// Cauchy iteratively reweighted least squares.
+    Robust(RobustOptions),
+}
+
+impl AnalysisMethod {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Ols => "ols",
+            Self::Robust(_) => "robust",
+        }
+    }
+}
+
 impl ConfidenceInterval {
     const fn method(self) -> &'static str {
         match self {
@@ -98,6 +117,8 @@ pub struct AnalyzeConfig {
     pub constituent_selection: ConstituentSelection,
     /// Optional linearized confidence intervals and their noise model.
     pub confidence_interval: ConfidenceInterval,
+    /// Ordinary or Cauchy robust least squares.
+    pub analysis_method: AnalysisMethod,
     /// Optional complete-series reconstruction and its constituent filter.
     pub reconstruction: Option<ReconstructionFilter>,
     /// Number of outer spatial worker threads.
@@ -214,6 +235,10 @@ pub struct RunReport {
     pub series_with_missing_observations: usize,
     /// Number of outer spatial workers.
     pub workers: usize,
+    /// Least-squares method: `ols` or `robust`.
+    pub analysis_method: &'static str,
+    /// Robust options when robust fitting is enabled.
+    pub robust_options: Option<RobustOptionsReport>,
     /// Auditable constituent-selection method and threshold.
     pub constituent_selection: ConstituentSelectionReport,
     /// Confidence method: `none` or `linear`.
@@ -234,6 +259,27 @@ pub struct RunReport {
     pub timings: StageTimings,
     /// First three results in output order.
     pub sample_results: Vec<SampleResult>,
+}
+
+/// Serializable robust fitting options retained in application reports.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct RobustOptionsReport {
+    /// Cauchy tuning constant.
+    pub tuning_constant: f64,
+    /// Fractional objective-improvement tolerance.
+    pub tolerance: f64,
+    /// Maximum IRLS iterations.
+    pub max_iterations: usize,
+}
+
+impl From<RobustOptions> for RobustOptionsReport {
+    fn from(options: RobustOptions) -> Self {
+        Self {
+            tuning_constant: options.tuning_constant,
+            tolerance: options.tolerance,
+            max_iterations: options.max_iterations,
+        }
+    }
 }
 
 /// Errors from FVCOM input, analysis, or result serialization.
@@ -332,10 +378,12 @@ struct ResolvedConstituentSelection {
 }
 
 impl ResolvedConstituentSelection {
-    fn profile(&self) -> &'static str {
-        match self.report.method {
-            "explicit" => "fixed-constituents-greenwich-nodal-ols",
-            "rayleigh" => "rayleigh-auto-greenwich-nodal-ols",
+    fn profile(&self, analysis_method: AnalysisMethod) -> &'static str {
+        match (self.report.method, analysis_method) {
+            ("explicit", AnalysisMethod::Ols) => "fixed-constituents-greenwich-nodal-ols",
+            ("rayleigh", AnalysisMethod::Ols) => "rayleigh-auto-greenwich-nodal-ols",
+            ("explicit", AnalysisMethod::Robust(_)) => "fixed-constituents-greenwich-nodal-robust",
+            ("rayleigh", AnalysisMethod::Robust(_)) => "rayleigh-auto-greenwich-nodal-robust",
             _ => unreachable!("selection methods are constructed internally"),
         }
     }
@@ -376,7 +424,13 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         .num_threads(config.workers)
         .build()?;
     let solve_start = Instant::now();
-    let solutions = solve_input(&worker_pool, &batch, &input, config.confidence_interval)?;
+    let solutions = solve_input(
+        &worker_pool,
+        &batch,
+        &input,
+        config.analysis_method,
+        config.confidence_interval,
+    )?;
     let solve_seconds = solve_start.elapsed().as_secs_f64();
 
     let reconstruction_start = Instant::now();
@@ -397,6 +451,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         batch.constituents(),
         &series_frequency_cph,
         &solutions,
+        config.analysis_method,
         config.confidence_interval,
         config
             .reconstruction
@@ -424,6 +479,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             solutions: &solutions,
             result_sha256: &result_sha256,
             selection: &selection,
+            analysis_method: config.analysis_method,
             confidence_interval: config.confidence_interval,
             modified_julian_days: &input.modified_julian_days,
             reference_time_modified_julian_day: batch.reference_time_modified_julian_day(),
@@ -445,7 +501,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         schema_version: OUTPUT_SCHEMA_VERSION,
         created_unix_seconds,
         rutide_version: rutide_core::VERSION,
-        profile: selection.profile(),
+        profile: selection.profile(config.analysis_method),
         input_path: config.input.to_string_lossy().into_owned(),
         input_file_bytes: input.input_file_bytes,
         logical_input_bytes: input.logical_input_bytes,
@@ -459,6 +515,11 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             .filter(|count| **count != input.modified_julian_days.len())
             .count(),
         workers: config.workers,
+        analysis_method: config.analysis_method.name(),
+        robust_options: match config.analysis_method {
+            AnalysisMethod::Ols => None,
+            AnalysisMethod::Robust(options) => Some(options.into()),
+        },
         constituent_selection: selection.report,
         confidence_interval: config.confidence_interval.method(),
         confidence_noise: config.confidence_interval.noise(),
@@ -502,16 +563,26 @@ fn solve_input(
     worker_pool: &rayon::ThreadPool,
     batch: &GreenwichNodalBatch,
     input: &InputData,
+    analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
 ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-    worker_pool.install(|| match confidence_interval {
-        ConfidenceInterval::None => {
+    worker_pool.install(|| match (analysis_method, confidence_interval) {
+        (AnalysisMethod::Ols, ConfidenceInterval::None) => {
             batch.solve_time_major_with_missing(&input.observations, &input.latitudes)
         }
-        ConfidenceInterval::Linear(noise) => batch
+        (AnalysisMethod::Ols, ConfidenceInterval::Linear(noise)) => batch
             .solve_time_major_with_missing_and_linear_confidence(
                 &input.observations,
                 &input.latitudes,
+                noise,
+            ),
+        (AnalysisMethod::Robust(options), ConfidenceInterval::None) => batch
+            .solve_time_major_with_missing_robust(&input.observations, &input.latitudes, options),
+        (AnalysisMethod::Robust(options), ConfidenceInterval::Linear(noise)) => batch
+            .solve_time_major_with_missing_robust_and_linear_confidence(
+                &input.observations,
+                &input.latitudes,
+                options,
                 noise,
             ),
     })
@@ -564,6 +635,23 @@ fn validate_config(config: &AnalyzeConfig) -> Result<(), AppError> {
         return Err(AppError::Invalid(
             "input and output paths must differ".to_owned(),
         ));
+    }
+    if let AnalysisMethod::Robust(options) = config.analysis_method {
+        if !options.tuning_constant.is_finite() || options.tuning_constant <= 0.0 {
+            return Err(AppError::Invalid(
+                "robust tuning constant must be finite and greater than zero".to_owned(),
+            ));
+        }
+        if !options.tolerance.is_finite() || options.tolerance <= 0.0 {
+            return Err(AppError::Invalid(
+                "robust tolerance must be finite and greater than zero".to_owned(),
+            ));
+        }
+        if options.max_iterations == 0 {
+            return Err(AppError::Invalid(
+                "robust iteration limit must be greater than zero".to_owned(),
+            ));
+        }
     }
     if let ConstituentSelection::Explicit(constituents) = &config.constituent_selection {
         if constituents.is_empty() {
@@ -942,17 +1030,33 @@ fn normalize_source_observation(
     Ok(value)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the canonical digest keeps every result-shaping input explicit"
+)]
 fn result_digest(
     node_indices: &[usize],
     latitudes: &[f64],
     constituents: &[Constituent],
     series_frequency_cph: &[Vec<f64>],
     solutions: &[ScalarSolution],
+    analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     reconstruction: Option<(&ReconstructionFilter, &[Vec<f64>])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-scalar-greenwich-nodal-v5\0");
+    digest.update(b"rutide-scalar-greenwich-nodal-v6\0");
+    digest.update(analysis_method.name().as_bytes());
+    if let AnalysisMethod::Robust(options) = analysis_method {
+        digest.update(options.tuning_constant.to_bits().to_le_bytes());
+        digest.update(options.tolerance.to_bits().to_le_bytes());
+        digest.update(
+            u64::try_from(options.max_iterations)
+                .map_err(|_| AppError::Invalid("robust iteration limit exceeds u64".to_owned()))?
+                .to_le_bytes(),
+        );
+    }
+    digest.update([0]);
     digest.update(confidence_interval.method().as_bytes());
     digest.update([0]);
     if let Some(noise) = confidence_interval.noise() {
@@ -998,6 +1102,22 @@ fn result_digest(
         }
         digest.update(solution.mean.to_bits().to_le_bytes());
         digest.update(solution.slope_per_day.to_bits().to_le_bytes());
+        if let Some(robust) = &solution.robust {
+            digest.update(
+                u64::try_from(robust.iterations)
+                    .map_err(|_| AppError::Invalid("robust iterations exceed u64".to_owned()))?
+                    .to_le_bytes(),
+            );
+            digest.update(robust.residual_scale.to_bits().to_le_bytes());
+            digest.update(robust.ols_rms_residual.to_bits().to_le_bytes());
+            digest.update(robust.rms_residual.to_bits().to_le_bytes());
+            digest.update(robust_termination_code(robust.termination).to_le_bytes());
+            for values in [&robust.weights, &robust.leverage] {
+                for value in values {
+                    digest.update(value.to_bits().to_le_bytes());
+                }
+            }
+        }
     }
     match reconstruction {
         Some((filter, values)) => {
@@ -1110,6 +1230,7 @@ struct OutputData<'data> {
     solutions: &'data [ScalarSolution],
     result_sha256: &'data str,
     selection: &'data ResolvedConstituentSelection,
+    analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     modified_julian_days: &'data [f64],
     reference_time_modified_julian_day: f64,
@@ -1145,6 +1266,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         solutions,
         result_sha256,
         selection,
+        analysis_method,
         confidence_interval,
         modified_julian_days,
         reference_time_modified_julian_day,
@@ -1159,7 +1281,17 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
     output.add_attribute("title", "RUTide scalar harmonic coefficients")?;
     output.add_attribute("rutide_schema_version", i64::from(OUTPUT_SCHEMA_VERSION))?;
     output.add_attribute("rutide_version", rutide_core::VERSION)?;
-    output.add_attribute("profile", selection.profile())?;
+    output.add_attribute("profile", selection.profile(analysis_method))?;
+    output.add_attribute("analysis_method", analysis_method.name())?;
+    if let AnalysisMethod::Robust(options) = analysis_method {
+        output.add_attribute("robust_tuning_constant", options.tuning_constant)?;
+        output.add_attribute("robust_tolerance", options.tolerance)?;
+        output.add_attribute(
+            "robust_max_iterations",
+            i64::try_from(options.max_iterations)
+                .map_err(|_| AppError::Invalid("robust iteration limit exceeds i64".to_owned()))?,
+        )?;
+    }
     output.add_attribute("confidence_interval", confidence_interval.method())?;
     if let Some(noise) = confidence_interval.noise() {
         output.add_attribute("confidence_noise", noise)?;
@@ -1245,7 +1377,13 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         "cycles per hour",
     )?;
 
-    write_solution_variables(&mut output, constituents, solutions, confidence_interval)?;
+    write_solution_variables(
+        &mut output,
+        constituents,
+        solutions,
+        analysis_method,
+        confidence_interval,
+    )?;
     if let Some((filter, values)) = reconstruction {
         write_reconstruction_variables(
             &mut output,
@@ -1304,6 +1442,7 @@ fn write_solution_variables(
     output: &mut FileMut,
     constituents: &[Constituent],
     solutions: &[ScalarSolution],
+    analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
 ) -> Result<(), AppError> {
     let mut amplitude = Vec::with_capacity(solutions.len() * constituents.len());
@@ -1370,7 +1509,120 @@ fn write_solution_variables(
         &slope,
         "source variable units per day",
     )?;
+    write_robust_variables(output, solutions, analysis_method)?;
     Ok(())
+}
+
+fn write_robust_variables(
+    output: &mut FileMut,
+    solutions: &[ScalarSolution],
+    analysis_method: AnalysisMethod,
+) -> Result<(), AppError> {
+    if analysis_method == AnalysisMethod::Ols {
+        if solutions.iter().any(|solution| solution.robust.is_some()) {
+            return Err(AppError::Invalid(
+                "OLS solver returned unexpected robust diagnostics".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    let diagnostics = solutions
+        .iter()
+        .map(|solution| {
+            solution
+                .robust
+                .as_ref()
+                .ok_or_else(|| AppError::Invalid("robust solver omitted diagnostics".to_owned()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let total_observations = diagnostics
+        .iter()
+        .map(|diagnostics| diagnostics.weights.len())
+        .sum();
+    output.add_dimension("robust_observation", total_observations)?;
+    let mut row_size = Vec::with_capacity(diagnostics.len());
+    let mut iterations = Vec::with_capacity(diagnostics.len());
+    let mut termination = Vec::with_capacity(diagnostics.len());
+    let mut residual_scale = Vec::with_capacity(diagnostics.len());
+    let mut ols_rms_residual = Vec::with_capacity(diagnostics.len());
+    let mut rms_residual = Vec::with_capacity(diagnostics.len());
+    let mut weights = Vec::with_capacity(total_observations);
+    let mut leverage = Vec::with_capacity(total_observations);
+    for diagnostics in diagnostics {
+        if diagnostics.weights.len() != diagnostics.leverage.len() {
+            return Err(AppError::Invalid(
+                "robust weight and leverage lengths differ".to_owned(),
+            ));
+        }
+        row_size.push(
+            i64::try_from(diagnostics.weights.len()).map_err(|_| {
+                AppError::Invalid("robust observation count exceeds i64".to_owned())
+            })?,
+        );
+        iterations.push(
+            i64::try_from(diagnostics.iterations)
+                .map_err(|_| AppError::Invalid("robust iteration count exceeds i64".to_owned()))?,
+        );
+        termination.push(robust_termination_code(diagnostics.termination));
+        residual_scale.push(diagnostics.residual_scale);
+        ols_rms_residual.push(diagnostics.ols_rms_residual);
+        rms_residual.push(diagnostics.rms_residual);
+        weights.extend_from_slice(&diagnostics.weights);
+        leverage.extend_from_slice(&diagnostics.leverage);
+    }
+    for (name, values) in [
+        ("robust_weight_row_size", &row_size),
+        ("robust_iterations", &iterations),
+        ("robust_termination", &termination),
+    ] {
+        write_variable(
+            &mut output.add_variable::<i64>(name, &["series"])?,
+            values,
+            "1",
+        )?;
+    }
+    for (name, values, units) in [
+        (
+            "robust_residual_scale",
+            &residual_scale,
+            "source variable units",
+        ),
+        (
+            "robust_ols_rms_residual",
+            &ols_rms_residual,
+            "source variable units",
+        ),
+        (
+            "robust_rms_residual",
+            &rms_residual,
+            "source variable units",
+        ),
+    ] {
+        write_variable(
+            &mut output.add_variable::<f64>(name, &["series"])?,
+            values,
+            units,
+        )?;
+    }
+    write_variable(
+        &mut output.add_variable::<f64>("robust_weight", &["robust_observation"])?,
+        &weights,
+        "1",
+    )?;
+    write_variable(
+        &mut output.add_variable::<f64>("robust_leverage", &["robust_observation"])?,
+        &leverage,
+        "1",
+    )?;
+    Ok(())
+}
+
+const fn robust_termination_code(termination: RobustTermination) -> i64 {
+    match termination {
+        RobustTermination::Tolerance => 0,
+        RobustTermination::ObjectiveIncrease => 1,
+        RobustTermination::ExactFit => 2,
+    }
 }
 
 fn write_variable<T>(
