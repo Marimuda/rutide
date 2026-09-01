@@ -1573,7 +1573,6 @@ fn write_robust_variables(
     for (name, values) in [
         ("robust_weight_row_size", &row_size),
         ("robust_iterations", &iterations),
-        ("robust_termination", &termination),
     ] {
         write_variable(
             &mut output.add_variable::<i64>(name, &["series"])?,
@@ -1581,6 +1580,7 @@ fn write_robust_variables(
             "1",
         )?;
     }
+    write_robust_schema_metadata(output, &termination)?;
     for (name, values, units) in [
         (
             "robust_residual_scale",
@@ -1623,6 +1623,18 @@ const fn robust_termination_code(termination: RobustTermination) -> i64 {
         RobustTermination::ObjectiveIncrease => 1,
         RobustTermination::ExactFit => 2,
     }
+}
+
+fn write_robust_schema_metadata(output: &mut FileMut, termination: &[i64]) -> Result<(), AppError> {
+    output
+        .variable_mut("robust_weight_row_size")
+        .ok_or_else(|| AppError::Invalid("robust row-size variable was not created".to_owned()))?
+        .put_attribute("sample_dimension", "robust_observation")?;
+    let mut variable = output.add_variable::<i64>("robust_termination", &["series"])?;
+    write_variable(&mut variable, termination, "1")?;
+    variable.put_attribute("flag_values", vec![0_i64, 1, 2])?;
+    variable.put_attribute("flag_meanings", "tolerance objective_increase exact_fit")?;
+    Ok(())
 }
 
 fn write_variable<T>(

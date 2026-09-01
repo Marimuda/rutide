@@ -421,6 +421,105 @@ fn matches_python_utide_cauchy_robust_scalar_fit() {
 }
 
 #[test]
+fn matches_python_utide_for_a_sustained_scalar_outlier() {
+    let time = oracle_times();
+    let mut observations = oracle_observations();
+    for value in &mut observations[300..331] {
+        *value += 2.5;
+    }
+    let model = GreenwichNodalOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE_DEGREES_NORTH,
+        &CONSTITUENTS,
+    )
+    .expect("valid sustained-outlier model");
+    let solution = model
+        .solve_robust_with_linear_confidence(
+            &observations,
+            RobustOptions::default(),
+            LinearConfidence::Colored,
+        )
+        .expect("converged sustained-outlier solution");
+
+    for (label, actual, expected, tolerance) in [
+        (
+            "sustained robust amplitude",
+            &solution.amplitude,
+            &[
+                0.658_342_939_774_640_9,
+                0.237_586_228_525_747_96,
+                0.154_849_024_020_135_53,
+                0.106_145_206_841_438_44,
+                0.062_397_163_868_370_305,
+            ],
+            3e-11,
+        ),
+        (
+            "sustained robust phase",
+            &solution.phase_degrees,
+            &[
+                188.968_537_730_831_88,
+                231.314_689_016_924_43,
+                161.007_478_621_623_1,
+                154.146_371_902_974_8,
+                19.648_934_651_665_137,
+            ],
+            3e-8,
+        ),
+        (
+            "sustained robust amplitude CI",
+            solution.amplitude_ci.as_ref().expect("amplitude CI"),
+            &[
+                0.009_980_564_103_119_892,
+                0.009_974_265_253_914_148,
+                0.009_985_259_389_109_383,
+                0.006_986_736_584_833_989,
+                0.007_007_945_389_750_689,
+            ],
+            3e-10,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{label}[{index}]"), *actual, *expected, tolerance);
+        }
+    }
+    assert_close(
+        "sustained robust mean",
+        solution.mean,
+        0.097_490_406_999_837_45,
+        3e-11,
+    );
+    assert_close(
+        "sustained robust slope",
+        solution.slope_per_day,
+        0.001_091_945_399_845_701_5,
+        3e-12,
+    );
+    let diagnostics = solution.robust.as_ref().expect("robust diagnostics");
+    assert_eq!(diagnostics.iterations, 6);
+    assert_close(
+        "sustained robust weight sum",
+        diagnostics.weights.iter().sum(),
+        621.260_918_730_234_7,
+        2e-8,
+    );
+    for (index, expected) in [
+        (299, 0.707_734_756_258_129_8),
+        (300, 0.018_265_131_761_312_274),
+        (315, 0.017_999_228_385_467_99),
+        (330, 0.017_047_553_732_599_69),
+        (331, 0.886_312_389_678_020_5),
+    ] {
+        assert_close(
+            &format!("sustained robust weight[{index}]"),
+            diagnostics.weights[index],
+            expected,
+            3e-10,
+        );
+    }
+}
+
+#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "freezes ellipse, shared-weight, and confidence oracle values"

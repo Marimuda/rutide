@@ -23,7 +23,8 @@ use super::{
     normalize_source_observation, reconstruction_report, required_dimension_length,
     required_variable, resolve_constituent_selection, robust_termination_code, temporary_sibling,
     update_reconstruction_filter_digest, validate_config, validate_dimensions,
-    validate_reconstruction_filter, validate_source_value, write_json_report, write_variable,
+    validate_reconstruction_filter, validate_source_value, write_json_report,
+    write_robust_schema_metadata, write_variable,
 };
 
 const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 2;
@@ -1084,7 +1085,6 @@ fn write_vector_robust_variables(
     for (name, values) in [
         ("robust_weight_row_size", &row_size),
         ("robust_iterations", &iterations),
-        ("robust_termination", &termination),
     ] {
         write_variable(
             &mut output.add_variable::<i64>(name, &["series"])?,
@@ -1092,6 +1092,7 @@ fn write_vector_robust_variables(
             "1",
         )?;
     }
+    write_robust_schema_metadata(output, &termination)?;
     for (name, values, units) in [
         (
             "robust_residual_scale",
@@ -1311,6 +1312,16 @@ mod tests {
                 .expect("robust weights")
                 .len(),
             96
+        );
+        assert_eq!(
+            output
+                .variable("robust_termination")
+                .expect("robust termination")
+                .attribute("flag_meanings")
+                .expect("termination flag meanings")
+                .value()
+                .expect("read termination flag meanings"),
+            netcdf::AttributeValue::Str("tolerance objective_increase exact_fit".to_owned())
         );
         assert_eq!(
             output

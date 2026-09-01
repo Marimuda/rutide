@@ -59,7 +59,7 @@ pub enum RobustTermination {
 /// Auditable diagnostics from a converged robust fit.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RobustDiagnostics {
-    /// Final per-time weights used by the retained weighted least-squares solve.
+    /// Final weight for each retained time row, in timestamp order.
     pub weights: Vec<f64>,
     /// OLS leverage, or diagonal of the unweighted model hat matrix.
     pub leverage: Vec<f64>,
