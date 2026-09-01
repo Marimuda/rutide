@@ -243,9 +243,12 @@ timestamps; the last use a Lomb–Scargle residual spectrum.
 
 Vector inference uses separate positive- and negative-rotary constraints:
 `--infer INFERRED:REFERENCE:AMP+:PHASE+:AMP-:PHASE-`. It supports exact or
-approximate OLS, missing values, white/colored linear confidence, PE/SNR, and
-reconstruction. Robust vector inference is rejected explicitly until its coupled
-IRLS formulation has pinned-oracle coverage.
+approximate OLS or robust fitting, missing values, white/colored linear
+confidence, PE/SNR, and reconstruction. Robust inference solves the coupled
+complex rotary model with one Cauchy weight per retained timestamp; NetCDF
+outputs retain those shared weights, complex-model leverage, convergence
+diagnostics, and reconstruction metadata. Add `--method robust` alongside the
+vector `--infer` relationships to enable it.
 
 ## Working principles
 

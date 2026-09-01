@@ -1,9 +1,9 @@
 //! Scalar inferred-constituent parity against the pinned Python `UTide` oracle.
 
 use rutide_core::{
-    AnalysisError, InferenceMode, LinearConfidence, ReconstructionFilter, ScalarInferenceBatch,
-    ScalarInferenceOls, ScalarInferenceRelation, TidalConstituent, VectorInferenceBatch,
-    VectorInferenceOls, VectorInferenceRelation,
+    AnalysisError, InferenceMode, LinearConfidence, ReconstructionFilter, RobustOptions,
+    ScalarInferenceBatch, ScalarInferenceOls, ScalarInferenceRelation, TidalConstituent,
+    VectorInferenceBatch, VectorInferenceOls, VectorInferenceRelation,
 };
 
 const LATITUDE: f64 = 60.957_717_895_507_81;
@@ -728,6 +728,268 @@ fn matches_resolved_exact_vector_inference_oracle() {
     ] {
         for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
             assert_close(&format!("{field}[{index}]"), *actual, *expected, 5e-10);
+        }
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "freezes coupled robust ellipses, diagnostics, intervals, and reconstruction together"
+)]
+fn matches_resolved_exact_robust_vector_inference_oracle() {
+    let time = oracle_times(745);
+    let (mut eastward, mut northward) = synthetic_vector_observations(&time);
+    for (index, eastward_outlier, northward_outlier) in
+        [(33, 3.0, -2.5), (211, -2.4, 3.2), (510, 4.0, 3.5)]
+    {
+        eastward[index] += eastward_outlier;
+        northward[index] += northward_outlier;
+    }
+    let model = VectorInferenceOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE,
+        &requested(),
+        &VECTOR_RELATIONSHIPS,
+        InferenceMode::Exact,
+    )
+    .expect("valid robust vector inference model");
+    let solution = model
+        .solve_vector_robust_with_linear_confidence(
+            &eastward,
+            &northward,
+            RobustOptions::default(),
+            LinearConfidence::White,
+        )
+        .expect("valid robust vector inference solution");
+    for (field, actual, expected, tolerance) in [
+        (
+            "semi_major",
+            &solution.semi_major,
+            &[
+                0.003_828_149_278_447_270_8,
+                0.003_685_374_929_143_065,
+                0.012_816_252_494_210_874,
+                0.001_022_806_688_243_341_5,
+                0.005_912_024_400_890_821_5,
+            ],
+            5e-10,
+        ),
+        (
+            "semi_minor",
+            &solution.semi_minor,
+            &[
+                -0.002_375_619_626_209_732_3,
+                -0.001_656_115_809_991_561,
+                0.002_894_215_569_918_538,
+                -0.000_312_565_996_540_314_9,
+                0.001_943_209_631_173_886_2,
+            ],
+            5e-10,
+        ),
+        (
+            "inclination",
+            &solution.inclination_degrees,
+            &[
+                28.597_902_984_005_586,
+                75.556_177_227_940_08,
+                31.392_430_614_142_853,
+                90.556_177_227_940_08,
+                38.892_430_614_142_85,
+            ],
+            5e-7,
+        ),
+        (
+            "phase",
+            &solution.phase_degrees,
+            &[
+                62.676_432_014_437_836,
+                205.867_843_234_095_18,
+                134.505_327_740_328_14,
+                200.867_843_234_095_18,
+                97.005_327_740_328_14,
+            ],
+            5e-7,
+        ),
+        (
+            "semi_major_ci",
+            solution
+                .semi_major_ci
+                .as_ref()
+                .expect("robust vector confidence contains major intervals"),
+            &[
+                0.028_758_510_970_297_146,
+                0.027_763_185_276_047_066,
+                0.028_974_415_164_226_296,
+                0.008_446_409_204_575_064,
+                0.013_122_647_163_503_8,
+            ],
+            5e-8,
+        ),
+        (
+            "semi_minor_ci",
+            solution
+                .semi_minor_ci
+                .as_ref()
+                .expect("robust vector confidence contains minor intervals"),
+            &[
+                0.028_816_022_483_273_38,
+                0.027_778_418_078_398_658,
+                0.028_991_770_980_478_237,
+                0.008_446_409_204_575_065,
+                0.013_122_647_163_503_8,
+            ],
+            5e-8,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(
+                &format!("robust_{field}[{index}]"),
+                *actual,
+                *expected,
+                tolerance,
+            );
+        }
+    }
+    for (field, actual, expected) in [
+        (
+            "eastward_mean",
+            solution.eastward_mean,
+            0.164_326_356_109_881_17,
+        ),
+        (
+            "northward_mean",
+            solution.northward_mean,
+            -0.073_035_711_340_204_02,
+        ),
+        (
+            "eastward_slope",
+            solution.eastward_slope_per_day,
+            0.000_855_311_061_192_666_9,
+        ),
+        (
+            "northward_slope",
+            solution.northward_slope_per_day,
+            0.002_041_823_754_524_812_3,
+        ),
+    ] {
+        assert_close(field, actual, expected, 5e-10);
+    }
+    let diagnostics = solution.robust.as_ref().expect("robust diagnostics");
+    assert_eq!(diagnostics.iterations, 2);
+    for (position, expected) in [
+        (0, 0.919_575_027_491_081),
+        (33, 0.088_855_050_987_428_13),
+        (211, 0.124_214_443_740_685_09),
+        (510, 0.052_969_643_620_864_69),
+        (744, 0.913_389_944_585_981_9),
+    ] {
+        assert_close(
+            &format!("robust_weight[{position}]"),
+            diagnostics.weights[position],
+            expected,
+            5e-8,
+        );
+    }
+    for (position, expected) in [
+        (0, 0.010_689_442_245_621_017),
+        (33, 0.009_980_304_875_996_836),
+        (211, 0.013_370_639_401_765_35),
+        (510, 0.013_753_648_872_101_934),
+        (744, 0.011_647_158_724_217_692),
+    ] {
+        assert_close(
+            &format!("robust_leverage[{position}]"),
+            diagnostics.leverage[position],
+            expected,
+            5e-10,
+        );
+    }
+    assert_close(
+        "robust_ols_rms",
+        diagnostics.ols_rms_residual,
+        0.494_881_202_636_785_37,
+        5e-9,
+    );
+    assert_close(
+        "robust_rms",
+        diagnostics.rms_residual,
+        0.495_619_070_132_678_6,
+        5e-9,
+    );
+
+    let reconstruction = model
+        .reconstruct_vector_modified_julian_days(
+            &RECONSTRUCTION_TIMES,
+            &solution,
+            &ReconstructionFilter::All,
+        )
+        .expect("valid robust inferred reconstruction");
+    for (field, actual, expected) in [
+        (
+            "robust_reconstruction_eastward",
+            &reconstruction.eastward,
+            &[
+                0.143_905_869_205_494_8,
+                0.170_038_405_967_186_9,
+                0.170_396_546_423_146_25,
+            ],
+        ),
+        (
+            "robust_reconstruction_northward",
+            &reconstruction.northward,
+            &[
+                -0.103_978_904_725_694_4,
+                -0.076_612_332_306_421_62,
+                -0.041_420_540_958_734_39,
+            ],
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{field}[{index}]"), *actual, *expected, 5e-9);
+        }
+    }
+
+    let colored = model
+        .solve_vector_robust_with_linear_confidence(
+            &eastward,
+            &northward,
+            RobustOptions::default(),
+            LinearConfidence::Colored,
+        )
+        .expect("valid colored robust vector inference solution");
+    for (field, actual, expected) in [
+        (
+            "colored_major_ci",
+            colored
+                .semi_major_ci
+                .as_ref()
+                .expect("colored major intervals"),
+            &[
+                0.025_263_501_186_252_68,
+                0.007_113_991_699_530_108,
+                0.024_961_934_987_802_848,
+                0.005_983_748_698_121_433,
+                0.009_510_324_577_108_95,
+            ],
+        ),
+        (
+            "colored_minor_ci",
+            colored
+                .semi_minor_ci
+                .as_ref()
+                .expect("colored minor intervals"),
+            &[
+                0.013_866_696_366_408_264,
+                0.026_901_392_195_889_05,
+                0.016_102_732_952_262_125,
+                0.005_983_748_698_121_433,
+                0.009_510_324_577_108_95,
+            ],
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{field}[{index}]"), *actual, *expected, 5e-7);
         }
     }
 }

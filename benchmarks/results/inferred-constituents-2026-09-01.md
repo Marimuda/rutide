@@ -149,6 +149,9 @@ fits, complete and missing records, FFT and Lomb colored spectra, and realistic
 parallel batches. No inference-specific optimization is needed before continuing
 functional coverage.
 
-The remaining inference gap is robust coupled-vector fitting. The CLI currently
-rejects that combination explicitly; implementing it with pinned coefficient,
-weight, interval, and iteration-count oracles is the next increment.
+At the benchmarked revision, the remaining inference gap was robust
+coupled-vector fitting and the CLI rejected that combination explicitly. The
+subsequent implementation now solves one coupled complex Cauchy IRLS problem
+with shared timestamp weights and pinned coefficient, interval, weight,
+leverage, iteration-count, and reconstruction oracles. Its performance is not
+included in the measurements above.

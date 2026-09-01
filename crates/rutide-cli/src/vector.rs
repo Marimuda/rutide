@@ -314,20 +314,38 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                     ),
             }
         }
-        VectorAnalysisBatch::Inferred(batch) => match config.confidence_interval {
-            ConfidenceInterval::None => batch.solve_vector_time_major_with_missing(
-                &input.eastward,
-                &input.northward,
-                &input.latitudes,
-            ),
-            ConfidenceInterval::Linear(noise) => batch
-                .solve_vector_time_major_with_missing_and_linear_confidence(
-                    &input.eastward,
-                    &input.northward,
-                    &input.latitudes,
-                    noise,
-                ),
-        },
+        VectorAnalysisBatch::Inferred(batch) => {
+            match (config.analysis_method, config.confidence_interval) {
+                (AnalysisMethod::Ols, ConfidenceInterval::None) => batch
+                    .solve_vector_time_major_with_missing(
+                        &input.eastward,
+                        &input.northward,
+                        &input.latitudes,
+                    ),
+                (AnalysisMethod::Ols, ConfidenceInterval::Linear(noise)) => batch
+                    .solve_vector_time_major_with_missing_and_linear_confidence(
+                        &input.eastward,
+                        &input.northward,
+                        &input.latitudes,
+                        noise,
+                    ),
+                (AnalysisMethod::Robust(options), ConfidenceInterval::None) => batch
+                    .solve_vector_time_major_with_missing_robust(
+                        &input.eastward,
+                        &input.northward,
+                        &input.latitudes,
+                        options,
+                    ),
+                (AnalysisMethod::Robust(options), ConfidenceInterval::Linear(noise)) => batch
+                    .solve_vector_time_major_with_missing_robust_and_linear_confidence(
+                        &input.eastward,
+                        &input.northward,
+                        &input.latitudes,
+                        options,
+                        noise,
+                    ),
+            }
+        }
     })?;
     let solve_seconds = solve_start.elapsed().as_secs_f64();
 
@@ -478,11 +496,6 @@ fn validate_vector_config(config: &VectorAnalyzeConfig) -> Result<(), AppError> 
         workers: config.workers,
         overwrite: config.overwrite,
     })?;
-    if config.inference.is_some() && matches!(config.analysis_method, AnalysisMethod::Robust(_)) {
-        return Err(AppError::Invalid(
-            "robust vector inference is not implemented; use --method ols".to_owned(),
-        ));
-    }
     if config
         .inference
         .as_ref()
@@ -501,9 +514,19 @@ fn vector_profile(
     inferred: bool,
 ) -> &'static str {
     if inferred {
-        return match selection.report.method {
-            "explicit" => "fixed-constituents-greenwich-nodal-vector-inference-ols",
-            "rayleigh" => "rayleigh-auto-greenwich-nodal-vector-inference-ols",
+        return match (selection.report.method, analysis_method) {
+            ("explicit", AnalysisMethod::Ols) => {
+                "fixed-constituents-greenwich-nodal-vector-inference-ols"
+            }
+            ("rayleigh", AnalysisMethod::Ols) => {
+                "rayleigh-auto-greenwich-nodal-vector-inference-ols"
+            }
+            ("explicit", AnalysisMethod::Robust(_)) => {
+                "fixed-constituents-greenwich-nodal-vector-inference-robust"
+            }
+            ("rayleigh", AnalysisMethod::Robust(_)) => {
+                "rayleigh-auto-greenwich-nodal-vector-inference-robust"
+            }
             _ => unreachable!("selection methods are constructed internally"),
         };
     }
@@ -1510,7 +1533,10 @@ mod tests {
                 ],
             }),
             confidence_interval: ConfidenceInterval::Linear(LinearConfidence::Colored),
-            analysis_method: AnalysisMethod::Ols,
+            analysis_method: AnalysisMethod::Robust(RobustOptions {
+                tolerance: 0.01,
+                ..RobustOptions::default()
+            }),
             reconstruction: Some(ReconstructionFilter::All),
             workers: 2,
             overwrite: false,
@@ -1524,6 +1550,11 @@ mod tests {
                 .expect("inference report")
                 .mode,
             "exact"
+        );
+        assert_eq!(inference_report.analysis_method, "robust");
+        assert_eq!(
+            inference_report.profile,
+            "fixed-constituents-greenwich-nodal-vector-inference-robust"
         );
         let inference_output =
             netcdf::open(&inference_output_path).expect("open inferred vector output");
@@ -1549,6 +1580,21 @@ mod tests {
                 .expect("inferred semi-major")
                 .len(),
             8
+        );
+        assert_eq!(
+            inference_output
+                .variable("robust_weight_row_size")
+                .expect("inferred robust row sizes")
+                .get_values::<i64, _>(..)
+                .expect("read inferred robust row sizes"),
+            [48, 48]
+        );
+        assert_eq!(
+            inference_output
+                .variable("robust_weight")
+                .expect("inferred robust weights")
+                .len(),
+            96
         );
         drop(inference_output);
         fs::remove_file(input_path).expect("remove vector fixture");

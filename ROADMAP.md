@@ -104,7 +104,7 @@ records all iteration counts in
 on the 100-series worker matrix and 13.39–17.66x faster on 1,000 series at 16/32
 workers.
 
-## 3. Inferred constituents — in progress
+## 3. Inferred constituents — complete
 
 - Support inferred/reference names, amplitude ratios, phase offsets, and exact and
   approximate inference modes.
@@ -130,16 +130,22 @@ The scalar and vector FVCOM commands now accept repeatable relationships and an
 exact/approximate switch; JSON reports and versioned NetCDF schemas retain every
 ratio, phase offset, convention, and mode, while the canonical digest includes
 the complete inference configuration. End-to-end vector coverage combines
-inference with joint missing-value masks, Lomb–Scargle colored confidence, and
-reconstruction. Robust vector inference remains before this item can be marked
-complete and is rejected explicitly at both configuration and CLI boundaries.
+inference with joint missing-value masks, Lomb–Scargle colored confidence,
+reconstruction, and Cauchy robust fitting. The robust vector path solves one
+coupled complex IRLS problem, preserves one shared weight per timestamp, and
+propagates UTide-compatible weighted covariance and colored residuals into
+linear intervals. Pinned-oracle coverage freezes ellipse coefficients, white
+and colored intervals, leverage, weights, iteration count, residual diagnostics,
+and reconstruction; the CLI writes the same ragged diagnostics for complete or
+gappy batches.
 
 The comparative measurements are now retained in
 `benchmarks/results/inferred-constituents-2026-09-01.md`. Across controlled
 100-series exact-inference runs, RUTide is 48.97–228.45x faster than pinned
 Python; retained 1,000-series comparisons are 71.93–140.44x faster. Approximate
-mode is 69.30–86.55x faster at 16 workers. Robust coupled-vector inference is now
-the only implementation gap in this item.
+mode is 69.30–86.55x faster at 16 workers. These measurements predate the robust
+coupled-vector implementation; robust inference performance has not yet been
+benchmarked separately.
 
 ## 4. Monte Carlo confidence intervals — planned
 

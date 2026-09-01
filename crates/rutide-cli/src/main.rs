@@ -356,9 +356,6 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                 mode: inference_mode,
                 relationships: vector_inference_relationships,
             });
-        if inference.is_some() && matches!(analysis_method, AnalysisMethod::Robust(_)) {
-            return Err("robust vector inference is not implemented; use --method ols".to_owned());
-        }
         Ok(Command::AnalyzeVector(VectorAnalyzeConfig {
             input,
             output,
@@ -858,6 +855,8 @@ mod tests {
             "output.nc",
             "--infer",
             "O1:K1:0.5:45:0.4:30",
+            "--method",
+            "robust",
         ]))
         .expect("valid vector inference");
         let Command::AnalyzeVector(config) = vector else {
@@ -877,12 +876,12 @@ mod tests {
                 )],
             })
         );
+        assert!(matches!(config.analysis_method, AnalysisMethod::Robust(_)));
 
         for invalid in [
             &["--infer-approximate"][..],
             &["--infer", "S2:M2:-0.1:20"][..],
             &["--infer", "S2:M2:0.3"][..],
-            &["--infer", "S2:M2:0.3:20:0.2:10", "--method", "robust"][..],
         ] {
             let mut values = vec![
                 "analyze-vector",

@@ -1,7 +1,7 @@
 //! Iteratively reweighted least squares for outlier-resistant harmonic fits.
 
 use faer::{
-    Mat,
+    Mat, c64,
     linalg::solvers::{DenseSolveCore, SolveLstsq},
 };
 
@@ -80,10 +80,24 @@ pub(crate) struct RobustFit {
     pub(crate) diagnostics: RobustDiagnostics,
 }
 
+pub(crate) struct ComplexRobustFit {
+    pub(crate) coefficients: Mat<c64>,
+    pub(crate) diagnostics: RobustDiagnostics,
+}
+
 struct Iteration {
     coefficients: Mat<f64>,
     weights: Vec<f64>,
     residuals: Vec<[f64; 2]>,
+    residual_sum_squares: f64,
+    weighted_mean_square: f64,
+    weight_scale: Option<f64>,
+}
+
+struct ComplexIteration {
+    coefficients: Mat<c64>,
+    weights: Vec<f64>,
+    residuals: Vec<c64>,
     residual_sum_squares: f64,
     weighted_mean_square: f64,
     weight_scale: Option<f64>,
@@ -187,6 +201,105 @@ pub(crate) fn fit_with_initial(
     })
 }
 
+pub(crate) fn fit_complex_with_initial(
+    design: &Mat<c64>,
+    observations: &Mat<c64>,
+    initial_coefficients: Mat<c64>,
+    options: RobustOptions,
+) -> Result<ComplexRobustFit, AnalysisError> {
+    options.validate()?;
+    debug_assert_eq!(design.nrows(), observations.nrows());
+    debug_assert_eq!(observations.ncols(), 1);
+    debug_assert_eq!(initial_coefficients.nrows(), design.ncols());
+    debug_assert_eq!(initial_coefficients.ncols(), 1);
+
+    let leverage = complex_leverage(design)?;
+    let residual_factor = leverage
+        .iter()
+        .map(|value| 1.0 / (options.tuning_constant * (1.0 - value).sqrt()))
+        .collect::<Vec<_>>();
+    let mut weights = vec![1.0; design.nrows()];
+    let mut weight_scale = None;
+    let mut previous: Option<ComplexIteration> = None;
+    let mut ols_rms_residual = 0.0;
+
+    let mut initial_coefficients = Some(initial_coefficients);
+    for iteration_index in 0..options.max_iterations {
+        let current = if let Some(coefficients) = initial_coefficients.take() {
+            complex_iteration_from_coefficients(
+                design,
+                observations,
+                coefficients,
+                weights,
+                weight_scale,
+            )
+        } else {
+            solve_complex_iteration(design, observations, weights, weight_scale)
+        };
+        if iteration_index == 0 {
+            ols_rms_residual = (current.residual_sum_squares / usize_to_f64(design.nrows())).sqrt();
+        }
+
+        if let Some(previous_iteration) = previous.take() {
+            let improvement = (previous_iteration.weighted_mean_square
+                - current.weighted_mean_square)
+                / previous_iteration.weighted_mean_square;
+            if improvement < 0.0 {
+                return Ok(completed_complex_fit(
+                    previous_iteration,
+                    leverage,
+                    iteration_index,
+                    RobustTermination::ObjectiveIncrease,
+                    ols_rms_residual,
+                ));
+            }
+            if improvement < options.tolerance {
+                return Ok(completed_complex_fit(
+                    current,
+                    leverage,
+                    iteration_index + 1,
+                    RobustTermination::Tolerance,
+                    ols_rms_residual,
+                ));
+            }
+        }
+
+        let residual_pairs = current
+            .residuals
+            .iter()
+            .map(|residual| [residual.re, residual.im])
+            .collect::<Vec<_>>();
+        let scale = residual_scale(&residual_pairs, 2);
+        if scale == 0.0 {
+            if complex_is_numerically_exact(&current.residuals, observations) {
+                return Ok(completed_complex_fit(
+                    current,
+                    leverage,
+                    iteration_index + 1,
+                    RobustTermination::ExactFit,
+                    ols_rms_residual,
+                ));
+            }
+            return Err(AnalysisError::DegenerateRobustScale);
+        }
+        weights = current
+            .residuals
+            .iter()
+            .zip(&residual_factor)
+            .map(|(residual, factor)| {
+                let normalized = factor * residual.re.hypot(residual.im) / scale;
+                1.0 / normalized.mul_add(normalized, 1.0)
+            })
+            .collect();
+        weight_scale = Some(scale);
+        previous = Some(current);
+    }
+
+    Err(AnalysisError::RobustDidNotConverge {
+        iterations: options.max_iterations,
+    })
+}
+
 fn solve_iteration(
     design: &Mat<f64>,
     observations: &Mat<f64>,
@@ -204,6 +317,24 @@ fn solve_iteration(
         .col_piv_qr()
         .solve_lstsq(weighted_observations.as_ref());
     iteration_from_coefficients(design, observations, coefficients, weights, weight_scale)
+}
+
+fn solve_complex_iteration(
+    design: &Mat<c64>,
+    observations: &Mat<c64>,
+    weights: Vec<f64>,
+    weight_scale: Option<f64>,
+) -> ComplexIteration {
+    let weighted_design = Mat::from_fn(design.nrows(), design.ncols(), |row, column| {
+        weights[row] * design[(row, column)]
+    });
+    let weighted_observations = Mat::from_fn(observations.nrows(), 1, |row, _| {
+        weights[row] * observations[(row, 0)]
+    });
+    let coefficients = weighted_design
+        .col_piv_qr()
+        .solve_lstsq(weighted_observations.as_ref());
+    complex_iteration_from_coefficients(design, observations, coefficients, weights, weight_scale)
 }
 
 fn iteration_from_coefficients(
@@ -234,6 +365,34 @@ fn iteration_from_coefficients(
     }
 }
 
+fn complex_iteration_from_coefficients(
+    design: &Mat<c64>,
+    observations: &Mat<c64>,
+    coefficients: Mat<c64>,
+    weights: Vec<f64>,
+    weight_scale: Option<f64>,
+) -> ComplexIteration {
+    let residuals = complex_residuals(design, observations, &coefficients);
+    let residual_sum_squares = residuals
+        .iter()
+        .zip(&weights)
+        .map(|(residual, weight)| {
+            let real = weight * residual.re;
+            let imaginary = weight * residual.im;
+            real.mul_add(real, imaginary * imaginary)
+        })
+        .sum::<f64>();
+    let weighted_mean_square = residual_sum_squares / weights.iter().sum::<f64>();
+    ComplexIteration {
+        coefficients,
+        weights,
+        residuals,
+        residual_sum_squares,
+        weighted_mean_square,
+        weight_scale,
+    }
+}
+
 fn completed_fit(
     iteration: Iteration,
     leverage: Vec<f64>,
@@ -249,6 +408,34 @@ fn completed_fit(
         / usize_to_f64(iteration.residuals.len()))
     .sqrt();
     RobustFit {
+        coefficients: iteration.coefficients,
+        diagnostics: RobustDiagnostics {
+            weights: iteration.weights,
+            leverage,
+            iterations,
+            termination,
+            residual_scale: iteration.weight_scale.unwrap_or(0.0),
+            ols_rms_residual,
+            rms_residual,
+        },
+    }
+}
+
+fn completed_complex_fit(
+    iteration: ComplexIteration,
+    leverage: Vec<f64>,
+    iterations: usize,
+    termination: RobustTermination,
+    ols_rms_residual: f64,
+) -> ComplexRobustFit {
+    let rms_residual = (iteration
+        .residuals
+        .iter()
+        .map(|residual| residual.re.mul_add(residual.re, residual.im * residual.im))
+        .sum::<f64>()
+        / usize_to_f64(iteration.residuals.len()))
+    .sqrt();
+    ComplexRobustFit {
         coefficients: iteration.coefficients,
         diagnostics: RobustDiagnostics {
             weights: iteration.weights,
@@ -289,6 +476,33 @@ fn leverage(design: &Mat<f64>) -> Result<Vec<f64>, AnalysisError> {
         .collect()
 }
 
+fn complex_leverage(design: &Mat<c64>) -> Result<Vec<f64>, AnalysisError> {
+    let normal = Mat::from_fn(design.ncols(), design.ncols(), |row, column| {
+        (0..design.nrows())
+            .map(|time| design[(time, row)].conj() * design[(time, column)])
+            .sum::<c64>()
+    });
+    let covariance = normal.partial_piv_lu().inverse();
+    (0..design.nrows())
+        .map(|time| {
+            let value = (0..design.ncols())
+                .map(|row| {
+                    let projected = (0..design.ncols())
+                        .map(|column| covariance[(row, column)] * design[(time, column)].conj())
+                        .sum::<c64>();
+                    design[(time, row)] * projected
+                })
+                .sum::<c64>();
+            let absolute = value.re.hypot(value.im);
+            if absolute.is_finite() && absolute < 1.0 {
+                Ok(absolute)
+            } else {
+                Err(AnalysisError::InvalidRobustLeverage { time })
+            }
+        })
+        .collect()
+}
+
 fn residuals(design: &Mat<f64>, observations: &Mat<f64>, coefficients: &Mat<f64>) -> Vec<[f64; 2]> {
     (0..design.nrows())
         .map(|time| {
@@ -305,6 +519,21 @@ fn residuals(design: &Mat<f64>, observations: &Mat<f64>, coefficients: &Mat<f64>
                     0.0
                 },
             ]
+        })
+        .collect()
+}
+
+fn complex_residuals(
+    design: &Mat<c64>,
+    observations: &Mat<c64>,
+    coefficients: &Mat<c64>,
+) -> Vec<c64> {
+    (0..design.nrows())
+        .map(|time| {
+            let fitted = (0..design.ncols())
+                .map(|column| design[(time, column)] * coefficients[(column, 0)])
+                .sum::<c64>();
+            observations[(time, 0)] - fitted
         })
         .collect()
 }
@@ -364,6 +593,18 @@ fn is_numerically_exact(residuals: &[[f64; 2]], observations: &Mat<f64>) -> bool
     residuals
         .iter()
         .all(|residual| residual[0].hypot(residual[1]) <= tolerance)
+}
+
+fn complex_is_numerically_exact(residuals: &[c64], observations: &Mat<c64>) -> bool {
+    let observation_scale = observations
+        .col_iter()
+        .flat_map(|column| column.iter().copied())
+        .map(|value| value.re.hypot(value.im))
+        .fold(1.0, f64::max);
+    let tolerance = 64.0 * f64::EPSILON * observation_scale * usize_to_f64(observations.nrows());
+    residuals
+        .iter()
+        .all(|residual| residual.re.hypot(residual.im) <= tolerance)
 }
 
 #[allow(

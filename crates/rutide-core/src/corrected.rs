@@ -13,10 +13,11 @@ use faer::{
 use rayon::prelude::*;
 
 use crate::{
-    AnalysisError, Constituent, FixedRawOls, LinearConfidence, RobustOptions, ScalarSolution,
-    TidalConstituent, VectorReconstruction, VectorSolution,
+    AnalysisError, Constituent, FixedRawOls, LinearConfidence, RobustDiagnostics, RobustOptions,
+    ScalarSolution, TidalConstituent, VectorReconstruction, VectorSolution,
     astronomy::at_modified_julian_day,
     catalog::{CONSTITUENT_COUNT, Metadata},
+    robust::fit_complex_with_initial as robust_complex_fit_with_initial,
     scalar::{ConfidenceSampling, equidistant_sample_interval_hours, validate_time},
     vector::{from_component_solutions, linearized_ellipse_sigmas},
 };
@@ -1001,7 +1002,7 @@ impl VectorInferenceOls {
         eastward: &[f64],
         northward: &[f64],
     ) -> Result<VectorSolution, AnalysisError> {
-        self.solve_vector_impl(eastward, northward, None)
+        self.solve_vector_impl(eastward, northward, None, None)
     }
 
     /// Fit one current series with linear ellipse confidence intervals and SNR.
@@ -1015,7 +1016,36 @@ impl VectorInferenceOls {
         northward: &[f64],
         noise: LinearConfidence,
     ) -> Result<VectorSolution, AnalysisError> {
-        self.solve_vector_impl(eastward, northward, Some(noise))
+        self.solve_vector_impl(eastward, northward, Some(noise), None)
+    }
+
+    /// Robustly fit one inferred current series with shared Cauchy weights.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or robust fitting failure.
+    pub fn solve_vector_robust(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        options: RobustOptions,
+    ) -> Result<VectorSolution, AnalysisError> {
+        self.solve_vector_impl(eastward, northward, None, Some(options))
+    }
+
+    /// Robustly fit inferred currents with linear ellipse intervals and SNR.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or robust fitting failure.
+    pub fn solve_vector_robust_with_linear_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        options: RobustOptions,
+        noise: LinearConfidence,
+    ) -> Result<VectorSolution, AnalysisError> {
+        self.solve_vector_impl(eastward, northward, Some(noise), Some(options))
     }
 
     /// Reconstruct one inferred vector solution with exact astronomical terms.
@@ -1044,6 +1074,7 @@ impl VectorInferenceOls {
         eastward: &[f64],
         northward: &[f64],
         confidence: Option<LinearConfidence>,
+        robust: Option<RobustOptions>,
     ) -> Result<VectorSolution, AnalysisError> {
         if eastward.len() != northward.len() {
             return Err(AnalysisError::ObservationShape {
@@ -1074,7 +1105,27 @@ impl VectorInferenceOls {
             c64::new(eastward[time], northward[time])
         });
         let coefficients = self.decomposition.solve_lstsq(observations.as_ref());
-        self.solution_from_coefficients(observations.as_ref(), coefficients.as_ref(), confidence)
+        if let Some(options) = robust {
+            let fit = robust_complex_fit_with_initial(
+                &self.design,
+                &observations,
+                coefficients,
+                options,
+            )?;
+            self.solution_from_coefficients(
+                observations.as_ref(),
+                fit.coefficients.as_ref(),
+                confidence,
+                Some(fit.diagnostics),
+            )
+        } else {
+            self.solution_from_coefficients(
+                observations.as_ref(),
+                coefficients.as_ref(),
+                confidence,
+                None,
+            )
+        }
     }
 
     #[allow(
@@ -1086,6 +1137,7 @@ impl VectorInferenceOls {
         observations: faer::MatRef<'_, c64>,
         coefficients: faer::MatRef<'_, c64>,
         confidence: Option<LinearConfidence>,
+        robust: Option<RobustDiagnostics>,
     ) -> Result<VectorSolution, AnalysisError> {
         let fit_count = self.output_mappings[..]
             .iter()
@@ -1150,8 +1202,16 @@ impl VectorInferenceOls {
             .map(|(positive, negative)| (*positive - *negative).re)
             .collect::<Vec<_>>();
 
-        let intervals = confidence
-            .map(|noise| self.vector_inference_intervals(observations, coefficients, noise));
+        let intervals = confidence.map(|noise| {
+            self.vector_inference_intervals(
+                observations,
+                coefficients,
+                noise,
+                robust
+                    .as_ref()
+                    .map(|diagnostics| diagnostics.weights.as_slice()),
+            )
+        });
         let trailing = self.design.ncols() - 2;
         let mean = coefficients[(trailing, 0)];
         let slope = coefficients[(trailing + 1, 0)];
@@ -1232,6 +1292,7 @@ impl VectorInferenceOls {
                     .collect(),
             );
         }
+        solution.robust = robust;
         Ok(solution)
     }
 
@@ -1245,6 +1306,7 @@ impl VectorInferenceOls {
         observations: faer::MatRef<'_, c64>,
         coefficients: faer::MatRef<'_, c64>,
         noise: LinearConfidence,
+        weights: Option<&[f64]>,
     ) -> VectorInferenceIntervals {
         let fitted = Mat::from_fn(self.time_count, 1, |time, _| {
             (0..self.design.ncols())
@@ -1254,28 +1316,40 @@ impl VectorInferenceOls {
         let degrees_of_freedom = usize_to_f64(self.time_count - self.design.ncols());
         let covariance_misfit = (0..self.time_count)
             .map(|time| {
-                observations[(time, 0)].conj() * observations[(time, 0)]
-                    - fitted[(time, 0)].conj() * observations[(time, 0)]
+                let weighted_observation =
+                    weights.map_or(1.0, |weights| weights[time]) * observations[(time, 0)];
+                observations[(time, 0)].conj() * weighted_observation
+                    - fitted[(time, 0)].conj() * weighted_observation
             })
             .sum::<c64>()
             .re
             / degrees_of_freedom;
         let pseudo_misfit = (0..self.time_count)
             .map(|time| {
-                observations[(time, 0)] * observations[(time, 0)]
-                    - fitted[(time, 0)] * observations[(time, 0)]
+                let weighted_observation =
+                    weights.map_or(1.0, |weights| weights[time]) * observations[(time, 0)];
+                observations[(time, 0)] * weighted_observation
+                    - fitted[(time, 0)] * weighted_observation
             })
             .sum::<c64>()
             / degrees_of_freedom;
         let column_count = self.design.ncols();
         let covariance_normal = Mat::from_fn(column_count, column_count, |row, column| {
             (0..self.time_count)
-                .map(|time| self.design[(time, row)].conj() * self.design[(time, column)])
+                .map(|time| {
+                    self.design[(time, row)].conj()
+                        * weights.map_or(1.0, |weights| weights[time])
+                        * self.design[(time, column)]
+                })
                 .sum::<c64>()
         });
         let pseudo_normal = Mat::from_fn(column_count, column_count, |row, column| {
             (0..self.time_count)
-                .map(|time| self.design[(time, row)] * self.design[(time, column)])
+                .map(|time| {
+                    self.design[(time, row)]
+                        * weights.map_or(1.0, |weights| weights[time])
+                        * self.design[(time, column)]
+                })
                 .sum::<c64>()
         });
         let covariance_inverse = covariance_normal.partial_piv_lu().inverse();
@@ -1305,7 +1379,10 @@ impl VectorInferenceOls {
         }
         if noise == LinearConfidence::Colored {
             let northward_residual = (0..self.time_count)
-                .map(|time| observations[(time, 0)].im - fitted[(time, 0)].im)
+                .map(|time| {
+                    weights.map_or(1.0, |weights| weights[time])
+                        * (observations[(time, 0)].im - fitted[(time, 0)].im)
+                })
                 .collect::<Vec<_>>();
             let power = self
                 .confidence_sampling
@@ -2078,7 +2155,7 @@ impl VectorInferenceBatch {
         northward: &[f64],
         latitudes: &[f64],
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
-        self.solve_vector_time_major_impl(eastward, northward, latitudes, None, false)
+        self.solve_vector_time_major_impl(eastward, northward, latitudes, None, None, false)
     }
 
     /// Fit complete current series with linear ellipse confidence intervals.
@@ -2093,7 +2170,52 @@ impl VectorInferenceBatch {
         latitudes: &[f64],
         noise: LinearConfidence,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
-        self.solve_vector_time_major_impl(eastward, northward, latitudes, Some(noise), false)
+        self.solve_vector_time_major_impl(eastward, northward, latitudes, Some(noise), None, false)
+    }
+
+    /// Robustly fit complete inferred current series.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or robust fitting failure.
+    pub fn solve_vector_time_major_robust(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        options: RobustOptions,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_impl(
+            eastward,
+            northward,
+            latitudes,
+            None,
+            Some(options),
+            false,
+        )
+    }
+
+    /// Robustly fit complete inferred currents with linear ellipse intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or robust fitting failure.
+    pub fn solve_vector_time_major_robust_with_linear_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        options: RobustOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_impl(
+            eastward,
+            northward,
+            latitudes,
+            Some(noise),
+            Some(options),
+            false,
+        )
     }
 
     /// Fit currents while omitting a time from both components when either is
@@ -2109,7 +2231,7 @@ impl VectorInferenceBatch {
         northward: &[f64],
         latitudes: &[f64],
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
-        self.solve_vector_time_major_impl(eastward, northward, latitudes, None, true)
+        self.solve_vector_time_major_impl(eastward, northward, latitudes, None, None, true)
     }
 
     /// Fit gappy currents with linear ellipse confidence intervals.
@@ -2124,7 +2246,45 @@ impl VectorInferenceBatch {
         latitudes: &[f64],
         noise: LinearConfidence,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
-        self.solve_vector_time_major_impl(eastward, northward, latitudes, Some(noise), true)
+        self.solve_vector_time_major_impl(eastward, northward, latitudes, Some(noise), None, true)
+    }
+
+    /// Robustly fit inferred currents while jointly omitting `NaN` samples.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or robust fitting failure.
+    pub fn solve_vector_time_major_with_missing_robust(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        options: RobustOptions,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_impl(eastward, northward, latitudes, None, Some(options), true)
+    }
+
+    /// Robustly fit gappy inferred currents with linear ellipse intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or robust fitting failure.
+    pub fn solve_vector_time_major_with_missing_robust_and_linear_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        options: RobustOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_impl(
+            eastward,
+            northward,
+            latitudes,
+            Some(noise),
+            Some(options),
+            true,
+        )
     }
 
     fn solve_vector_time_major_impl(
@@ -2133,6 +2293,7 @@ impl VectorInferenceBatch {
         northward: &[f64],
         latitudes: &[f64],
         confidence: Option<LinearConfidence>,
+        robust: Option<RobustOptions>,
         allow_missing: bool,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
         validate_batch_shape_and_latitudes(self.time_count(), eastward, latitudes)?;
@@ -2211,13 +2372,23 @@ impl VectorInferenceBatch {
                     .copied()
                     .map(|time| northward[time * series_count + series])
                     .collect::<Vec<_>>();
-                match confidence {
-                    Some(noise) => model.solve_vector_with_linear_confidence(
+                match (robust, confidence) {
+                    (Some(options), Some(noise)) => model
+                        .solve_vector_robust_with_linear_confidence(
+                            &eastward_values,
+                            &northward_values,
+                            options,
+                            noise,
+                        ),
+                    (Some(options), None) => {
+                        model.solve_vector_robust(&eastward_values, &northward_values, options)
+                    }
+                    (None, Some(noise)) => model.solve_vector_with_linear_confidence(
                         &eastward_values,
                         &northward_values,
                         noise,
                     ),
-                    None => model.solve_vector(&eastward_values, &northward_values),
+                    (None, None) => model.solve_vector(&eastward_values, &northward_values),
                 }
             })
             .collect()
