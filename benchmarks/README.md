@@ -75,9 +75,10 @@ uv run --project benchmarks/python --locked \
   --field scalar --series-count 100
 ```
 
-Record the worker count explicitly when using the Rust probe. The Python probe is
-canonical single-process UTide with BLAS limited to one thread; it measures the
-existing one-series API that domain users call in a loop.
+Record the worker count explicitly for both probes. With `--workers 1`, the
+Python probe is canonical single-process UTide with BLAS limited to one thread.
+Larger worker counts retain a Linux `fork` pool and still call the existing
+one-series API once per series, matching the Rust batch worker-count comparison.
 
 The `fixed-raw` solver profile is the first Rust parity target. It fits M2, S2,
 N2, K1, and O1 with ordinary least squares, a mean and trend, raw phase, no nodal

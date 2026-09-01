@@ -61,10 +61,19 @@ comparison of all four ellipse confidence intervals plus SNR.
 - The dedicated scalar/vector probes benchmark representative irregular records
   separately from the regular FVCOM whole-field profile; Lomb–Scargle remains an
   `O(samples * frequencies)` path.
+- Reusable records now cache the timestamp-only Hann window, frequency grid,
+  phase-shifted trigonometric bases, and basis energies. Batch plans require at
+  least 16 series with the same valid-time mask and are constructed in parallel.
+- Cache growth is bounded: at most four mask groups per batch, at most 16 MiB of
+  trigonometric bases per plan, and a direct low-memory fallback for unique,
+  lightly reused, or longer records.
 - The retained measurements and environment are recorded in
   `benchmarks/results/irregular-confidence-2026-09-01.md`.
-- Cache frequency grids, windows, or phase-shifted trigonometric work by valid-time
-  mask only when a real workload justifies the additional per-mask memory.
+- On the 100-series comparison the planned kernel is 20.05–70.06x faster than
+  pinned Python UTide and 5.54–10.82x faster than the original direct Rust
+  kernel. At 1,000 series, 16/32-worker speedups over Python are 31.61–61.64x.
+- Batched matrix projection remains a possible optimization for larger shared-mask
+  workloads, but is no longer a viability blocker.
 
 ### 1d. Sampling diagnostics — planned
 
