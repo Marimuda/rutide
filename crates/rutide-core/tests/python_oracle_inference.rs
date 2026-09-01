@@ -2,7 +2,7 @@
 
 use rutide_core::{
     AnalysisError, InferenceMode, LinearConfidence, ReconstructionFilter, ScalarInferenceOls,
-    ScalarInferenceRelation, TidalConstituent,
+    ScalarInferenceRelation, TidalConstituent, VectorInferenceOls, VectorInferenceRelation,
 };
 
 const LATITUDE: f64 = 60.957_717_895_507_81;
@@ -11,6 +11,24 @@ const RELATIONSHIPS: [ScalarInferenceRelation; 2] = [
     ScalarInferenceRelation::new(TidalConstituent::O1, TidalConstituent::K1, 0.5, 45.0),
 ];
 const RECONSTRUCTION_TIMES: [f64; 3] = [58_113.0, 58_120.25, 58_144.5];
+const VECTOR_RELATIONSHIPS: [VectorInferenceRelation; 2] = [
+    VectorInferenceRelation::new(
+        TidalConstituent::S2,
+        TidalConstituent::M2,
+        0.35,
+        20.0,
+        0.25,
+        -10.0,
+    ),
+    VectorInferenceRelation::new(
+        TidalConstituent::O1,
+        TidalConstituent::K1,
+        0.5,
+        45.0,
+        0.4,
+        30.0,
+    ),
+];
 
 struct Expected {
     amplitude: [f64; 5],
@@ -235,8 +253,7 @@ const RESOLVED_APPROXIMATE: Expected = Expected {
 fn oracle_times(count: usize) -> Vec<f64> {
     (0..count)
         .map(|index| {
-            58_113.0
-                + f64::from(u32::try_from(index).expect("oracle index fits u32")) / 24.0
+            58_113.0 + f64::from(u32::try_from(index).expect("oracle index fits u32")) / 24.0
         })
         .collect()
 }
@@ -262,6 +279,27 @@ fn oracle_observations(count: usize) -> Vec<f64> {
             ))
         })
         .collect()
+}
+
+fn synthetic_vector_observations(time: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let reference = time[0].midpoint(time[time.len() - 1]);
+    let mut eastward = Vec::with_capacity(time.len());
+    let mut northward = Vec::with_capacity(time.len());
+    for (index, time) in time.iter().copied().enumerate() {
+        let index = f64::from(u32::try_from(index).expect("fixture index fits u32"));
+        eastward.push(
+            0.15 + 0.0008 * (time - reference)
+                + 0.42 * (index / 11.0).sin()
+                + 0.17 * (index / 37.0).cos()
+                + 0.05 * (index / 3.7).sin(),
+        );
+        northward.push(
+            -0.08 - 0.0003 * (time - reference) + 0.31 * (index / 13.0).cos()
+                - 0.12 * (index / 29.0).sin()
+                + 0.04 * (index / 4.1).cos(),
+        );
+    }
+    (eastward, northward)
 }
 
 fn assert_close(label: &str, actual: f64, expected: f64, tolerance: f64) {
@@ -416,6 +454,26 @@ fn rejects_invalid_scalar_inference_graphs_and_values() {
         .expect_err("inference chains must be rejected"),
         AnalysisError::InferenceReferenceIsInferred { name: "S2" }
     );
+
+    let invalid_vector = VectorInferenceRelation::new(
+        TidalConstituent::S2,
+        TidalConstituent::M2,
+        0.5,
+        0.0,
+        -0.5,
+        0.0,
+    );
+    assert_eq!(
+        VectorInferenceOls::prepare_modified_julian_days(
+            &time,
+            LATITUDE,
+            &requested(),
+            &[invalid_vector],
+            InferenceMode::Exact,
+        )
+        .expect_err("negative vector rotary ratios must be rejected"),
+        AnalysisError::InvalidInferenceAmplitudeRatio { index: 0 }
+    );
 }
 
 #[test]
@@ -478,6 +536,399 @@ fn matches_resolved_exact_colored_confidence_oracle() {
                 299.848_091_478_189_36,
             ],
             5e-5,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{field}[{index}]"), *actual, *expected, tolerance);
+        }
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps every vector coefficient, interval, and reconstruction oracle in one fixture"
+)]
+fn matches_resolved_exact_vector_inference_oracle() {
+    let time = oracle_times(745);
+    let (eastward, northward) = synthetic_vector_observations(&time);
+    let model = VectorInferenceOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE,
+        &requested(),
+        &VECTOR_RELATIONSHIPS,
+        InferenceMode::Exact,
+    )
+    .expect("valid exact vector inference model");
+    let solution = model
+        .solve_vector_with_linear_confidence(&eastward, &northward, LinearConfidence::White)
+        .expect("valid exact vector inference solution");
+    for (field, actual, expected, tolerance) in [
+        (
+            "semi_major",
+            &solution.semi_major,
+            &[
+                0.001_407_920_440_945_174_7,
+                0.002_090_612_554_378_58,
+                0.011_508_568_119_819_637,
+                0.000_644_069_690_393_918_9,
+                0.005_179_687_361_785_794,
+            ],
+            5e-11,
+        ),
+        (
+            "semi_minor",
+            &solution.semi_minor,
+            &[
+                0.000_185_983_948_857_171_68,
+                0.000_337_718_481_606_899_1,
+                0.000_016_634_157_339_116_308,
+                0.000_205_846_172_200_998_7,
+                0.000_582_913_776_793_584_3,
+            ],
+            5e-11,
+        ),
+        (
+            "inclination",
+            &solution.inclination_degrees,
+            &[
+                24.369_186_727_347_31,
+                27.974_372_636_132_912,
+                60.495_721_494_951_65,
+                42.974_372_636_132_905,
+                67.995_721_494_951_67,
+            ],
+            5e-8,
+        ),
+        (
+            "phase",
+            &solution.phase_degrees,
+            &[
+                44.312_896_465_342_05,
+                245.624_603_252_718_5,
+                201.204_818_439_787_86,
+                240.624_603_252_718_46,
+                163.704_818_439_787_86,
+            ],
+            5e-8,
+        ),
+        (
+            "semi_major_ci",
+            solution
+                .semi_major_ci
+                .as_ref()
+                .expect("vector confidence contains major intervals"),
+            &[
+                0.028_690_987_341_039_025,
+                0.027_691_479_783_168_37,
+                0.028_913_193_825_560_728,
+                0.008_422_402_294_410_412,
+                0.013_081_812_736_393_179,
+            ],
+            5e-9,
+        ),
+        (
+            "semi_minor_ci",
+            solution
+                .semi_minor_ci
+                .as_ref()
+                .expect("vector confidence contains minor intervals"),
+            &[
+                0.028_693_601_478_011_75,
+                0.027_693_727_887_231_134,
+                0.028_875_614_459_945_56,
+                0.008_422_402_294_410_412,
+                0.013_081_812_736_393_177,
+            ],
+            5e-9,
+        ),
+        (
+            "percent_energy",
+            &solution.percent_energy,
+            &[
+                1.210_763_122_342_355_8,
+                2.692_307_775_054_401,
+                79.512_129_532_811_61,
+                0.274_469_825_634_424_57,
+                16.310_329_744_157_2,
+            ],
+            5e-8,
+        ),
+        (
+            "signal_to_noise",
+            solution
+                .signal_to_noise
+                .as_ref()
+                .expect("vector confidence contains SNR"),
+            &[
+                0.004_705_663_648_382_104,
+                0.011_232_834_847_357_293,
+                0.304_717_902_460_835_1,
+                0.012_379_836_181_647_973,
+                0.304_943_330_895_505_85,
+            ],
+            5e-8,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{field}[{index}]"), *actual, *expected, tolerance);
+        }
+    }
+    assert_close(
+        "eastward_mean",
+        solution.eastward_mean,
+        0.163_559_915_423_324_51,
+        5e-11,
+    );
+    assert_close(
+        "northward_mean",
+        solution.northward_mean,
+        -0.076_932_476_537_805_51,
+        5e-11,
+    );
+    assert_close(
+        "eastward_slope",
+        solution.eastward_slope_per_day,
+        0.000_733_633_115_831_299_4,
+        5e-11,
+    );
+    assert_close(
+        "northward_slope",
+        solution.northward_slope_per_day,
+        0.001_951_992_501_818_680_2,
+        5e-11,
+    );
+    let reconstruction = model
+        .reconstruct_vector_modified_julian_days(
+            &RECONSTRUCTION_TIMES,
+            &solution,
+            &ReconstructionFilter::All,
+        )
+        .expect("valid inferred vector reconstruction");
+    for (field, actual, expected) in [
+        (
+            "reconstruction_eastward",
+            &reconstruction.eastward,
+            &[
+                0.150_056_288_504_953_73,
+                0.158_924_765_047_456_06,
+                0.176_940_550_404_792_62,
+            ],
+        ),
+        (
+            "reconstruction_northward",
+            &reconstruction.northward,
+            &[
+                -0.111_460_613_566_090_16,
+                -0.094_613_429_164_934_2,
+                -0.039_702_780_371_134_117,
+            ],
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{field}[{index}]"), *actual, *expected, 5e-10);
+        }
+    }
+}
+
+fn check_vector_ellipse(
+    count: usize,
+    mode: InferenceMode,
+    expected_major: &[f64; 5],
+    expected_minor: &[f64; 5],
+    expected_inclination: &[f64; 5],
+    expected_phase: &[f64; 5],
+) {
+    let time = oracle_times(count);
+    let (eastward, northward) = synthetic_vector_observations(&time);
+    let model = VectorInferenceOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE,
+        &requested(),
+        &VECTOR_RELATIONSHIPS,
+        mode,
+    )
+    .expect("valid vector inference model");
+    let solution = model
+        .solve_vector(&eastward, &northward)
+        .expect("valid vector inference observations");
+    for (field, actual, expected, tolerance) in [
+        ("semi_major", &solution.semi_major, expected_major, 5e-11),
+        ("semi_minor", &solution.semi_minor, expected_minor, 5e-11),
+        (
+            "inclination",
+            &solution.inclination_degrees,
+            expected_inclination,
+            5e-8,
+        ),
+        ("phase", &solution.phase_degrees, expected_phase, 5e-8),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{field}[{index}]"), *actual, *expected, tolerance);
+        }
+    }
+}
+
+#[test]
+fn matches_unresolved_and_approximate_vector_ellipse_oracles() {
+    check_vector_ellipse(
+        169,
+        InferenceMode::Exact,
+        &[
+            0.005_691_288_851_948_564,
+            0.013_444_201_325_114_27,
+            0.029_830_045_346_458_53,
+            0.003_734_781_606_630_359,
+            0.014_180_603_390_018_889,
+        ],
+        &[
+            0.003_219_918_445_964_943_4,
+            -0.005_969_575_818_078_434,
+            0.015_141_659_682_251_011,
+            -0.001_118_662_679_167_816_7,
+            0.008_305_249_124_335_879,
+        ],
+        &[
+            99.090_341_402_017_32,
+            53.059_162_600_699_494,
+            35.883_492_147_495_25,
+            68.059_162_600_699_51,
+            43.383_492_147_495_25,
+        ],
+        &[
+            34.513_530_730_812_52,
+            266.705_163_984_708_5,
+            64.361_959_857_307_58,
+            261.705_163_984_708_46,
+            26.861_959_857_307_59,
+        ],
+    );
+    check_vector_ellipse(
+        169,
+        InferenceMode::Approximate,
+        &[
+            0.005_671_652_502_119_847,
+            0.016_112_588_323_643_11,
+            0.049_269_113_328_217_54,
+            0.004_572_830_717_424_066,
+            0.022_952_723_523_839_723,
+        ],
+        &[
+            0.003_372_618_718_473_810_4,
+            -0.005_218_915_593_377_333,
+            0.015_632_450_522_836_603,
+            -0.000_760_045_261_831_044_5,
+            0.009_498_058_401_687_347,
+        ],
+        &[
+            101.409_758_739_030_54,
+            66.997_727_688_143_85,
+            56.892_524_085_768_1,
+            81.997_727_688_143_84,
+            64.392_524_085_768_12,
+        ],
+        &[
+            35.489_638_592_827_376,
+            257.212_474_276_669_5,
+            72.523_133_086_453_65,
+            252.212_474_276_669_55,
+            35.023_133_086_453_67,
+        ],
+    );
+    check_vector_ellipse(
+        745,
+        InferenceMode::Approximate,
+        &[
+            0.001_419_564_959_975_855,
+            0.002_892_924_116_977_396_4,
+            0.006_303_401_752_535_92,
+            0.000_873_617_305_015_497_6,
+            0.002_687_291_860_871_099_7,
+        ],
+        &[
+            0.000_172_333_198_488_661_9,
+            0.000_114_801_398_445_579_14,
+            -0.002_984_778_555_401_283_6,
+            0.000_179_086_625_382_543_67,
+            -0.001_027_980_262_303_782,
+        ],
+        &[
+            24.714_009_739_394_456,
+            24.737_573_280_915_18,
+            108.793_813_042_33,
+            39.737_573_280_915_17,
+            116.293_813_042_330_02,
+        ],
+        &[
+            43.952_188_651_260_13,
+            253.054_270_259_882_7,
+            36.252_826_353_608_85,
+            248.054_270_259_882_7,
+            358.752_826_353_608_84,
+        ],
+    );
+}
+
+#[test]
+fn matches_resolved_exact_vector_colored_confidence_oracle() {
+    let time = oracle_times(745);
+    let (eastward, northward) = synthetic_vector_observations(&time);
+    let model = VectorInferenceOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE,
+        &requested(),
+        &VECTOR_RELATIONSHIPS,
+        InferenceMode::Exact,
+    )
+    .expect("valid exact vector inference model");
+    let solution = model
+        .solve_vector_with_linear_confidence(&eastward, &northward, LinearConfidence::Colored)
+        .expect("valid colored vector inference solution");
+    for (field, actual, expected, tolerance) in [
+        (
+            "semi_major_ci",
+            solution
+                .semi_major_ci
+                .as_ref()
+                .expect("colored vector solution contains major intervals"),
+            &[
+                0.026_133_970_076_758_575,
+                0.024_455_249_849_153_86,
+                0.015_351_169_329_795_213,
+                0.005_955_334_142_149_809,
+                0.009_485_447_628_870_975,
+            ],
+            5e-8,
+        ),
+        (
+            "semi_minor_ci",
+            solution
+                .semi_minor_ci
+                .as_ref()
+                .expect("colored vector solution contains minor intervals"),
+            &[
+                0.011_838_199_569_600_407,
+                0.012_991_004_776_935_836,
+                0.025_337_141_909_765_732,
+                0.005_955_334_142_149_81,
+                0.009_485_447_628_870_975,
+            ],
+            5e-8,
+        ),
+        (
+            "signal_to_noise",
+            solution
+                .signal_to_noise
+                .as_ref()
+                .expect("colored vector solution contains SNR"),
+            &[
+                0.009_412_703_895_376_576,
+                0.022_467_276_872_470_257,
+                0.579_755_117_359_606_4,
+                0.024_761_365_635_209_573,
+                0.580_015_146_258_317_4,
+            ],
+            5e-7,
         ),
     ] {
         for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {

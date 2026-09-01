@@ -19,7 +19,8 @@ pub use catalog::{
 };
 pub use corrected::{
     GreenwichNodalBatch, GreenwichNodalOls, GreenwichNodalReconstructor, InferenceMode,
-    ReconstructionFilter, ScalarInferenceOls, ScalarInferenceRelation,
+    ReconstructionFilter, ScalarInferenceOls, ScalarInferenceRelation, VectorInferenceOls,
+    VectorInferenceRelation,
 };
 pub use error::AnalysisError;
 pub use robust::{RobustDiagnostics, RobustOptions, RobustTermination};

@@ -906,6 +906,55 @@ impl ConfidenceSampling {
             sampling.precompute_shared_plan();
         }
     }
+
+    pub(crate) fn band_averaged_residual_power(
+        &self,
+        residual: &[f64],
+        constituents: &[Constituent],
+    ) -> Vec<f64> {
+        if let Some(sample_interval_hours) = self.sample_interval_hours {
+            let interpolated = match &self.observation_positions {
+                Some(positions) => {
+                    debug_assert_eq!(positions.len(), residual.len());
+                    let mut interpolated = vec![residual[0]; self.spectrum_time_count];
+                    let mut valid = 0;
+                    for (grid_index, value) in interpolated.iter_mut().enumerate() {
+                        while valid + 1 < positions.len() && positions[valid + 1] <= grid_index {
+                            valid += 1;
+                        }
+                        *value = if positions[valid] == grid_index || valid + 1 == positions.len() {
+                            residual[valid]
+                        } else if grid_index < positions[0] {
+                            residual[0]
+                        } else {
+                            let left = positions[valid];
+                            let right = positions[valid + 1];
+                            let fraction =
+                                usize_to_f64(grid_index - left) / usize_to_f64(right - left);
+                            residual[valid] + fraction * (residual[valid + 1] - residual[valid])
+                        };
+                    }
+                    Cow::Owned(interpolated)
+                }
+                None => Cow::Borrowed(residual),
+            };
+            band_averaged_fft_residual_power(
+                &interpolated,
+                sample_interval_hours,
+                self.effective_record_length_days,
+                constituents,
+            )
+        } else {
+            self.irregular_spectrum
+                .as_ref()
+                .expect("irregular confidence sampling retains timestamps")
+                .band_averaged_residual_power(
+                    residual,
+                    self.effective_record_length_days,
+                    constituents,
+                )
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

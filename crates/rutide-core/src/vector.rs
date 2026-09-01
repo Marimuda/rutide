@@ -296,7 +296,7 @@ fn vector_intervals(
     clippy::too_many_arguments,
     reason = "matches UTide's four coefficients and four sigmas"
 )]
-fn linearized_ellipse_sigmas(
+pub(crate) fn linearized_ellipse_sigmas(
     eastward_cosine: f64,
     eastward_sine: f64,
     northward_cosine: f64,

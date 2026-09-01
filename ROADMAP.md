@@ -117,12 +117,14 @@ reference graphs, and exact/approximate Python-oracle fixtures. Python UTide doe
 not implement Monte Carlo confidence combined with inference; RUTide must either
 retain that explicit boundary or specify and validate an extension.
 
-The scalar fixed-latitude kernel is complete: exact and Python-compatible
-approximate bases, grouped references, robust and bulk solves, white and colored
+The scalar and vector fixed-latitude kernels are complete. Scalar inference
+includes robust and bulk solves; the vector kernel uses one coupled complex solve
+for the independent positive/negative rotary ratios. Exact and
+Python-compatible approximate bases, grouped references, white and colored
 linear confidence, PE/SNR, reconstruction, and invalid graph/value handling pass
 resolved and unresolved pinned-oracle fixtures. Inference confidence preserves a
-pinned Python column-order/indexing quirk inside this model only. Coupled vector
-inference, missing-value batch integration, and the CLI/NetCDF schema remain
+pinned Python column-order/indexing quirk inside these models only. Missing-value
+batch integration, robust vector inference, and the CLI/NetCDF schema remain
 before this item can be marked complete.
 
 ## 4. Monte Carlo confidence intervals — planned
