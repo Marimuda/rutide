@@ -187,10 +187,9 @@ filters behave as in scalar mode.
 For compatibility, colored two-dimensional linear intervals reproduce the
 pinned Python UTide implementation exactly, including its asymmetric variance
 rescaling: the eastward coefficient pair retains the white estimate while the
-northward pair uses its colored residual band. White intervals support irregular
-timestamps. Colored intervals support gaps on an originally regular grid, but
-truly irregular colored spectra are rejected explicitly until the planned
-Lomb–Scargle path is implemented.
+northward pair uses its colored residual band. White and colored intervals support
+regular timestamps, gaps on an originally regular grid, and truly irregular
+timestamps; the last use a Lomb–Scargle residual spectrum.
 
 ## Working principles
 

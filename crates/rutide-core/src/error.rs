@@ -34,8 +34,6 @@ pub enum AnalysisError {
     EmptyConstituents,
     /// The Rayleigh criterion is not finite and strictly positive.
     InvalidRayleighMinimum,
-    /// Vector colored confidence intervals currently require equidistant timestamps.
-    UnevenTimeForColoredConfidence,
     /// A reconstruction threshold is negative or non-finite.
     InvalidReconstructionThreshold {
         /// Diagnostic whose threshold is invalid.
@@ -122,8 +120,6 @@ impl fmt::Display for AnalysisError {
             Self::InvalidRayleighMinimum => {
                 formatter.write_str("Rayleigh minimum must be finite and greater than zero")
             }
-            Self::UnevenTimeForColoredConfidence => formatter
-                .write_str("vector colored confidence intervals require equidistant timestamps"),
             Self::InvalidReconstructionThreshold { diagnostic } => write!(
                 formatter,
                 "{diagnostic} reconstruction threshold must be finite and non-negative"

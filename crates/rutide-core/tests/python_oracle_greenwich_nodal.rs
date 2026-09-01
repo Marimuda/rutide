@@ -828,6 +828,181 @@ fn matches_python_utide_for_vector_ellipse_and_linear_confidence() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one oracle test keeps the complete irregular vector reference together"
+)]
+fn matches_python_utide_lomb_scargle_confidence_for_irregular_vector_observations() {
+    let time = irregular_oracle_times();
+    let (mut eastward, mut northward) = synthetic_vector_observations(&time);
+    for index in [0, 137] {
+        eastward[index] = f64::NAN;
+    }
+    for index in [2, 411] {
+        northward[index] = f64::NAN;
+    }
+    let batch = GreenwichNodalBatch::prepare_modified_julian_days(&time, &CONSTITUENTS)
+        .expect("valid irregular vector oracle batch");
+    let solution = batch
+        .solve_vector_time_major_with_missing_and_linear_confidence(
+            &eastward,
+            &northward,
+            &[LATITUDE_DEGREES_NORTH],
+            LinearConfidence::Colored,
+        )
+        .expect("valid irregular colored vector solution")
+        .pop()
+        .expect("one vector solution");
+
+    for (label, actual, expected, tolerance) in [
+        (
+            "irregular semi-major",
+            &solution.semi_major,
+            &[
+                0.002_386_378_307_631_415_3,
+                0.003_318_271_025_053_142_5,
+                0.001_376_241_525_120_659_7,
+                0.004_225_774_688_046_809,
+                0.040_869_601_922_192_59,
+            ],
+            3e-12,
+        ),
+        (
+            "irregular semi-minor",
+            &solution.semi_minor,
+            &[
+                0.001_427_609_021_093_964,
+                0.000_791_733_465_406_382_5,
+                0.000_073_174_719_220_492_69,
+                -0.001_119_063_664_119_936_1,
+                -0.007_840_851_008_634_082,
+            ],
+            3e-12,
+        ),
+        (
+            "irregular inclination",
+            &solution.inclination_degrees,
+            &[
+                155.010_955_107_475_55,
+                2.937_837_451_292_324_4,
+                111.026_671_474_869_69,
+                13.834_456_402_777_79,
+                85.363_321_834_123_72,
+            ],
+            3e-9,
+        ),
+        (
+            "irregular vector phase",
+            &solution.phase_degrees,
+            &[
+                42.643_567_016_682_44,
+                125.447_870_539_818_84,
+                44.227_553_019_517_12,
+                180.776_420_577_477_86,
+                172.609_588_506_942_83,
+            ],
+            3e-9,
+        ),
+        (
+            "irregular semi-major CI",
+            solution.semi_major_ci.as_ref().expect("major CI"),
+            &[
+                0.029_880_753_967_559_567,
+                0.033_769_790_010_141_32,
+                0.011_893_351_268_993_392,
+                0.035_586_826_997_351_46,
+                0.003_403_928_484_171_693_7,
+            ],
+            2e-9,
+        ),
+        (
+            "irregular semi-minor CI",
+            solution.semi_minor_ci.as_ref().expect("minor CI"),
+            &[
+                0.013_945_981_894_905_556,
+                0.001_953_023_361_151_898,
+                0.030_864_569_621_632_09,
+                0.008_892_053_668_296_35,
+                0.038_506_104_015_462_43,
+            ],
+            2e-9,
+        ),
+        (
+            "irregular inclination CI",
+            solution
+                .inclination_ci_degrees
+                .as_ref()
+                .expect("inclination CI"),
+            &[
+                846.402_724_591_051_1,
+                151.777_641_587_505_34,
+                1_288.864_148_354_187_6,
+                188.979_848_465_717_62,
+                56.176_163_351_497_046,
+            ],
+            2e-5,
+        ),
+        (
+            "irregular vector phase CI",
+            solution.phase_ci_degrees.as_ref().expect("phase CI"),
+            &[
+                1_158.814_086_751_269_3,
+                618.119_967_113_884,
+                501.301_513_125_509_5,
+                521.948_325_050_910_5,
+                11.858_031_940_865_116,
+            ],
+            2e-5,
+        ),
+        (
+            "irregular vector SNR",
+            solution.signal_to_noise.as_ref().expect("SNR"),
+            &[
+                0.027_320_175_586_342_813,
+                0.039_072_825_884_677_115,
+                0.006_669_311_650_112_340_5,
+                0.054_560_726_743_910_805,
+                4.452_161_824_047_751,
+            ],
+            2e-7,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{label}[{index}]"), *actual, *expected, tolerance);
+        }
+    }
+    for (label, actual, expected) in [
+        (
+            "irregular eastward mean",
+            solution.eastward_mean,
+            0.163_587_537_768_660_45,
+        ),
+        (
+            "irregular northward mean",
+            solution.northward_mean,
+            -0.077_977_441_474_055_65,
+        ),
+        (
+            "irregular eastward slope",
+            solution.eastward_slope_per_day,
+            0.000_823_089_465_449_228_9,
+        ),
+        (
+            "irregular northward slope",
+            solution.northward_slope_per_day,
+            0.002_158_481_741_248_824,
+        ),
+        (
+            "irregular vector reference time",
+            solution.reference_time_days,
+            58_128.521_542_833_4,
+        ),
+    ] {
+        assert_close(label, actual, expected, 3e-12);
+    }
+}
+
+#[test]
 fn matches_python_utide_for_expanded_base_and_shallow_constituents() {
     let time = oracle_times();
     let observations = oracle_observations();

@@ -339,9 +339,8 @@ The first coverage sequence is complete and retained as separate Git increments:
 Missing-value grouping and scalar/vector current support are now complete. Scalar
 and vector fits use per-series valid-time masks, vector fits use the joint
 component mask, and equidistant gaps retain Python-compatible colored FFT
-behavior. Scalar colored intervals use Lomb–Scargle spectra for truly irregular
-timestamps; the corresponding vector path remains explicitly gated until its
-ellipse oracle passes. [`ROADMAP.md`](ROADMAP.md) is the authoritative ordered
-task list and acceptance contract for that work and the later robust, inference,
+behavior. Scalar and vector colored intervals use Lomb–Scargle spectra for truly
+irregular timestamps. [`ROADMAP.md`](ROADMAP.md) is the authoritative ordered task
+list and acceptance contract for the remaining performance, robust, inference,
 Monte Carlo, option-parity, and resource increments. Each expansion remains
 subject to the same parity and resource gates above.

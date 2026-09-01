@@ -231,10 +231,6 @@ impl FixedRawOls {
         self.time_count
     }
 
-    pub(crate) const fn has_irregular_confidence_sampling(&self) -> bool {
-        self.sample_interval_hours.is_none()
-    }
-
     /// Fit one complete, finite scalar observation series.
     ///
     /// # Errors

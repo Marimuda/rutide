@@ -157,8 +157,7 @@ impl GreenwichNodalOls {
     ///
     /// # Errors
     ///
-    /// Returns [`AnalysisError`] for invalid inputs or unsupported irregular
-    /// colored spectra.
+    /// Returns [`AnalysisError`] for invalid inputs.
     pub fn solve_vector_with_linear_confidence(
         &self,
         eastward: &[f64],
@@ -174,11 +173,6 @@ impl GreenwichNodalOls {
         northward: &[f64],
         confidence: Option<LinearConfidence>,
     ) -> Result<VectorSolution, AnalysisError> {
-        if confidence == Some(LinearConfidence::Colored)
-            && self.model.has_irregular_confidence_sampling()
-        {
-            return Err(AnalysisError::UnevenTimeForColoredConfidence);
-        }
         if eastward.len() != northward.len() {
             return Err(AnalysisError::ObservationShape {
                 actual: northward.len(),
@@ -685,8 +679,7 @@ impl GreenwichNodalBatch {
     ///
     /// # Errors
     ///
-    /// Returns [`AnalysisError`] for invalid input or unsupported irregular
-    /// colored spectra.
+    /// Returns [`AnalysisError`] for invalid input.
     pub fn solve_vector_time_major_with_missing_and_linear_confidence(
         &self,
         eastward: &[f64],
@@ -704,11 +697,6 @@ impl GreenwichNodalBatch {
         latitudes: &[f64],
         confidence: Option<LinearConfidence>,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
-        if confidence == Some(LinearConfidence::Colored)
-            && self.basis.sample_interval_hours.is_none()
-        {
-            return Err(AnalysisError::UnevenTimeForColoredConfidence);
-        }
         validate_batch_shape_and_latitudes(self.time_count(), eastward, latitudes)?;
         if northward.len() != eastward.len() {
             return Err(AnalysisError::ObservationShape {
@@ -1564,14 +1552,15 @@ mod tests {
                 )
                 .is_ok()
         );
-        assert_eq!(
-            batch.solve_vector_time_major_with_missing_and_linear_confidence(
-                &observations,
-                &northward,
-                &[60.0],
-                LinearConfidence::Colored,
-            ),
-            Err(AnalysisError::UnevenTimeForColoredConfidence)
+        assert!(
+            batch
+                .solve_vector_time_major_with_missing_and_linear_confidence(
+                    &observations,
+                    &northward,
+                    &[60.0],
+                    LinearConfidence::Colored,
+                )
+                .is_ok()
         );
     }
 

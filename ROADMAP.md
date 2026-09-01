@@ -29,10 +29,6 @@ defined behavior, and representative oracle tests are versioned.
 
 The harmonic least-squares fit already supports irregular timestamps. This item
 concerns only the colored residual spectrum used to estimate confidence intervals.
-Until the vector increment is complete, truly irregular vector colored-confidence
-requests must continue to return `UnevenTimeForColoredConfidence` rather than use
-an unverified component path.
-
 ### 1a. Scalar Lomb–Scargle spectrum — complete
 
 - Reproduce UTide's nine residual-noise frequency bands and oversampled frequency
@@ -49,11 +45,9 @@ jitter, isolated gaps, clustered gaps, and at least one band-boundary constituen
 Tests must compare band powers, coefficient variances, amplitude/phase intervals,
 and SNR, not only the final amplitude.
 
-### 1b. Vector Lomb–Scargle spectrum — next
+### 1b. Vector Lomb–Scargle spectrum — complete
 
 - Compute eastward and northward residual auto-spectra using the scalar kernel.
-- Add the UTide-compatible irregular cross-spectrum needed by full vector
-  covariance and future Monte Carlo intervals.
 - Integrate vector linearized colored intervals while recording any intentional
   Python-compatibility behavior separately from scientifically improved behavior.
 
@@ -100,7 +94,8 @@ retain that explicit boundary or specify and validate an extension.
 ## 4. Monte Carlo confidence intervals — planned
 
 - Build the complete coefficient covariance and pseudo-covariance matrices.
-- Include eastward/northward cross-covariance and colored cross-spectral power.
+- Add the UTide-compatible irregular eastward/northward cross-spectrum and include
+  cross-covariance and colored cross-spectral power.
 - Make realization count and random seed effective, reproducible API options.
 - Reproduce UTide's angle clustering and median-absolute-deviation intervals.
 - Repair non-positive-definite covariance matrices using a documented method.
