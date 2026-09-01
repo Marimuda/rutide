@@ -75,6 +75,7 @@ def _vector_observations(times: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def _set_worker_state(
     oracle: Any,
     field: str,
+    confidence: str,
     times: np.ndarray,
     scalar: np.ndarray,
     eastward: np.ndarray,
@@ -91,7 +92,8 @@ def _set_worker_state(
         "options": {
             "constit": _CONSTITUENTS,
             "order_constit": _CONSTITUENTS,
-            "conf_int": "linear",
+            "conf_int": "linear" if confidence == "linear" else "MC",
+            "MC_n": 200,
             "method": "ols",
             "trend": True,
             "phase": "Greenwich",
@@ -144,6 +146,11 @@ class _SerialPool:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--field", choices=("scalar", "vector"), default="scalar")
+    parser.add_argument(
+        "--confidence",
+        choices=("linear", "monte-carlo"),
+        default="linear",
+    )
     parser.add_argument("--series-count", type=int, default=100)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repetitions", type=int, default=5)
@@ -167,7 +174,15 @@ def main() -> None:
     times = _times()
     scalar = _scalar_observations()
     eastward, northward = _vector_observations(times)
-    _set_worker_state(oracle, args.field, times, scalar, eastward, northward)
+    _set_worker_state(
+        oracle,
+        args.field,
+        args.confidence,
+        times,
+        scalar,
+        eastward,
+        northward,
+    )
 
     with threadpool_limits(limits=1):
         context = multiprocessing.get_context("fork")
@@ -205,6 +220,10 @@ def main() -> None:
         json.dumps(
             {
                 "field": args.field,
+                "confidence": args.confidence,
+                "monte_carlo_realizations": (
+                    200 if args.confidence == "monte-carlo" else 0
+                ),
                 "series_count": args.series_count,
                 "workers": args.workers,
                 "chunk_size": args.chunk_size,

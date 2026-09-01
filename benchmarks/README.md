@@ -96,6 +96,23 @@ maximum. Use the same field, series count, warm-up count, repetitions, and worke
 count in comparisons. The Python probe exposes `coef.rf.iterations` from the
 pinned solver rather than inferring work from elapsed time.
 
+The irregular and robust probes also accept an explicit Monte Carlo mode while
+retaining their historical linear-confidence defaults. Both implementations use
+200 realizations. Python UTide currently ignores configurable `MC_n`, so this
+comparison deliberately fixes the oracle's effective realization count:
+
+```console
+RUTIDE_BENCH_CONFIDENCE=monte-carlo \
+  cargo bench -p rutide-core --bench irregular_confidence_throughput
+uv run --project benchmarks/python --locked \
+  python -m rutide_baseline.irregular_benchmark --confidence monte-carlo
+
+RUTIDE_BENCH_CONFIDENCE=monte-carlo \
+  cargo bench -p rutide-core --bench robust_throughput
+uv run --project benchmarks/python --locked \
+  python -m rutide_baseline.robust_benchmark --confidence monte-carlo
+```
+
 Benchmark exact or approximate inferred-constituent OLS with colored confidence
 on either the regular FFT route or the shared-mask irregular Lomb–Scargle route:
 

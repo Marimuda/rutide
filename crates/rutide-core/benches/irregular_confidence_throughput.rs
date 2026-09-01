@@ -4,7 +4,10 @@ use std::{env, error::Error, hint::black_box, time::Instant};
 
 use faer::{Par, set_global_parallelism};
 use rayon::ThreadPoolBuilder;
-use rutide_core::{GreenwichNodalBatch, LinearConfidence, TidalConstituent};
+use rutide_core::{
+    AnalysisError, GreenwichNodalBatch, LinearConfidence, MonteCarloOptions, ScalarSolution,
+    TidalConstituent, VectorSolution,
+};
 
 const CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -97,15 +100,71 @@ fn median(values: &mut [f64]) -> f64 {
     values[values.len() / 2]
 }
 
+fn solve_scalar(
+    batch: &GreenwichNodalBatch,
+    observations: &[f64],
+    latitudes: &[f64],
+    confidence: &str,
+) -> Result<Vec<ScalarSolution>, AnalysisError> {
+    if confidence == "linear" {
+        batch.solve_time_major_with_missing_and_linear_confidence(
+            observations,
+            latitudes,
+            LinearConfidence::Colored,
+        )
+    } else {
+        batch.solve_time_major_with_missing_and_monte_carlo_confidence(
+            observations,
+            latitudes,
+            MonteCarloOptions::default(),
+            LinearConfidence::Colored,
+        )
+    }
+}
+
+fn solve_vector(
+    batch: &GreenwichNodalBatch,
+    eastward: &[f64],
+    northward: &[f64],
+    latitudes: &[f64],
+    confidence: &str,
+) -> Result<Vec<VectorSolution>, AnalysisError> {
+    if confidence == "linear" {
+        batch.solve_vector_time_major_with_missing_and_linear_confidence(
+            eastward,
+            northward,
+            latitudes,
+            LinearConfidence::Colored,
+        )
+    } else {
+        batch.solve_vector_time_major_with_missing_and_monte_carlo_confidence(
+            eastward,
+            northward,
+            latitudes,
+            MonteCarloOptions::default(),
+            LinearConfidence::Colored,
+        )
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let field = env::var("RUTIDE_BENCH_FIELD").unwrap_or_else(|_| "scalar".to_owned());
     if field != "scalar" && field != "vector" {
         return Err("RUTIDE_BENCH_FIELD must be scalar or vector".into());
     }
+    let confidence = env::var("RUTIDE_BENCH_CONFIDENCE").unwrap_or_else(|_| "linear".to_owned());
+    if confidence != "linear" && confidence != "monte-carlo" {
+        return Err("RUTIDE_BENCH_CONFIDENCE must be linear or monte-carlo".into());
+    }
     let series_count = setting("RUTIDE_BENCH_SERIES", 100);
     let repetitions = setting("RUTIDE_BENCH_REPETITIONS", 5);
     let warmups = nonnegative_setting("RUTIDE_BENCH_WARMUPS", 1);
     let workers = setting("RUTIDE_BENCH_WORKERS", 1);
+    let realizations = if confidence == "monte-carlo" {
+        MonteCarloOptions::default().realizations
+    } else {
+        0
+    };
     set_global_parallelism(Par::Seq);
 
     let times = irregular_times();
@@ -126,26 +185,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let run = || -> Result<f64, Box<dyn Error>> {
         if field == "scalar" {
-            let solutions = pool.install(|| {
-                batch.solve_time_major_with_missing_and_linear_confidence(
-                    &scalar,
-                    &latitudes,
-                    LinearConfidence::Colored,
-                )
-            })?;
+            let solutions =
+                pool.install(|| solve_scalar(&batch, &scalar, &latitudes, &confidence))?;
             Ok(solutions
                 .iter()
                 .map(|solution| solution.amplitude_ci.as_ref().expect("requested CI")[0])
                 .sum())
         } else {
-            let solutions = pool.install(|| {
-                batch.solve_vector_time_major_with_missing_and_linear_confidence(
-                    &eastward,
-                    &northward,
-                    &latitudes,
-                    LinearConfidence::Colored,
-                )
-            })?;
+            let solutions = pool
+                .install(|| solve_vector(&batch, &eastward, &northward, &latitudes, &confidence))?;
             Ok(solutions
                 .iter()
                 .map(|solution| solution.semi_major_ci.as_ref().expect("requested CI")[0])
@@ -167,9 +215,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let median_seconds = median(&mut seconds);
     println!(
-        "summary field={field} series={series_count} workers={workers} warmups={warmups} \
-         repetitions={repetitions} prepare_seconds={prepare_seconds:.9} \
+        "summary field={field} confidence={confidence} realizations={} series={series_count} \
+         workers={workers} warmups={warmups} repetitions={repetitions} \
+         prepare_seconds={prepare_seconds:.9} \
          median_seconds={median_seconds:.9} median_series_per_second={:.3}",
+        realizations,
         f64::from(u32::try_from(series_count)?) / median_seconds,
     );
     Ok(())
