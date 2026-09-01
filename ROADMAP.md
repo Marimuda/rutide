@@ -131,9 +131,15 @@ exact/approximate switch; JSON reports and versioned NetCDF schemas retain every
 ratio, phase offset, convention, and mode, while the canonical digest includes
 the complete inference configuration. End-to-end vector coverage combines
 inference with joint missing-value masks, Lomb–Scargle colored confidence, and
-reconstruction. Comparative performance measurements and robust vector inference
-remain before this item can be marked complete; the latter is rejected explicitly
-at both configuration and CLI boundaries.
+reconstruction. Robust vector inference remains before this item can be marked
+complete and is rejected explicitly at both configuration and CLI boundaries.
+
+The comparative measurements are now retained in
+`benchmarks/results/inferred-constituents-2026-09-01.md`. Across controlled
+100-series exact-inference runs, RUTide is 48.97–228.45x faster than pinned
+Python; retained 1,000-series comparisons are 71.93–140.44x faster. Approximate
+mode is 69.30–86.55x faster at 16 workers. Robust coupled-vector inference is now
+the only implementation gap in this item.
 
 ## 4. Monte Carlo confidence intervals — planned
 

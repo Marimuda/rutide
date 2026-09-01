@@ -37,6 +37,13 @@ records exact Cauchy-IRLS parity, including identical iteration counts, and a
 7.66–19.46x advantage on 100 series. On the more sustained 1,000-series workload,
 RUTide is 13.39–17.66x faster at 16 and 32 workers.
 
+The controlled [inferred-constituent snapshot](benchmarks/results/inferred-constituents-2026-09-01.md)
+records scalar and coupled-vector exact/approximate parity on both regular FFT
+and irregular/gappy Lomb–Scargle confidence paths. RUTide is 48.97–228.45x faster
+on the 100-series matrix and 71.93–140.44x faster in retained 1,000-series runs;
+the report documents significant host contention and the CPU-affinity controls
+used to exclude contaminated measurements.
+
 The implemented scalar kernels now cover fixed-constituent OLS with mean and
 trend in both raw-phase mode and exact Greenwich/nodal mode. The exact-correction
 catalog contains all 146 constituents, 162 satellite corrections, and 251
@@ -82,7 +89,8 @@ resource tasks are tracked in [`ROADMAP.md`](ROADMAP.md). Irregular scalar and
 vector colored confidence use Lomb–Scargle residual spectra, robust fitting is
 complete. Scalar and coupled-vector inferred constituents now pass exact,
 approximate, and gappy Python oracle fixtures and are exposed by the FVCOM
-commands; comparative inference benchmarking is the active scientific increment.
+commands. Their comparative benchmark is complete; robust coupled-vector
+inference is the active scientific increment.
 
 ## Development
 
