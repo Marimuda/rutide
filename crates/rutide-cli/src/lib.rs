@@ -14,9 +14,9 @@ use netcdf::{FileMut, Variable, VariableMut};
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
     AnalysisError, Constituent, GreenwichNodalBatch, GreenwichNodalReconstructor, InferenceMode,
-    LinearConfidence, RayleighSelection, ReconstructionFilter, RobustOptions, RobustTermination,
-    ScalarInferenceBatch, ScalarInferenceRelation, ScalarSolution, TidalConstituent,
-    VectorInferenceRelation, select_constituents_by_rayleigh,
+    LinearConfidence, MonteCarloOptions, RayleighSelection, ReconstructionFilter, RobustOptions,
+    RobustTermination, ScalarInferenceBatch, ScalarInferenceRelation, ScalarSolution,
+    TidalConstituent, VectorInferenceRelation, select_constituents_by_rayleigh,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -26,7 +26,7 @@ mod vector;
 pub use vector::{VectorAnalyzeConfig, VectorRunReport, VectorSampleResult, analyze_vector};
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
-const OUTPUT_SCHEMA_VERSION: u32 = 7;
+const OUTPUT_SCHEMA_VERSION: u32 = 8;
 /// Backward-compatible benchmark constituent set used when none is specified.
 pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -84,6 +84,13 @@ pub enum ConfidenceInterval {
     None,
     /// Calculate linearized 95% intervals using the selected noise model.
     Linear(LinearConfidence),
+    /// Calculate nonlinear intervals from seeded coefficient realizations.
+    MonteCarlo {
+        /// Reproducible realization count and root seed.
+        options: MonteCarloOptions,
+        /// White or band-averaged colored residual noise.
+        noise: LinearConfidence,
+    },
 }
 
 /// Least-squares method requested for an application run.
@@ -109,14 +116,30 @@ impl ConfidenceInterval {
         match self {
             Self::None => "none",
             Self::Linear(_) => "linear",
+            Self::MonteCarlo { .. } => "monte-carlo",
         }
     }
 
     const fn noise(self) -> Option<&'static str> {
         match self {
             Self::None => None,
-            Self::Linear(LinearConfidence::White) => Some("white"),
-            Self::Linear(LinearConfidence::Colored) => Some("colored"),
+            Self::Linear(LinearConfidence::White)
+            | Self::MonteCarlo {
+                noise: LinearConfidence::White,
+                ..
+            } => Some("white"),
+            Self::Linear(LinearConfidence::Colored)
+            | Self::MonteCarlo {
+                noise: LinearConfidence::Colored,
+                ..
+            } => Some("colored"),
+        }
+    }
+
+    const fn monte_carlo_options(self) -> Option<MonteCarloOptions> {
+        match self {
+            Self::MonteCarlo { options, .. } => Some(options),
+            Self::None | Self::Linear(_) => None,
         }
     }
 }
@@ -136,7 +159,7 @@ pub struct AnalyzeConfig {
     pub constituent_selection: ConstituentSelection,
     /// Optional constrained inferred constituents.
     pub inference: Option<ScalarInferenceConfig>,
-    /// Optional linearized confidence intervals and their noise model.
+    /// Optional linearized or Monte Carlo confidence and its noise model.
     pub confidence_interval: ConfidenceInterval,
     /// Ordinary or Cauchy robust least squares.
     pub analysis_method: AnalysisMethod,
@@ -180,10 +203,10 @@ pub struct SampleResult {
     pub phase_degrees: Vec<f64>,
     /// Percent energy in the report's constituent order.
     pub percent_energy: Vec<f64>,
-    /// Linearized 95% amplitude CI half-widths, when enabled.
+    /// 95% amplitude CI half-widths, when enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub amplitude_ci: Option<Vec<f64>>,
-    /// Linearized 95% phase CI half-widths in degrees, when enabled.
+    /// 95% phase CI half-widths in degrees, when enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase_ci_degrees: Option<Vec<f64>>,
     /// Signal-to-noise ratio derived from amplitude CI, when enabled.
@@ -343,10 +366,16 @@ pub struct RunReport {
     pub constituent_selection: ConstituentSelectionReport,
     /// Inference configuration when inferred constituents are enabled.
     pub inference: Option<InferenceReport>,
-    /// Confidence method: `none` or `linear`.
+    /// Confidence method: `none`, `linear`, or `monte-carlo`.
     pub confidence_interval: &'static str,
     /// Residual-noise model when confidence intervals are enabled.
     pub confidence_noise: Option<&'static str>,
+    /// Number of coefficient realizations for Monte Carlo confidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monte_carlo_realizations: Option<usize>,
+    /// Root random seed for Monte Carlo confidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monte_carlo_seed: Option<u64>,
     /// Complete-series reconstruction configuration, when enabled.
     pub reconstruction: Option<ReconstructionReport>,
     /// Constituent names in coefficient order.
@@ -721,6 +750,14 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         inference: config.inference.as_ref().map(ScalarInferenceConfig::report),
         confidence_interval: config.confidence_interval.method(),
         confidence_noise: config.confidence_interval.noise(),
+        monte_carlo_realizations: config
+            .confidence_interval
+            .monte_carlo_options()
+            .map(|options| options.realizations),
+        monte_carlo_seed: config
+            .confidence_interval
+            .monte_carlo_options()
+            .map(|options| options.seed),
         reconstruction: config
             .reconstruction
             .as_ref()
@@ -775,6 +812,13 @@ fn solve_input(
                     &input.latitudes,
                     noise,
                 ),
+            (AnalysisMethod::Ols, ConfidenceInterval::MonteCarlo { options, noise }) => batch
+                .solve_time_major_with_missing_and_monte_carlo_confidence(
+                    &input.observations,
+                    &input.latitudes,
+                    options,
+                    noise,
+                ),
             (AnalysisMethod::Robust(options), ConfidenceInterval::None) => batch
                 .solve_time_major_with_missing_robust(
                     &input.observations,
@@ -788,6 +832,19 @@ fn solve_input(
                     options,
                     noise,
                 ),
+            (
+                AnalysisMethod::Robust(robust_options),
+                ConfidenceInterval::MonteCarlo {
+                    options: monte_carlo_options,
+                    noise,
+                },
+            ) => batch.solve_time_major_with_missing_robust_and_monte_carlo_confidence(
+                &input.observations,
+                &input.latitudes,
+                robust_options,
+                monte_carlo_options,
+                noise,
+            ),
         },
         ScalarAnalysisBatch::Inferred(batch) => match (analysis_method, confidence_interval) {
             (AnalysisMethod::Ols, ConfidenceInterval::None) => {
@@ -812,6 +869,9 @@ fn solve_input(
                     options,
                     noise,
                 ),
+            (_, ConfidenceInterval::MonteCarlo { .. }) => {
+                Err(AnalysisError::UnsupportedMonteCarloInference)
+            }
         },
     })
 }
@@ -863,6 +923,18 @@ fn validate_config(config: &AnalyzeConfig) -> Result<(), AppError> {
         return Err(AppError::Invalid(
             "input and output paths must differ".to_owned(),
         ));
+    }
+    if let ConfidenceInterval::MonteCarlo { options, .. } = config.confidence_interval {
+        if options.realizations < 2 {
+            return Err(AppError::Invalid(
+                "Monte Carlo confidence requires at least two realizations".to_owned(),
+            ));
+        }
+        if config.inference.is_some() {
+            return Err(AppError::Invalid(
+                "Monte Carlo confidence with inferred constituents is not yet supported".to_owned(),
+            ));
+        }
     }
     if let AnalysisMethod::Robust(options) = config.analysis_method {
         if !options.tuning_constant.is_finite() || options.tuning_constant <= 0.0 {
@@ -1368,7 +1440,7 @@ fn result_digest(
     reconstruction: Option<(&ReconstructionFilter, &[Vec<f64>])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-scalar-greenwich-nodal-v7\0");
+    digest.update(b"rutide-scalar-greenwich-nodal-v8\0");
     digest.update(analysis_method.name().as_bytes());
     if let AnalysisMethod::Robust(options) = analysis_method {
         digest.update(options.tuning_constant.to_bits().to_le_bytes());
@@ -1384,6 +1456,16 @@ fn result_digest(
     digest.update([0]);
     if let Some(noise) = confidence_interval.noise() {
         digest.update(noise.as_bytes());
+    }
+    if let Some(options) = confidence_interval.monte_carlo_options() {
+        digest.update(
+            u64::try_from(options.realizations)
+                .map_err(|_| {
+                    AppError::Invalid("Monte Carlo realization count exceeds u64".to_owned())
+                })?
+                .to_le_bytes(),
+        );
+        digest.update(options.seed.to_le_bytes());
     }
     digest.update([0]);
     update_inference_digest(&mut digest, inference);
@@ -1535,9 +1617,12 @@ fn confidence_values(
         solution.signal_to_noise.as_deref(),
     ) {
         (ConfidenceInterval::None, None, None, None) => Ok(None),
-        (ConfidenceInterval::Linear(_), Some(amplitude), Some(phase), Some(snr)) => {
-            Ok(Some((amplitude, phase, snr)))
-        }
+        (
+            ConfidenceInterval::Linear(_) | ConfidenceInterval::MonteCarlo { .. },
+            Some(amplitude),
+            Some(phase),
+            Some(snr),
+        ) => Ok(Some((amplitude, phase, snr))),
         _ => Err(AppError::Invalid(
             "solver returned inconsistent confidence-interval fields".to_owned(),
         )),
@@ -1665,6 +1750,16 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
     output.add_attribute("confidence_interval", confidence_interval.method())?;
     if let Some(noise) = confidence_interval.noise() {
         output.add_attribute("confidence_noise", noise)?;
+    }
+    if let Some(options) = confidence_interval.monte_carlo_options() {
+        output.add_attribute(
+            "monte_carlo_realizations",
+            u64::try_from(options.realizations).map_err(|_| {
+                AppError::Invalid("Monte Carlo realization count exceeds u64".to_owned())
+            })?,
+        )?;
+        output.add_attribute("monte_carlo_seed", options.seed)?;
+        output.add_attribute("monte_carlo_rng", "rand_chacha-0.9-ChaCha12Rng")?;
     }
     output.add_attribute("constituent_selection", selection.report.method)?;
     if let Some(rayleigh_min) = selection.report.rayleigh_min {

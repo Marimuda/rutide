@@ -147,20 +147,40 @@ mode is 69.30–86.55x faster at 16 workers. These measurements predate the robu
 coupled-vector implementation; robust inference performance has not yet been
 benchmarked separately.
 
-## 4. Monte Carlo confidence intervals — planned
+## 4. Monte Carlo confidence intervals — implementation complete; benchmark next
 
-- Build the complete coefficient covariance and pseudo-covariance matrices.
-- Add the UTide-compatible irregular eastward/northward cross-spectrum and include
-  cross-covariance and colored cross-spectral power.
-- Make realization count and random seed effective, reproducible API options.
-- Reproduce UTide's angle clustering and median-absolute-deviation intervals.
-- Repair non-positive-definite covariance matrices using a documented method.
+- Complete 2×2 scalar and 4×4 vector coefficient covariances are sampled for OLS
+  and final-weight Cauchy robust fits.
+- Regular FFT and irregular Lomb–Scargle residual paths now include the
+  UTide-compatible real eastward/northward co-spectrum. Direct and cached Lomb
+  kernels pass the same pinned-Python band-power fixtures.
+- Realization count and root seed are effective API and CLI options. Derived
+  series/constituent streams make output independent of outer worker scheduling
+  when the inner matrix implementation is held sequential, as in the FVCOM app.
+- Scalar amplitudes and vector ellipses reproduce UTide's angle clustering and
+  median-absolute-deviation interval calculation.
+- Finite non-positive-definite covariance matrices are symmetrized, projected
+  onto the positive-semidefinite cone with a Jacobi eigendecomposition, and
+  diagonally nudged until Cholesky sampling is valid.
+- Missing and truly irregular scalar/vector batches, robust fits, CLI options,
+  result digests, JSON reports, and versioned NetCDF metadata are integrated.
 
-Acceptance requires deterministic seeded scalar/vector fixtures, white and colored
-noise, near-degenerate ellipses, covariance repair, and distribution-level checks.
-The pinned Python `MC_n` option is documented as not yet implemented even though
-its Monte Carlo route uses an internal 200 realizations; compatibility tests must
-therefore freeze the actual oracle behavior rather than its nominal option.
+The acceptance suite now covers deterministic seeded scalar/vector fixtures,
+white and colored noise, near-degenerate ellipses, covariance repair, statistical
+cross-covariance recovery, robust fits, irregular masks, worker-count invariance,
+and distribution-level pinned-Python comparisons. The pinned Python `MC_n`
+option is ignored and always uses an internal 200 realizations; RUTide preserves
+that default but deliberately makes its configured count effective.
+
+There is no theoretical restriction on combining Monte Carlo confidence with
+inferred constituents. Correct support must sample each independently fitted
+ordinary/reference coefficient jointly, apply exact or approximate inference
+relations to every realization, and retain reference/inferred correlation before
+forming amplitudes or ellipses. Python UTide does not implement that path. RUTide
+currently rejects the combination explicitly; implementing and validating this
+extension is the remaining scientific subtask. A dedicated performance snapshot
+for regular FVCOM, irregular Lomb–Scargle, and robust Monte Carlo profiles is the
+remaining acceptance task before this section becomes fully complete.
 
 ## 5. Solver-option parity — planned
 

@@ -138,11 +138,13 @@ pub enum AnalysisError {
     },
     /// A Monte Carlo confidence calculation requested fewer than two realizations.
     InvalidMonteCarloRealizationCount,
-    /// A coefficient covariance matrix was not finite and positive definite.
+    /// A coefficient covariance matrix was not finite or could not be repaired.
     InvalidConfidenceCovariance {
         /// Constituent position whose covariance could not be sampled.
         constituent: usize,
     },
+    /// Monte Carlo propagation through inferred relationships is not implemented yet.
+    UnsupportedMonteCarloInference,
 }
 
 impl fmt::Display for AnalysisError {
@@ -266,7 +268,10 @@ impl fmt::Display for AnalysisError {
             }
             Self::InvalidConfidenceCovariance { constituent } => write!(
                 formatter,
-                "coefficient covariance for constituent {constituent} is not finite and positive definite"
+                "coefficient covariance for constituent {constituent} is not finite or could not be repaired for sampling"
+            ),
+            Self::UnsupportedMonteCarloInference => formatter.write_str(
+                "Monte Carlo confidence with inferred constituents is not yet supported",
             ),
         }
     }

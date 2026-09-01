@@ -13,8 +13,8 @@ use rutide_cli::{
     analyze_scalar, analyze_vector,
 };
 use rutide_core::{
-    InferenceMode, LinearConfidence, ReconstructionFilter, RobustOptions, ScalarInferenceRelation,
-    TidalConstituent, VectorInferenceRelation,
+    InferenceMode, LinearConfidence, MonteCarloOptions, ReconstructionFilter, RobustOptions,
+    ScalarInferenceRelation, TidalConstituent, VectorInferenceRelation,
 };
 
 // The application repeatedly allocates short-lived QR storage across worker
@@ -46,8 +46,10 @@ Options:
                       Fractional IRLS tolerance (default: 0.001)
   --robust-max-iterations N
                       Maximum IRLS iterations (default: 50)
-  --confidence MODE   Confidence intervals: none or linear (default: none)
+  --confidence MODE   Confidence intervals: none, linear, or monte-carlo (default: none)
   --white-noise       Use white noise instead of colored residual bands
+  --mc-realizations N Coefficient draws for monte-carlo confidence (default: 200)
+  --mc-seed N         Reproducible unsigned 64-bit root seed (default: 0)
   --reconstruct       Write complete original-time reconstruction to the output
   --reconstruct-constituents LIST
                       Reconstruct only these fitted constituent names
@@ -152,6 +154,8 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let mut robust_max_iterations = None;
     let mut confidence_requested = None;
     let mut white_noise = false;
+    let mut monte_carlo_realizations = None;
+    let mut monte_carlo_seed = None;
     let mut reconstruct = false;
     let mut reconstruction_constituents = None;
     let mut minimum_percent_energy = None;
@@ -274,6 +278,22 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                 confidence_requested = Some(parse_confidence(&value)?);
             }
             "--white-noise" => white_noise = true,
+            "--mc-realizations" => {
+                if monte_carlo_realizations.is_some() {
+                    return Err("--mc-realizations may only be supplied once".to_owned());
+                }
+                monte_carlo_realizations = Some(parse_positive_usize(
+                    &required_value(&mut arguments, option)?,
+                    option,
+                )?);
+            }
+            "--mc-seed" => {
+                if monte_carlo_seed.is_some() {
+                    return Err("--mc-seed may only be supplied once".to_owned());
+                }
+                monte_carlo_seed =
+                    Some(parse_u64(&required_value(&mut arguments, option)?, option)?);
+            }
             "--reconstruct" => reconstruct = true,
             "--reconstruct-constituents" => {
                 if reconstruction_constituents.is_some() {
@@ -322,7 +342,12 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
         robust_tolerance,
         robust_max_iterations,
     )?;
-    let confidence_interval = resolve_confidence_interval(confidence_requested, white_noise)?;
+    let confidence_interval = resolve_confidence_interval(
+        confidence_requested,
+        white_noise,
+        monte_carlo_realizations,
+        monte_carlo_seed,
+    )?;
     if inference_approximate
         && scalar_inference_relationships.is_empty()
         && vector_inference_relationships.is_empty()
@@ -334,6 +359,15 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     } else {
         InferenceMode::Exact
     };
+    if matches!(confidence_interval, ConfidenceInterval::MonteCarlo { .. })
+        && (!scalar_inference_relationships.is_empty()
+            || !vector_inference_relationships.is_empty())
+    {
+        return Err(
+            "--confidence monte-carlo with --infer is not yet supported; use linear confidence"
+                .to_owned(),
+        );
+    }
     let reconstruction = resolve_reconstruction(
         reconstruct,
         reconstruction_constituents,
@@ -436,7 +470,7 @@ fn resolve_reconstruction(
         );
     }
     if minimum_signal_to_noise.is_some() && confidence_interval == ConfidenceInterval::None {
-        return Err("--min-snr requires --confidence linear".to_owned());
+        return Err("--min-snr requires linear or monte-carlo confidence".to_owned());
     }
     Ok(Some(match constituents {
         Some(constituents) => ReconstructionFilter::Constituents(constituents),
@@ -474,19 +508,47 @@ fn resolve_constituent_selection(
 }
 
 fn resolve_confidence_interval(
-    confidence_requested: Option<bool>,
+    confidence_requested: Option<ParsedConfidence>,
     white_noise: bool,
+    monte_carlo_realizations: Option<usize>,
+    monte_carlo_seed: Option<u64>,
 ) -> Result<ConfidenceInterval, String> {
-    if confidence_requested.unwrap_or(false) {
-        Ok(ConfidenceInterval::Linear(if white_noise {
-            LinearConfidence::White
-        } else {
-            LinearConfidence::Colored
-        }))
-    } else if white_noise {
-        Err("--white-noise requires --confidence linear".to_owned())
+    let noise = if white_noise {
+        LinearConfidence::White
     } else {
-        Ok(ConfidenceInterval::None)
+        LinearConfidence::Colored
+    };
+    match confidence_requested.unwrap_or(ParsedConfidence::None) {
+        ParsedConfidence::None => {
+            if white_noise || monte_carlo_realizations.is_some() || monte_carlo_seed.is_some() {
+                return Err(
+                    "--white-noise, --mc-realizations, and --mc-seed require an enabled --confidence mode"
+                        .to_owned(),
+                );
+            }
+            Ok(ConfidenceInterval::None)
+        }
+        ParsedConfidence::Linear => {
+            if monte_carlo_realizations.is_some() || monte_carlo_seed.is_some() {
+                return Err(
+                    "--mc-realizations and --mc-seed require --confidence monte-carlo".to_owned(),
+                );
+            }
+            Ok(ConfidenceInterval::Linear(noise))
+        }
+        ParsedConfidence::MonteCarlo => {
+            let realizations = monte_carlo_realizations.unwrap_or(200);
+            if realizations < 2 {
+                return Err("--mc-realizations requires an integer of at least 2".to_owned());
+            }
+            Ok(ConfidenceInterval::MonteCarlo {
+                options: MonteCarloOptions {
+                    realizations,
+                    seed: monte_carlo_seed.unwrap_or(0),
+                },
+                noise,
+            })
+        }
     }
 }
 
@@ -510,6 +572,14 @@ fn parse_positive_usize(value: &OsStr, option: &str) -> Result<usize, String> {
         return Err(format!("{option} requires a positive integer"));
     }
     Ok(parsed)
+}
+
+fn parse_u64(value: &OsStr, option: &str) -> Result<u64, String> {
+    let text = value
+        .to_str()
+        .ok_or_else(|| format!("{option} value must be valid UTF-8"))?;
+    text.parse::<u64>()
+        .map_err(|_| format!("{option} requires an unsigned 64-bit integer, received {text:?}"))
 }
 
 fn parse_positive_f64(value: &OsStr, option: &str) -> Result<f64, String> {
@@ -600,12 +670,20 @@ fn parse_inference_phase(value: &str) -> Result<f64, String> {
     Ok(phase)
 }
 
-fn parse_confidence(value: &OsStr) -> Result<bool, String> {
+#[derive(Clone, Copy)]
+enum ParsedConfidence {
+    None,
+    Linear,
+    MonteCarlo,
+}
+
+fn parse_confidence(value: &OsStr) -> Result<ParsedConfidence, String> {
     match value.to_str() {
-        Some("none") => Ok(false),
-        Some("linear") => Ok(true),
+        Some("none") => Ok(ParsedConfidence::None),
+        Some("linear") => Ok(ParsedConfidence::Linear),
+        Some("monte-carlo" | "mc") => Ok(ParsedConfidence::MonteCarlo),
         Some(value) => Err(format!(
-            "--confidence must be 'none' or 'linear', received {value:?}"
+            "--confidence must be 'none', 'linear', or 'monte-carlo', received {value:?}"
         )),
         None => Err("--confidence value must be valid UTF-8".to_owned()),
     }
@@ -701,7 +779,7 @@ mod tests {
         NodeSelection, ScalarInferenceConfig, VectorInferenceConfig,
     };
     use rutide_core::{
-        InferenceMode, LinearConfidence, ReconstructionFilter, RobustOptions,
+        InferenceMode, LinearConfidence, MonteCarloOptions, ReconstructionFilter, RobustOptions,
         ScalarInferenceRelation, TidalConstituent, VectorInferenceRelation,
     };
 
@@ -1027,7 +1105,60 @@ mod tests {
     }
 
     #[test]
-    fn rejects_white_noise_without_linear_confidence() {
+    fn parses_seeded_monte_carlo_and_rejects_invalid_combinations() {
+        let command = parse_arguments(args(&[
+            "analyze-vector",
+            "--input",
+            "input.nc",
+            "--output",
+            "output.nc",
+            "--confidence",
+            "monte-carlo",
+            "--white-noise",
+            "--mc-realizations",
+            "512",
+            "--mc-seed",
+            "18446744073709551615",
+        ]))
+        .expect("valid Monte Carlo options");
+        let Command::AnalyzeVector(config) = command else {
+            panic!("expected vector command");
+        };
+        assert_eq!(
+            config.confidence_interval,
+            ConfidenceInterval::MonteCarlo {
+                options: MonteCarloOptions {
+                    realizations: 512,
+                    seed: u64::MAX,
+                },
+                noise: LinearConfidence::White,
+            }
+        );
+
+        for extra in [
+            &["--confidence", "linear", "--mc-seed", "1"][..],
+            &["--confidence", "monte-carlo", "--mc-realizations", "1"][..],
+            &[
+                "--confidence",
+                "monte-carlo",
+                "--infer",
+                "S2:M2:0.3:20:0.2:10",
+            ][..],
+        ] {
+            let mut values = vec![
+                "analyze-vector",
+                "--input",
+                "input.nc",
+                "--output",
+                "output.nc",
+            ];
+            values.extend_from_slice(extra);
+            assert!(parse_arguments(args(&values)).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_white_noise_without_confidence() {
         assert!(
             parse_arguments(args(&[
                 "analyze-scalar",

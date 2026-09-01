@@ -1,5 +1,6 @@
 //! Exact corrected-basis parity against the pinned Python `UTide` oracle.
 
+use rayon::ThreadPoolBuilder;
 use rutide_core::{
     AnalysisError, GreenwichNodalBatch, GreenwichNodalOls, GreenwichNodalReconstructor,
     LinearConfidence, MonteCarloOptions, ReconstructionFilter, RobustOptions, TidalConstituent,
@@ -1448,6 +1449,71 @@ fn matches_python_utide_monte_carlo_distributions_and_is_seeded() {
             }
         }
     }
+}
+
+#[test]
+fn gappy_irregular_monte_carlo_is_reproducible_across_worker_counts() {
+    faer::set_global_parallelism(faer::Par::Seq);
+    let time = irregular_oracle_times();
+    let scalar = oracle_observations();
+    let (eastward, northward) = synthetic_vector_observations(&time);
+    let batch = GreenwichNodalBatch::prepare_modified_julian_days(&time, &CONSTITUENTS)
+        .expect("valid irregular batch");
+    let mut scalar_time_major = Vec::with_capacity(time.len() * 2);
+    let mut eastward_time_major = Vec::with_capacity(time.len() * 2);
+    let mut northward_time_major = Vec::with_capacity(time.len() * 2);
+    for time_index in 0..time.len() {
+        scalar_time_major.extend([scalar[time_index]; 2]);
+        eastward_time_major.extend([eastward[time_index]; 2]);
+        northward_time_major.extend([northward[time_index]; 2]);
+    }
+    for time_index in [137, 411] {
+        scalar_time_major[time_index * 2] = f64::NAN;
+        scalar_time_major[time_index * 2 + 1] = f64::NAN;
+        eastward_time_major[time_index * 2] = f64::NAN;
+        eastward_time_major[time_index * 2 + 1] = f64::NAN;
+    }
+    let options = MonteCarloOptions {
+        realizations: 200,
+        seed: 71,
+    };
+    let solve = |workers| {
+        ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .expect("valid worker pool")
+            .install(|| {
+                let scalar = batch
+                    .solve_time_major_with_missing_and_monte_carlo_confidence(
+                        &scalar_time_major,
+                        &[LATITUDE_DEGREES_NORTH; 2],
+                        options,
+                        LinearConfidence::Colored,
+                    )
+                    .expect("valid gappy scalar Monte Carlo batch");
+                let vector = batch
+                    .solve_vector_time_major_with_missing_and_monte_carlo_confidence(
+                        &eastward_time_major,
+                        &northward_time_major,
+                        &[LATITUDE_DEGREES_NORTH; 2],
+                        options,
+                        LinearConfidence::Colored,
+                    )
+                    .expect("valid gappy vector Monte Carlo batch");
+                (scalar, vector)
+            })
+    };
+    let single_worker = solve(1);
+    let four_workers = solve(4);
+    assert_eq!(single_worker, four_workers);
+    assert_ne!(
+        single_worker.0[0].amplitude_ci, single_worker.0[1].amplitude_ci,
+        "identical series receive independent deterministic streams"
+    );
+    assert_ne!(
+        single_worker.1[0].semi_major_ci, single_worker.1[1].semi_major_ci,
+        "identical vectors receive independent deterministic streams"
+    );
 }
 
 #[test]

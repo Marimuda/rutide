@@ -52,14 +52,16 @@ API shares latitude-independent astronomy, pre-aggregates satellite terms, and
 parallelizes the latitude-specific factorizations across spatial series. Both
 paths have real-FVCOM parity tests against the pinned Python oracle.
 
-Percent-energy diagnostics, linearized 95% amplitude/phase confidence intervals,
-CI-derived signal-to-noise ratio, per-solution PE/SNR ranking, and exact scalar
-reconstruction are available. Reconstruction supports arbitrary target times in
-the core API and an opt-in complete original-time series in the FVCOM command.
+Percent-energy diagnostics, linearized and Monte Carlo 95% amplitude/phase
+confidence intervals, CI-derived signal-to-noise ratio, per-solution PE/SNR
+ranking, and exact scalar reconstruction are available. Reconstruction supports
+arbitrary target times in the core API and an opt-in complete original-time
+series in the FVCOM command.
 Scalar `_FillValue` and `NaN` observations are omitted per series, with shared
 valid-time masks grouped before fitting. Depth-averaged vector currents now use
 the same machinery with a joint `ua`/`va` validity mask and return current
-ellipses, all four linearized ellipse confidence intervals, SNR, PE, and optional
+ellipses, all four linearized or Monte Carlo ellipse confidence intervals, SNR,
+PE, and optional
 eastward/northward reconstruction. The command-line application accepts either
 FVCOM `zeta(time, node)` or `ua(time, nele)` plus `va(time, nele)` and serializes
 the corresponding analysis, diagnostics, observation counts, per-series
@@ -70,6 +72,17 @@ missing and irregular records, colored confidence intervals, and reconstruction.
 It returns auditable weights, leverage, iteration/stopping diagnostics, robust
 scale, and OLS/final RMS residuals. Pinned-Python oracle tests cover coefficients,
 ellipses, weights, confidence intervals, and SNR.
+
+Monte Carlo confidence uses complete 2×2 scalar or 4×4 current coefficient
+covariances, including eastward/northward cross-covariance. Colored current
+noise uses the real co-spectrum from the FFT for regular records and the
+phase-shifted Lomb–Scargle cross-spectrum for irregular records. Each
+constituent's sampled amplitudes or ellipses are summarized with UTide's
+clustered-angle median absolute deviation. Non-positive-definite colored
+covariances are symmetrized, projected onto the positive-semidefinite cone, and
+nudged to a sampleable positive-definite matrix. A pinned ChaCha12 RNG and
+series/constituent-derived streams make a seed reproducible independently of
+worker scheduling; NumPy and Rust draws are not expected to be bit-identical.
 
 ## Repository layout
 
@@ -86,11 +99,14 @@ Large FVCOM data and generated benchmark results also remain outside Git.
 
 The completed compatibility surface and remaining scientific, interface, and
 resource tasks are tracked in [`ROADMAP.md`](ROADMAP.md). Irregular scalar and
-vector colored confidence use Lomb–Scargle residual spectra, robust fitting is
-complete. Scalar and coupled-vector inferred constituents now pass exact,
+vector colored confidence use Lomb–Scargle residual spectra, robust fitting and
+non-inferred Monte Carlo confidence are complete. Scalar and coupled-vector
+inferred constituents now pass exact,
 approximate, and gappy Python oracle fixtures and are exposed by the FVCOM
-commands. Their comparative benchmark is complete; robust coupled-vector
-inference is the active scientific increment.
+commands. Their comparative benchmark is complete. Monte Carlo propagation
+through inferred relationships is the remaining confidence extension; it is
+mathematically feasible but explicitly rejected until its correlated-reference
+sampling contract and tests are implemented.
 
 ## Development
 
@@ -145,6 +161,15 @@ Missing observations on an originally equidistant grid use Python-compatible
 linear interpolation of fitted residuals onto the full grid before the FFT;
 truly irregular timestamps use a Lomb–Scargle residual spectrum.
 
+Use `--confidence monte-carlo` for nonlinear coefficient-sampling intervals.
+The defaults are 200 realizations and root seed 0; override them with
+`--mc-realizations N` and `--mc-seed N`. Unlike the pinned Python `MC_n` option,
+which is ignored and always draws 200 realizations, both Rust options are
+effective. Add `--white-noise` to either confidence method to bypass residual
+band coloring. Monte Carlo works with OLS or robust fitting, regular, missing,
+and truly irregular scalar/current records. It is currently rejected together
+with `--infer` rather than silently omitting uncertainty propagation.
+
 Add `--method robust` for Python-compatible Cauchy iteratively reweighted least
 squares. Defaults are tuning constant `2.385`, fractional tolerance `0.001`, and
 50 iterations; override them with `--robust-tuning`, `--robust-tolerance`, and
@@ -174,7 +199,7 @@ FVCOM timestamp. With no filter it includes every fitted constituent. Use
 `--reconstruct-constituents M2,S2,K1` for an explicit subset, or diagnostic
 thresholds such as `--min-pe 1 --min-snr 2`. PE and SNR thresholds are inclusive
 and combine with logical AND; explicit names are the alternative selection mode,
-matching Python UTide. `--min-snr` requires `--confidence linear`, while PE-only
+matching Python UTide. `--min-snr` requires an enabled confidence method, while PE-only
 filtering does not. For example:
 
 ```console
@@ -240,6 +265,11 @@ rescaling: the eastward coefficient pair retains the white estimate while the
 northward pair uses its colored residual band. White and colored intervals support
 regular timestamps, gaps on an originally regular grid, and truly irregular
 timestamps; the last use a Lomb–Scargle residual spectrum.
+
+Monte Carlo current intervals instead use the complete 4×4 covariance and the
+eastward/northward co-spectrum, as Python UTide intends for its nonlinear path.
+This yields joint semi-major, signed semi-minor, inclination, and phase
+realizations rather than independently linearizing the two components.
 
 Vector inference uses separate positive- and negative-rotary constraints:
 `--infer INFERRED:REFERENCE:AMP+:PHASE+:AMP-:PHASE-`. It supports exact or

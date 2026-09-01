@@ -361,6 +361,23 @@ impl FixedRawOls {
         monte_carlo_options: MonteCarloOptions,
         noise: LinearConfidence,
     ) -> Result<ScalarSolution, AnalysisError> {
+        self.solve_robust_with_monte_carlo_confidence_from_stream(
+            observations,
+            robust_options,
+            monte_carlo_options,
+            noise,
+            0,
+        )
+    }
+
+    pub(crate) fn solve_robust_with_monte_carlo_confidence_from_stream(
+        &self,
+        observations: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+        stream: u64,
+    ) -> Result<ScalarSolution, AnalysisError> {
         monte_carlo_options.validate()?;
         let observation_matrix = self.observation_matrix(observations, 1)?;
         let fit = self.robust_fit(&observation_matrix, robust_options)?;
@@ -380,7 +397,7 @@ impl FixedRawOls {
             &mut solution,
             &covariances,
             monte_carlo_options,
-            0,
+            stream,
         )?;
         Ok(solution)
     }

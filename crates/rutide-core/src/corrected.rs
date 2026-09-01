@@ -29,6 +29,113 @@ use crate::{
 const MIN_SHARED_LOMB_SERIES: usize = 16;
 const MAX_SHARED_LOMB_PLANS_PER_BATCH: usize = 4;
 
+#[derive(Clone, Copy)]
+enum BatchConfidence {
+    Linear(LinearConfidence),
+    MonteCarlo {
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+    },
+}
+
+impl BatchConfidence {
+    const fn noise(self) -> LinearConfidence {
+        match self {
+            Self::Linear(noise) | Self::MonteCarlo { noise, .. } => noise,
+        }
+    }
+}
+
+fn solve_scalar_with_batch_confidence(
+    model: &FixedRawOls,
+    observations: &[f64],
+    robust: Option<RobustOptions>,
+    confidence: Option<BatchConfidence>,
+    stream: u64,
+) -> Result<ScalarSolution, AnalysisError> {
+    match (robust, confidence) {
+        (Some(options), Some(BatchConfidence::Linear(noise))) => {
+            model.solve_robust_with_linear_confidence(observations, options, noise)
+        }
+        (Some(robust_options), Some(BatchConfidence::MonteCarlo { options, noise })) => model
+            .solve_robust_with_monte_carlo_confidence_from_stream(
+                observations,
+                robust_options,
+                options,
+                noise,
+                stream,
+            ),
+        (Some(options), None) => model.solve_robust(observations, options),
+        (None, Some(BatchConfidence::Linear(noise))) => {
+            model.solve_with_linear_confidence(observations, noise)
+        }
+        (None, Some(BatchConfidence::MonteCarlo { options, noise })) => model
+            .solve_many_time_major_with_monte_carlo_confidence_from_stream(
+                observations,
+                1,
+                options,
+                noise,
+                stream,
+            )?
+            .pop()
+            .ok_or(AnalysisError::EmptySeries),
+        (None, None) => model.solve(observations),
+    }
+}
+
+fn solve_vector_with_batch_confidence(
+    model: &FixedRawOls,
+    observations: &[f64],
+    robust: Option<RobustOptions>,
+    confidence: Option<BatchConfidence>,
+    stream: u64,
+) -> Result<VectorSolution, AnalysisError> {
+    match (robust, confidence) {
+        (Some(options), Some(BatchConfidence::Linear(noise))) => {
+            let mut components = model.solve_two_component_robust_with_linear_confidence(
+                observations,
+                options,
+                noise,
+            )?;
+            let northward = components.pop().expect("two requested component solutions");
+            let eastward = components.pop().expect("two requested component solutions");
+            from_component_solutions(&eastward, &northward)
+        }
+        (Some(robust_options), Some(BatchConfidence::MonteCarlo { options, noise })) => model
+            .solve_vector_robust_with_monte_carlo_confidence(
+                observations,
+                robust_options,
+                options,
+                noise,
+                stream,
+            ),
+        (Some(options), None) => {
+            let mut components = model.solve_two_component_robust(observations, options)?;
+            let northward = components.pop().expect("two requested component solutions");
+            let eastward = components.pop().expect("two requested component solutions");
+            from_component_solutions(&eastward, &northward)
+        }
+        (None, Some(BatchConfidence::Linear(noise))) => {
+            let mut components = model.solve_many_time_major_with_linear_confidence_by_series(
+                observations,
+                &[LinearConfidence::White, noise],
+            )?;
+            let northward = components.pop().expect("two requested component solutions");
+            let eastward = components.pop().expect("two requested component solutions");
+            from_component_solutions(&eastward, &northward)
+        }
+        (None, Some(BatchConfidence::MonteCarlo { options, noise })) => {
+            model.solve_vector_with_monte_carlo_confidence(observations, options, noise, stream)
+        }
+        (None, None) => {
+            let mut components = model.solve_many_time_major(observations, 2)?;
+            let northward = components.pop().expect("two requested component solutions");
+            let eastward = components.pop().expect("two requested component solutions");
+            from_component_solutions(&eastward, &northward)
+        }
+    }
+}
+
 fn shared_lomb_plan_groups(record_use_count: &[usize]) -> Vec<bool> {
     let mut candidates = record_use_count
         .iter()
@@ -2634,7 +2741,36 @@ impl GreenwichNodalBatch {
         latitudes: &[f64],
         noise: LinearConfidence,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_impl(observations, latitudes, Some(noise), None)
+        self.solve_time_major_impl(
+            observations,
+            latitudes,
+            Some(BatchConfidence::Linear(noise)),
+            None,
+        )
+    }
+
+    /// Fit varying-latitude series with nonlinear Monte Carlo intervals.
+    ///
+    /// The root seed is split deterministically by series index, so results do
+    /// not depend on Rayon's worker count or scheduling order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input, options, or covariance.
+    pub fn solve_time_major_with_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        options.validate()?;
+        self.solve_time_major_impl(
+            observations,
+            latitudes,
+            Some(BatchConfidence::MonteCarlo { options, noise }),
+            None,
+        )
     }
 
     /// Robustly fit varying-latitude complete scalar series in parallel.
@@ -2663,7 +2799,38 @@ impl GreenwichNodalBatch {
         options: RobustOptions,
         noise: LinearConfidence,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_impl(observations, latitudes, Some(noise), Some(options))
+        self.solve_time_major_impl(
+            observations,
+            latitudes,
+            Some(BatchConfidence::Linear(noise)),
+            Some(options),
+        )
+    }
+
+    /// Robustly fit complete scalar series with Monte Carlo intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input, robust fitting failure,
+    /// invalid Monte Carlo options, or covariance failure.
+    pub fn solve_time_major_robust_with_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        monte_carlo_options.validate()?;
+        self.solve_time_major_impl(
+            observations,
+            latitudes,
+            Some(BatchConfidence::MonteCarlo {
+                options: monte_carlo_options,
+                noise,
+            }),
+            Some(robust_options),
+        )
     }
 
     /// Fit scalar series while treating `NaN` observations as missing.
@@ -2699,7 +2866,34 @@ impl GreenwichNodalBatch {
         latitudes: &[f64],
         noise: LinearConfidence,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_with_missing_impl(observations, latitudes, Some(noise), None)
+        self.solve_time_major_with_missing_impl(
+            observations,
+            latitudes,
+            Some(BatchConfidence::Linear(noise)),
+            None,
+        )
+    }
+
+    /// Fit gappy scalar series with Monte Carlo confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input, underdetermined records,
+    /// invalid Monte Carlo options, or covariance failure.
+    pub fn solve_time_major_with_missing_and_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        options.validate()?;
+        self.solve_time_major_with_missing_impl(
+            observations,
+            latitudes,
+            Some(BatchConfidence::MonteCarlo { options, noise }),
+            None,
+        )
     }
 
     /// Robustly fit scalar series while treating `NaN` observations as missing.
@@ -2728,7 +2922,38 @@ impl GreenwichNodalBatch {
         options: RobustOptions,
         noise: LinearConfidence,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_with_missing_impl(observations, latitudes, Some(noise), Some(options))
+        self.solve_time_major_with_missing_impl(
+            observations,
+            latitudes,
+            Some(BatchConfidence::Linear(noise)),
+            Some(options),
+        )
+    }
+
+    /// Robustly fit gappy scalar series with Monte Carlo confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input, robust fitting failure,
+    /// invalid Monte Carlo options, or covariance failure.
+    pub fn solve_time_major_with_missing_robust_and_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        monte_carlo_options.validate()?;
+        self.solve_time_major_with_missing_impl(
+            observations,
+            latitudes,
+            Some(BatchConfidence::MonteCarlo {
+                options: monte_carlo_options,
+                noise,
+            }),
+            Some(robust_options),
+        )
     }
 
     /// Jointly fit possibly gappy eastward/northward current series.
@@ -2765,7 +2990,31 @@ impl GreenwichNodalBatch {
             eastward,
             northward,
             latitudes,
-            Some(noise),
+            Some(BatchConfidence::Linear(noise)),
+            None,
+        )
+    }
+
+    /// Jointly fit gappy currents with Monte Carlo ellipse intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input, underdetermined records,
+    /// invalid Monte Carlo options, or covariance failure.
+    pub fn solve_vector_time_major_with_missing_and_monte_carlo_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        options.validate()?;
+        self.solve_vector_time_major_with_missing_impl(
+            eastward,
+            northward,
+            latitudes,
+            Some(BatchConfidence::MonteCarlo { options, noise }),
             None,
         )
     }
@@ -2791,6 +3040,34 @@ impl GreenwichNodalBatch {
         )
     }
 
+    /// Robustly fit gappy currents with Monte Carlo ellipse intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input, robust fitting failure,
+    /// invalid Monte Carlo options, or covariance failure.
+    pub fn solve_vector_time_major_with_missing_robust_and_monte_carlo_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        monte_carlo_options.validate()?;
+        self.solve_vector_time_major_with_missing_impl(
+            eastward,
+            northward,
+            latitudes,
+            Some(BatchConfidence::MonteCarlo {
+                options: monte_carlo_options,
+                noise,
+            }),
+            Some(robust_options),
+        )
+    }
+
     /// Robustly fit gappy currents with linearized ellipse confidence intervals.
     ///
     /// # Errors
@@ -2808,7 +3085,7 @@ impl GreenwichNodalBatch {
             eastward,
             northward,
             latitudes,
-            Some(noise),
+            Some(BatchConfidence::Linear(noise)),
             Some(options),
         )
     }
@@ -2818,7 +3095,7 @@ impl GreenwichNodalBatch {
         eastward: &[f64],
         northward: &[f64],
         latitudes: &[f64],
-        confidence: Option<LinearConfidence>,
+        confidence: Option<BatchConfidence>,
         robust: Option<RobustOptions>,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
         validate_batch_shape_and_latitudes(self.time_count(), eastward, latitudes)?;
@@ -2867,7 +3144,7 @@ impl GreenwichNodalBatch {
             .zip(shared_lomb_plans)
             .map(|(positions, share_plan)| self.basis.record_subset(positions, share_plan))
             .collect::<Result<Vec<_>, _>>()?;
-        if confidence == Some(LinearConfidence::Colored) {
+        if confidence.is_some_and(|confidence| confidence.noise() == LinearConfidence::Colored) {
             for record in &records {
                 record
                     .confidence_sampling
@@ -2887,30 +3164,13 @@ impl GreenwichNodalBatch {
                     component_values.push(eastward[time * series_count + series]);
                     component_values.push(northward[time * series_count + series]);
                 }
-                let mut components = if let Some(options) = robust {
-                    match confidence {
-                        Some(noise) => model.solve_two_component_robust_with_linear_confidence(
-                            &component_values,
-                            options,
-                            noise,
-                        )?,
-                        None => model.solve_two_component_robust(&component_values, options)?,
-                    }
-                } else {
-                    match confidence {
-                        // Match Python UTide's asymmetric 2-D colored linear CI:
-                        // eastward remains white while northward is colored.
-                        Some(noise) => model
-                            .solve_many_time_major_with_linear_confidence_by_series(
-                                &component_values,
-                                &[LinearConfidence::White, noise],
-                            )?,
-                        None => model.solve_many_time_major(&component_values, 2)?,
-                    }
-                };
-                let northward = components.pop().expect("two requested component solutions");
-                let eastward = components.pop().expect("two requested component solutions");
-                from_component_solutions(&eastward, &northward)
+                solve_vector_with_batch_confidence(
+                    &model,
+                    &component_values,
+                    robust,
+                    confidence,
+                    u64::try_from(series).expect("series index is representable as u64"),
+                )
             })
             .collect()
     }
@@ -2919,7 +3179,7 @@ impl GreenwichNodalBatch {
         &self,
         observations: &[f64],
         latitudes: &[f64],
-        confidence: Option<LinearConfidence>,
+        confidence: Option<BatchConfidence>,
         robust: Option<RobustOptions>,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         validate_batch_shape_and_latitudes(self.time_count(), observations, latitudes)?;
@@ -2962,7 +3222,7 @@ impl GreenwichNodalBatch {
             .zip(shared_lomb_plans)
             .map(|(positions, share_plan)| self.basis.record_subset(positions, share_plan))
             .collect::<Result<Vec<_>, _>>()?;
-        if confidence == Some(LinearConfidence::Colored) {
+        if confidence.is_some_and(|confidence| confidence.noise() == LinearConfidence::Colored) {
             for record in &records {
                 record
                     .confidence_sampling
@@ -2983,23 +3243,13 @@ impl GreenwichNodalBatch {
                     .copied()
                     .map(|time| observations[time * series_count + series])
                     .collect::<Vec<_>>();
-                if let Some(options) = robust {
-                    match confidence {
-                        Some(noise) => model.solve_robust_with_linear_confidence(
-                            &series_observations,
-                            options,
-                            noise,
-                        ),
-                        None => model.solve_robust(&series_observations, options),
-                    }
-                } else {
-                    match confidence {
-                        Some(noise) => {
-                            model.solve_with_linear_confidence(&series_observations, noise)
-                        }
-                        None => model.solve(&series_observations),
-                    }
-                }
+                solve_scalar_with_batch_confidence(
+                    &model,
+                    &series_observations,
+                    robust,
+                    confidence,
+                    u64::try_from(series).expect("series index is representable as u64"),
+                )
             })
             .collect()
     }
@@ -3008,7 +3258,7 @@ impl GreenwichNodalBatch {
         &self,
         observations: &[f64],
         latitudes: &[f64],
-        confidence: Option<LinearConfidence>,
+        confidence: Option<BatchConfidence>,
         robust: Option<RobustOptions>,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         validate_batch_shape_and_latitudes(self.time_count(), observations, latitudes)?;
@@ -3026,7 +3276,7 @@ impl GreenwichNodalBatch {
         let record = self
             .basis
             .record_subset(positions, series_count >= MIN_SHARED_LOMB_SERIES)?;
-        if confidence == Some(LinearConfidence::Colored) {
+        if confidence.is_some_and(|confidence| confidence.noise() == LinearConfidence::Colored) {
             record
                 .confidence_sampling
                 .precompute_shared_irregular_plan();
@@ -3042,23 +3292,13 @@ impl GreenwichNodalBatch {
                 for time in 0..self.time_count() {
                     series_observations.push(observations[time * series_count + series]);
                 }
-                if let Some(options) = robust {
-                    match confidence {
-                        Some(noise) => model.solve_robust_with_linear_confidence(
-                            &series_observations,
-                            options,
-                            noise,
-                        ),
-                        None => model.solve_robust(&series_observations, options),
-                    }
-                } else {
-                    match confidence {
-                        Some(noise) => {
-                            model.solve_with_linear_confidence(&series_observations, noise)
-                        }
-                        None => model.solve(&series_observations),
-                    }
-                }
+                solve_scalar_with_batch_confidence(
+                    &model,
+                    &series_observations,
+                    robust,
+                    confidence,
+                    u64::try_from(series).expect("series index is representable as u64"),
+                )
             })
             .collect()
     }

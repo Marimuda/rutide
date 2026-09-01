@@ -1,6 +1,7 @@
 //! Deterministic small-matrix sampling for nonlinear confidence intervals.
 
-use rand::{SeedableRng, rngs::StdRng};
+use rand::SeedableRng;
+use rand_chacha::ChaCha12Rng;
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::{AnalysisError, vector::ellipse_parameters};
@@ -126,7 +127,7 @@ fn multivariate_samples<const DIMENSION: usize>(
 ) -> Option<Vec<[f64; DIMENSION]>> {
     let covariance = nearest_positive_definite(covariance)?;
     let cholesky = cholesky(covariance)?;
-    let mut random = StdRng::seed_from_u64(derived_seed(options.seed, stream));
+    let mut random = ChaCha12Rng::seed_from_u64(derived_seed(options.seed, stream));
     let normal = StandardNormal;
     let mut output = Vec::with_capacity(options.realizations);
     for _ in 0..options.realizations {

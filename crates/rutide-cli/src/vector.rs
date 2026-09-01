@@ -29,7 +29,7 @@ use super::{
     write_json_report, write_robust_schema_metadata, write_variable,
 };
 
-const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 3;
+const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 4;
 
 /// Configuration for one depth-averaged FVCOM current analysis.
 #[derive(Clone, Debug, PartialEq)]
@@ -46,7 +46,7 @@ pub struct VectorAnalyzeConfig {
     pub constituent_selection: ConstituentSelection,
     /// Optional constrained positive/negative rotary inferred constituents.
     pub inference: Option<VectorInferenceConfig>,
-    /// Optional linearized ellipse intervals and their noise model.
+    /// Optional linearized or Monte Carlo ellipse intervals and noise model.
     pub confidence_interval: ConfidenceInterval,
     /// Ordinary or Cauchy robust least squares.
     pub analysis_method: AnalysisMethod,
@@ -75,16 +75,16 @@ pub struct VectorSampleResult {
     pub phase_degrees: Vec<f64>,
     /// Percent ellipse energy in constituent order.
     pub percent_energy: Vec<f64>,
-    /// Linearized semi-major 95% confidence half-widths.
+    /// Semi-major 95% confidence half-widths.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semi_major_ci: Option<Vec<f64>>,
-    /// Linearized semi-minor 95% confidence half-widths.
+    /// Semi-minor 95% confidence half-widths.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semi_minor_ci: Option<Vec<f64>>,
-    /// Linearized inclination 95% confidence half-widths in degrees.
+    /// Inclination 95% confidence half-widths in degrees.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inclination_ci_degrees: Option<Vec<f64>>,
-    /// Linearized phase 95% confidence half-widths in degrees.
+    /// Phase 95% confidence half-widths in degrees.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase_ci_degrees: Option<Vec<f64>>,
     /// Ellipse-energy signal-to-noise ratios.
@@ -141,10 +141,16 @@ pub struct VectorRunReport {
     pub constituent_selection: ConstituentSelectionReport,
     /// Inference configuration when inferred constituents are enabled.
     pub inference: Option<InferenceReport>,
-    /// Confidence method: `none` or `linear`.
+    /// Confidence method: `none`, `linear`, or `monte-carlo`.
     pub confidence_interval: &'static str,
     /// Residual-noise model when confidence intervals are enabled.
     pub confidence_noise: Option<&'static str>,
+    /// Number of coefficient realizations for Monte Carlo confidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monte_carlo_realizations: Option<usize>,
+    /// Root random seed for Monte Carlo confidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monte_carlo_seed: Option<u64>,
     /// Complete-series reconstruction configuration, when enabled.
     pub reconstruction: Option<ReconstructionReport>,
     /// Constituent names in coefficient order.
@@ -297,6 +303,14 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                         &input.latitudes,
                         noise,
                     ),
+                (AnalysisMethod::Ols, ConfidenceInterval::MonteCarlo { options, noise }) => batch
+                    .solve_vector_time_major_with_missing_and_monte_carlo_confidence(
+                        &input.eastward,
+                        &input.northward,
+                        &input.latitudes,
+                        options,
+                        noise,
+                    ),
                 (AnalysisMethod::Robust(options), ConfidenceInterval::None) => batch
                     .solve_vector_time_major_with_missing_robust(
                         &input.eastward,
@@ -312,6 +326,20 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                         options,
                         noise,
                     ),
+                (
+                    AnalysisMethod::Robust(robust_options),
+                    ConfidenceInterval::MonteCarlo {
+                        options: monte_carlo_options,
+                        noise,
+                    },
+                ) => batch.solve_vector_time_major_with_missing_robust_and_monte_carlo_confidence(
+                    &input.eastward,
+                    &input.northward,
+                    &input.latitudes,
+                    robust_options,
+                    monte_carlo_options,
+                    noise,
+                ),
             }
         }
         VectorAnalysisBatch::Inferred(batch) => {
@@ -344,6 +372,9 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                         options,
                         noise,
                     ),
+                (_, ConfidenceInterval::MonteCarlo { .. }) => {
+                    Err(AnalysisError::UnsupportedMonteCarloInference)
+                }
             }
         }
     })?;
@@ -447,6 +478,14 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         inference: config.inference.as_ref().map(VectorInferenceConfig::report),
         confidence_interval: config.confidence_interval.method(),
         confidence_noise: config.confidence_interval.noise(),
+        monte_carlo_realizations: config
+            .confidence_interval
+            .monte_carlo_options()
+            .map(|options| options.realizations),
+        monte_carlo_seed: config
+            .confidence_interval
+            .monte_carlo_options()
+            .map(|options| options.seed),
         reconstruction: config
             .reconstruction
             .as_ref()
@@ -503,6 +542,16 @@ fn validate_vector_config(config: &VectorAnalyzeConfig) -> Result<(), AppError> 
     {
         return Err(AppError::Invalid(
             "inference requires at least one relationship".to_owned(),
+        ));
+    }
+    if config.inference.is_some()
+        && matches!(
+            config.confidence_interval,
+            ConfidenceInterval::MonteCarlo { .. }
+        )
+    {
+        return Err(AppError::Invalid(
+            "Monte Carlo confidence with inferred constituents is not yet supported".to_owned(),
         ));
     }
     Ok(())
@@ -747,7 +796,7 @@ fn vector_confidence_values(
     ) {
         (ConfidenceInterval::None, None, None, None, None, None) => Ok(None),
         (
-            ConfidenceInterval::Linear(_),
+            ConfidenceInterval::Linear(_) | ConfidenceInterval::MonteCarlo { .. },
             Some(major),
             Some(minor),
             Some(theta),
@@ -762,6 +811,7 @@ fn vector_confidence_values(
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the canonical digest keeps every result-shaping input explicit"
 )]
 fn vector_result_digest(
@@ -776,7 +826,7 @@ fn vector_result_digest(
     reconstruction: Option<(&ReconstructionFilter, &[VectorReconstruction])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-vector-greenwich-nodal-v3\0");
+    digest.update(b"rutide-vector-greenwich-nodal-v4\0");
     digest.update(analysis_method.name().as_bytes());
     if let AnalysisMethod::Robust(options) = analysis_method {
         digest.update(options.tuning_constant.to_bits().to_le_bytes());
@@ -792,6 +842,16 @@ fn vector_result_digest(
     digest.update([0]);
     if let Some(noise) = confidence_interval.noise() {
         digest.update(noise.as_bytes());
+    }
+    if let Some(options) = confidence_interval.monte_carlo_options() {
+        digest.update(
+            u64::try_from(options.realizations)
+                .map_err(|_| {
+                    AppError::Invalid("Monte Carlo realization count exceeds u64".to_owned())
+                })?
+                .to_le_bytes(),
+        );
+        digest.update(options.seed.to_le_bytes());
     }
     digest.update([0]);
     update_inference_digest(&mut digest, inference);
@@ -984,6 +1044,16 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
     output.add_attribute("confidence_interval", data.confidence_interval.method())?;
     if let Some(noise) = data.confidence_interval.noise() {
         output.add_attribute("confidence_noise", noise)?;
+    }
+    if let Some(options) = data.confidence_interval.monte_carlo_options() {
+        output.add_attribute(
+            "monte_carlo_realizations",
+            u64::try_from(options.realizations).map_err(|_| {
+                AppError::Invalid("Monte Carlo realization count exceeds u64".to_owned())
+            })?,
+        )?;
+        output.add_attribute("monte_carlo_seed", options.seed)?;
+        output.add_attribute("monte_carlo_rng", "rand_chacha-0.9-ChaCha12Rng")?;
     }
     output.add_attribute("constituent_selection", data.selection.report.method)?;
     if let Some(value) = data.selection.report.rayleigh_min {
@@ -1345,8 +1415,8 @@ mod tests {
     use std::fs;
 
     use rutide_core::{
-        InferenceMode, LinearConfidence, ReconstructionFilter, RobustOptions, TidalConstituent,
-        VectorInferenceRelation,
+        InferenceMode, LinearConfidence, MonteCarloOptions, ReconstructionFilter, RobustOptions,
+        TidalConstituent, VectorInferenceRelation,
     };
 
     use super::{
@@ -1445,7 +1515,13 @@ mod tests {
                 TidalConstituent::K1,
             ]),
             inference: None,
-            confidence_interval: ConfidenceInterval::Linear(LinearConfidence::White),
+            confidence_interval: ConfidenceInterval::MonteCarlo {
+                options: MonteCarloOptions {
+                    realizations: 64,
+                    seed: 42,
+                },
+                noise: LinearConfidence::White,
+            },
             analysis_method: AnalysisMethod::Robust(RobustOptions {
                 tolerance: 0.01,
                 ..RobustOptions::default()
@@ -1458,7 +1534,26 @@ mod tests {
         assert_eq!(report.series_count, 2);
         assert_eq!(report.series_with_missing_observations, 2);
         assert_eq!(report.analysis_method, "robust");
+        assert_eq!(report.confidence_interval, "monte-carlo");
+        assert_eq!(report.monte_carlo_realizations, Some(64));
+        assert_eq!(report.monte_carlo_seed, Some(42));
         let output = netcdf::open(&output_path).expect("open vector output");
+        assert_eq!(
+            output
+                .attribute("monte_carlo_realizations")
+                .expect("Monte Carlo realization metadata")
+                .value()
+                .expect("read realization metadata"),
+            netcdf::AttributeValue::Ulonglong(64)
+        );
+        assert_eq!(
+            output
+                .attribute("monte_carlo_seed")
+                .expect("Monte Carlo seed metadata")
+                .value()
+                .expect("read seed metadata"),
+            netcdf::AttributeValue::Ulonglong(42)
+        );
         assert_eq!(
             output
                 .variable("observation_count")
