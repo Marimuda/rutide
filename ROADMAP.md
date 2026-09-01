@@ -147,7 +147,7 @@ mode is 69.30–86.55x faster at 16 workers. These measurements predate the robu
 coupled-vector implementation; robust inference performance has not yet been
 benchmarked separately.
 
-## 4. Monte Carlo confidence intervals — implementation complete; benchmark next
+## 4. Monte Carlo confidence intervals — non-inferred implementation complete
 
 - Complete 2×2 scalar and 4×4 vector coefficient covariances are sampled for OLS
   and final-weight Cauchy robust fits.
@@ -178,9 +178,14 @@ ordinary/reference coefficient jointly, apply exact or approximate inference
 relations to every realization, and retain reference/inferred correlation before
 forming amplitudes or ellipses. Python UTide does not implement that path. RUTide
 currently rejects the combination explicitly; implementing and validating this
-extension is the remaining scientific subtask. A dedicated performance snapshot
-for regular FVCOM, irregular Lomb–Scargle, and robust Monte Carlo profiles is the
-remaining acceptance task before this section becomes fully complete.
+extension is the remaining scientific subtask.
+
+The dedicated
+`benchmarks/results/monte-carlo-confidence-2026-09-01.md` snapshot covers
+regular robust and irregular/gappy OLS scalar/vector workloads. On matched
+200-realization comparisons, RUTide is 17.24–61.09x faster than pinned Python on
+one worker and 10.80–35.08x faster at 16 workers. This closes the performance
+acceptance task for the supported non-inferred surface.
 
 ## 5. Solver-option parity — planned
 

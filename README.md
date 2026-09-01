@@ -44,6 +44,11 @@ on the 100-series matrix and 71.93–140.44x faster in retained 1,000-series run
 the report documents significant host contention and the CPU-affinity controls
 used to exclude contaminated measurements.
 
+The [Monte Carlo confidence snapshot](benchmarks/results/monte-carlo-confidence-2026-09-01.md)
+records complete scalar/vector covariance sampling on irregular OLS and regular
+robust profiles. RUTide is 17.24–61.09x faster on one worker and 10.80–35.08x
+faster at 16 workers for the matched 200-realization workloads.
+
 The implemented scalar kernels now cover fixed-constituent OLS with mean and
 trend in both raw-phase mode and exact Greenwich/nodal mode. The exact-correction
 catalog contains all 146 constituents, 162 satellite corrections, and 251
