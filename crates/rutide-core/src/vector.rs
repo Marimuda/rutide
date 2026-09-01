@@ -2,7 +2,7 @@
 
 use std::f64::consts::PI;
 
-use crate::{AnalysisError, ScalarSolution};
+use crate::{AnalysisError, RobustDiagnostics, ScalarSolution};
 
 /// Harmonic current ellipses derived from joint eastward/northward OLS fits.
 #[derive(Clone, Debug, PartialEq)]
@@ -37,6 +37,8 @@ pub struct VectorSolution {
     pub northward_slope_per_day: f64,
     /// Epoch at which both means are defined, in fit-day coordinates.
     pub reference_time_days: f64,
+    /// Shared iteration and weight diagnostics for a joint robust vector fit.
+    pub robust: Option<RobustDiagnostics>,
 }
 
 /// Eastward and northward current reconstructed at a shared set of timestamps.
@@ -91,6 +93,7 @@ impl VectorSolution {
                 self.eastward_mean,
                 self.eastward_slope_per_day,
                 self.reference_time_days,
+                self.robust.clone(),
             ),
             component_solution(
                 northward_cosine,
@@ -100,6 +103,7 @@ impl VectorSolution {
                 self.northward_mean,
                 self.northward_slope_per_day,
                 self.reference_time_days,
+                self.robust.clone(),
             ),
         )
     }
@@ -179,6 +183,17 @@ pub(crate) fn from_component_solutions(
             }
             None => (None, None, None, None, None),
         };
+    let robust = match (&eastward.robust, &northward.robust) {
+        (None, None) => None,
+        (Some(eastward), Some(northward)) if eastward == northward => Some(eastward.clone()),
+        _ => {
+            return Err(AnalysisError::InvalidSolutionShape {
+                field: "vector robust diagnostics",
+                actual: 1,
+                expected: 2,
+            });
+        }
+    };
 
     Ok(VectorSolution {
         semi_major,
@@ -196,6 +211,7 @@ pub(crate) fn from_component_solutions(
         eastward_slope_per_day: eastward.slope_per_day,
         northward_slope_per_day: northward.slope_per_day,
         reference_time_days: eastward.reference_time_days,
+        robust,
     })
 }
 
@@ -393,6 +409,10 @@ fn angular_sigma(
     weighted_sigma(derivatives.map(|value| value * scale), variances) * 180.0 / PI
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "component reconstruction carries coefficients, diagnostics, mean, trend, and epoch"
+)]
 fn component_solution(
     cosine_coefficient: Vec<f64>,
     sine_coefficient: Vec<f64>,
@@ -401,6 +421,7 @@ fn component_solution(
     mean: f64,
     slope_per_day: f64,
     reference_time_days: f64,
+    robust: Option<RobustDiagnostics>,
 ) -> ScalarSolution {
     let amplitude = cosine_coefficient
         .iter()
@@ -426,6 +447,7 @@ fn component_solution(
         mean,
         slope_per_day,
         reference_time_days,
+        robust,
     }
 }
 

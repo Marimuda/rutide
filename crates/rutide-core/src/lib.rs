@@ -8,6 +8,7 @@ mod astronomy;
 mod catalog;
 mod corrected;
 mod error;
+mod robust;
 mod scalar;
 mod selection;
 mod vector;
@@ -20,6 +21,7 @@ pub use corrected::{
     GreenwichNodalBatch, GreenwichNodalOls, GreenwichNodalReconstructor, ReconstructionFilter,
 };
 pub use error::AnalysisError;
+pub use robust::{RobustDiagnostics, RobustOptions, RobustTermination};
 pub use scalar::{Constituent, FixedRawOls, LinearConfidence, ScalarSolution};
 pub use selection::{RayleighSelection, select_constituents_by_rayleigh};
 pub use vector::{VectorReconstruction, VectorSolution};

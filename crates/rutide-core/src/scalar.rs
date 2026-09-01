@@ -15,7 +15,10 @@ use faer::{
 use rayon::prelude::*;
 use rustfft::{Fft, FftPlanner, num_complex::Complex};
 
-use crate::AnalysisError;
+use crate::{
+    AnalysisError, RobustDiagnostics, RobustOptions,
+    robust::{RobustFit, fit as robust_fit},
+};
 
 /// A named tidal constituent with a fixed frequency.
 #[derive(Clone, Debug, PartialEq)]
@@ -96,6 +99,8 @@ pub struct ScalarSolution {
     pub slope_per_day: f64,
     /// Epoch at which `mean` is defined, in the same day coordinate as the fit.
     pub reference_time_days: f64,
+    /// Iteration, weight, leverage, scale, and residual diagnostics for robust fits.
+    pub robust: Option<RobustDiagnostics>,
 }
 
 impl ScalarSolution {
@@ -258,6 +263,69 @@ impl FixedRawOls {
         solutions.pop().ok_or(AnalysisError::EmptySeries)
     }
 
+    /// Fit one series with Cauchy iteratively reweighted least squares.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid observations or robust options,
+    /// degenerate residual scale, invalid leverage, or non-convergence.
+    pub fn solve_robust(
+        &self,
+        observations: &[f64],
+        options: RobustOptions,
+    ) -> Result<ScalarSolution, AnalysisError> {
+        let observations = self.observation_matrix(observations, 1)?;
+        let fit = robust_fit(&self.design, &observations, options)?;
+        Ok(self.robust_component_solution(&fit, observations.as_ref(), 0, None))
+    }
+
+    /// Robustly fit one series with linearized confidence intervals and SNR.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input or robust fitting failure.
+    pub fn solve_robust_with_linear_confidence(
+        &self,
+        observations: &[f64],
+        options: RobustOptions,
+        noise: LinearConfidence,
+    ) -> Result<ScalarSolution, AnalysisError> {
+        let observations = self.observation_matrix(observations, 1)?;
+        let fit = robust_fit(&self.design, &observations, options)?;
+        Ok(self.robust_component_solution(&fit, observations.as_ref(), 0, Some(noise)))
+    }
+
+    pub(crate) fn solve_two_component_robust(
+        &self,
+        observations: &[f64],
+        options: RobustOptions,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        let observations = self.observation_matrix(observations, 2)?;
+        let fit = robust_fit(&self.design, &observations, options)?;
+        Ok((0..2)
+            .map(|component| {
+                self.robust_component_solution(&fit, observations.as_ref(), component, None)
+            })
+            .collect())
+    }
+
+    pub(crate) fn solve_two_component_robust_with_linear_confidence(
+        &self,
+        observations: &[f64],
+        options: RobustOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        let observations = self.observation_matrix(observations, 2)?;
+        let fit = robust_fit(&self.design, &observations, options)?;
+        Ok([LinearConfidence::White, noise]
+            .into_iter()
+            .enumerate()
+            .map(|(component, noise)| {
+                self.robust_component_solution(&fit, observations.as_ref(), component, Some(noise))
+            })
+            .collect())
+    }
+
     /// Fit several complete scalar series stored in time-major order.
     ///
     /// `observations[time * series_count + series]` is the value for one time and
@@ -334,7 +402,7 @@ impl FixedRawOls {
         let harmonic_columns = self.constituents.len() * 2;
         let variance_weights = confidence
             .is_enabled()
-            .then(|| self.linear_variance_weights());
+            .then(|| self.linear_variance_weights(None));
 
         Ok((0..series_count)
             .map(|series| {
@@ -371,6 +439,7 @@ impl FixedRawOls {
                         coefficients.as_ref(),
                         variance_weights,
                         noise,
+                        None,
                     );
                     let signal_to_noise = amplitude
                         .iter()
@@ -402,16 +471,127 @@ impl FixedRawOls {
                     slope_per_day: coefficients[(harmonic_columns + 1, series)]
                         / self.time_span_days,
                     reference_time_days: self.reference_time_days,
+                    robust: None,
                 }
             })
             .collect())
     }
 
-    fn linear_variance_weights(&self) -> Vec<f64> {
+    fn observation_matrix(
+        &self,
+        observations: &[f64],
+        component_count: usize,
+    ) -> Result<Mat<f64>, AnalysisError> {
+        let expected = self.time_count.saturating_mul(component_count);
+        if observations.len() != expected {
+            return Err(AnalysisError::ObservationShape {
+                actual: observations.len(),
+                expected,
+            });
+        }
+        for (index, value) in observations.iter().copied().enumerate() {
+            if !value.is_finite() {
+                return Err(AnalysisError::NonFiniteObservation {
+                    series: index % component_count,
+                    time: index / component_count,
+                });
+            }
+        }
+        Ok(Mat::from_fn(
+            self.time_count,
+            component_count,
+            |time, component| observations[time * component_count + component],
+        ))
+    }
+
+    fn robust_component_solution(
+        &self,
+        fit: &RobustFit,
+        observations: faer::MatRef<'_, f64>,
+        component: usize,
+        confidence: Option<LinearConfidence>,
+    ) -> ScalarSolution {
+        let mut cosine_coefficient = Vec::with_capacity(self.constituents.len());
+        let mut sine_coefficient = Vec::with_capacity(self.constituents.len());
+        let mut amplitude = Vec::with_capacity(self.constituents.len());
+        let mut phase_degrees = Vec::with_capacity(self.constituents.len());
+        for constituent in 0..self.constituents.len() {
+            let cosine = fit.coefficients[(constituent * 2, component)];
+            let sine = fit.coefficients[(constituent * 2 + 1, component)];
+            cosine_coefficient.push(cosine);
+            sine_coefficient.push(sine);
+            amplitude.push(cosine.hypot(sine));
+            phase_degrees.push(sine.atan2(cosine).to_degrees().rem_euclid(360.0));
+        }
+        let total_energy = amplitude.iter().map(|value| value * value).sum::<f64>();
+        let percent_energy = amplitude
+            .iter()
+            .map(|value| 100.0 * value * value / total_energy)
+            .collect();
+        let harmonic_columns = self.constituents.len() * 2;
+        let (
+            amplitude_ci,
+            phase_ci_degrees,
+            signal_to_noise,
+            cosine_coefficient_variance,
+            sine_coefficient_variance,
+        ) = if let Some(noise) = confidence {
+            let variance_weights = self.linear_variance_weights(Some(&fit.diagnostics.weights));
+            let component_observations = (0..self.time_count)
+                .map(|time| observations[(time, component)])
+                .collect::<Vec<_>>();
+            let intervals = self.linear_confidence_intervals(
+                &component_observations,
+                1,
+                0,
+                fit.coefficients.as_ref().subcols(component, 1),
+                &variance_weights,
+                noise,
+                Some(&fit.diagnostics.weights),
+            );
+            let signal_to_noise = amplitude
+                .iter()
+                .zip(&intervals.amplitude)
+                .map(|(amplitude, interval)| amplitude.powi(2) / (interval / 1.96).powi(2))
+                .collect();
+            (
+                Some(intervals.amplitude),
+                Some(intervals.phase_degrees),
+                Some(signal_to_noise),
+                Some(intervals.cosine_variance),
+                Some(intervals.sine_variance),
+            )
+        } else {
+            (None, None, None, None, None)
+        };
+        ScalarSolution {
+            cosine_coefficient,
+            sine_coefficient,
+            amplitude,
+            phase_degrees,
+            percent_energy,
+            amplitude_ci,
+            phase_ci_degrees,
+            signal_to_noise,
+            cosine_coefficient_variance,
+            sine_coefficient_variance,
+            mean: fit.coefficients[(harmonic_columns, component)],
+            slope_per_day: fit.coefficients[(harmonic_columns + 1, component)]
+                / self.time_span_days,
+            reference_time_days: self.reference_time_days,
+            robust: Some(fit.diagnostics.clone()),
+        }
+    }
+
+    fn linear_variance_weights(&self, weights: Option<&[f64]>) -> Vec<f64> {
         let column_count = self.design.ncols();
         let normal = Mat::from_fn(column_count, column_count, |row, column| {
             (0..self.time_count)
-                .map(|time| self.design[(time, row)] * self.design[(time, column)])
+                .map(|time| {
+                    weights.map_or(1.0, |weights| weights[time])
+                        * self.design[(time, row)]
+                        * self.design[(time, column)]
+                })
                 .sum::<f64>()
         });
         let covariance = normal.partial_piv_lu().inverse();
@@ -420,6 +600,10 @@ impl FixedRawOls {
             .collect()
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "keeps observation layout, coefficients, noise, and optional robust weights explicit"
+    )]
     fn linear_confidence_intervals(
         &self,
         observations: &[f64],
@@ -428,6 +612,7 @@ impl FixedRawOls {
         coefficients: faer::MatRef<'_, f64>,
         variance_weights: &[f64],
         noise: LinearConfidence,
+        weights: Option<&[f64]>,
     ) -> LinearIntervals {
         let mut residual = Vec::with_capacity(self.time_count);
         let mut observation_energy = 0.0;
@@ -437,9 +622,10 @@ impl FixedRawOls {
                 .map(|column| self.design[(time, column)] * coefficients[(column, series)])
                 .sum::<f64>();
             let observation = observations[time * series_count + series];
-            residual.push(observation - fitted);
-            observation_energy += observation * observation;
-            model_observation_product += fitted * observation;
+            let weight = weights.map_or(1.0, |weights| weights[time]);
+            residual.push(weight * (observation - fitted));
+            observation_energy += weight * observation * observation;
+            model_observation_product += weight * fitted * observation;
         }
 
         let white_variance = (observation_energy - model_observation_product)

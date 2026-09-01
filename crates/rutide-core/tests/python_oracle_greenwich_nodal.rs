@@ -2,7 +2,7 @@
 
 use rutide_core::{
     AnalysisError, GreenwichNodalBatch, GreenwichNodalOls, GreenwichNodalReconstructor,
-    LinearConfidence, ReconstructionFilter, TidalConstituent,
+    LinearConfidence, ReconstructionFilter, RobustOptions, TidalConstituent,
 };
 
 const CONSTITUENTS: [TidalConstituent; 5] = [
@@ -261,6 +261,623 @@ fn matches_python_utide_for_real_fvcom_elevation() {
         solution.slope_per_day,
         EXPECTED_SLOPE_PER_DAY,
         3e-12,
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "freezes coefficients, weights, and confidence oracle values"
+)]
+fn matches_python_utide_cauchy_robust_scalar_fit() {
+    let time = oracle_times();
+    let mut observations = oracle_observations();
+    for (index, offset) in [(71, 5.0), (218, -4.0), (503, 6.0)] {
+        observations[index] += offset;
+    }
+    let model = GreenwichNodalOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE_DEGREES_NORTH,
+        &CONSTITUENTS,
+    )
+    .expect("valid corrected robust model");
+    let solution = model
+        .solve_robust(&observations, RobustOptions::default())
+        .expect("converged robust solution");
+
+    for (index, (actual, expected)) in solution
+        .amplitude
+        .iter()
+        .zip([
+            0.658_145_852_459_635_5,
+            0.238_805_188_209_338_16,
+            0.156_177_076_824_299_6,
+            0.106_458_942_117_917_18,
+            0.061_386_581_707_001_765,
+        ])
+        .enumerate()
+    {
+        assert_close(
+            &format!("robust amplitude[{index}]"),
+            *actual,
+            expected,
+            3e-11,
+        );
+    }
+    for (index, (actual, expected)) in solution
+        .phase_degrees
+        .iter()
+        .zip([
+            189.139_324_737_893_02,
+            231.567_611_148_729_24,
+            161.293_601_526_333_96,
+            153.739_401_353_766_28,
+            22.440_374_521_922_72,
+        ])
+        .enumerate()
+    {
+        assert_close(&format!("robust phase[{index}]"), *actual, expected, 3e-9);
+    }
+    assert_close(
+        "robust mean",
+        solution.mean,
+        0.089_398_869_808_239_88,
+        3e-11,
+    );
+    assert_close(
+        "robust slope",
+        solution.slope_per_day,
+        0.001_264_652_294_300_096_9,
+        3e-12,
+    );
+
+    let diagnostics = solution.robust.as_ref().expect("robust diagnostics");
+    assert_eq!(diagnostics.iterations, 5);
+    let indices = [0, 1, 70, 71, 72, 217, 218, 219, 502, 503, 504, 744];
+    let expected_weights = [
+        0.374_888_711_962_230_84,
+        0.612_494_258_822_018_7,
+        0.962_171_726_691_640_4,
+        0.004_055_824_836_021_76,
+        0.987_574_556_280_989_9,
+        0.923_011_380_567_195_2,
+        0.006_517_669_413_056_472,
+        0.930_571_095_455_172_4,
+        0.637_865_641_244_842_8,
+        0.002_562_676_748_444_911,
+        0.610_158_416_922_485_6,
+        0.574_118_461_172_164_1,
+    ];
+    for (index, expected) in indices.into_iter().zip(expected_weights) {
+        assert_close(
+            &format!("robust weight[{index}]"),
+            diagnostics.weights[index],
+            expected,
+            3e-10,
+        );
+    }
+    assert_close(
+        "robust weight sum",
+        diagnostics.weights.iter().sum(),
+        640.463_424_939_137,
+        2e-8,
+    );
+    assert_close(
+        "robust OLS RMS",
+        diagnostics.ols_rms_residual,
+        0.353_713_248_377_981_35,
+        3e-11,
+    );
+
+    let colored = model
+        .solve_robust_with_linear_confidence(
+            &observations,
+            RobustOptions::default(),
+            LinearConfidence::Colored,
+        )
+        .expect("converged robust colored solution");
+    for (label, actual, expected, tolerance) in [
+        (
+            "robust colored amplitude CI",
+            colored.amplitude_ci.as_ref().expect("amplitude CI"),
+            &[
+                0.010_385_114_891_016_55,
+                0.010_373_818_074_631_45,
+                0.010_387_623_062_905_044,
+                0.006_423_739_604_029_797,
+                0.006_450_801_786_618_674,
+            ],
+            3e-10,
+        ),
+        (
+            "robust colored phase CI",
+            colored.phase_ci_degrees.as_ref().expect("phase CI"),
+            &[
+                0.902_627_245_321_272_8,
+                2.490_347_825_733_839,
+                3.802_839_792_387_647_6,
+                3.478_522_677_579_728_7,
+                6.007_376_471_310_384,
+            ],
+            3e-8,
+        ),
+        (
+            "robust colored SNR",
+            colored.signal_to_noise.as_ref().expect("SNR"),
+            &[
+                15_428.859_677_577_424,
+                2_035.740_437_742_849_5,
+                868.389_089_955_865_3,
+                1_055.116_900_744_206,
+                347.881_751_992_609_4,
+            ],
+            3e-4,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{label}[{index}]"), *actual, *expected, tolerance);
+        }
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "freezes ellipse, shared-weight, and confidence oracle values"
+)]
+fn matches_python_utide_cauchy_robust_vector_fit() {
+    let time = oracle_times();
+    let (mut eastward, mut northward) = synthetic_vector_observations(&time);
+    eastward[71] += 5.0;
+    northward[218] -= 4.0;
+    eastward[503] += 4.0;
+    northward[503] += 3.0;
+    let model = GreenwichNodalOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE_DEGREES_NORTH,
+        &CONSTITUENTS,
+    )
+    .expect("valid corrected robust vector model");
+    let solution = model
+        .solve_vector_robust(&eastward, &northward, RobustOptions::default())
+        .expect("converged robust vector solution");
+
+    for (label, actual, expected, tolerance) in [
+        (
+            "robust major",
+            &solution.semi_major,
+            &[
+                0.001_713_330_656_679_418_2,
+                0.001_581_357_412_332_718_6,
+                0.001_917_337_390_693_039_4,
+                0.009_257_122_602_617_771,
+                0.041_361_184_676_057_525,
+            ],
+            3e-11,
+        ),
+        (
+            "robust minor",
+            &solution.semi_minor,
+            &[
+                0.000_315_415_181_843_113_04,
+                0.000_344_199_099_888_868_23,
+                -0.000_762_919_912_225_096_1,
+                -0.001_007_737_463_980_055_6,
+                0.001_563_596_907_072_053_3,
+            ],
+            3e-11,
+        ),
+        (
+            "robust inclination",
+            &solution.inclination_degrees,
+            &[
+                54.734_344_768_150_784,
+                62.422_775_315_423_41,
+                140.474_675_685_810_9,
+                78.088_619_298_543_46,
+                83.703_604_289_762_1,
+            ],
+            3e-8,
+        ),
+        (
+            "robust vector phase",
+            &solution.phase_degrees,
+            &[
+                272.396_149_942_525_1,
+                40.766_579_729_213_575,
+                358.529_955_598_924_74,
+                67.998_280_349_531_38,
+                170.709_998_564_574_33,
+            ],
+            3e-8,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{label}[{index}]"), *actual, *expected, tolerance);
+        }
+    }
+    for (label, actual, expected) in [
+        (
+            "robust eastward mean",
+            solution.eastward_mean,
+            0.165_074_288_673_386_08,
+        ),
+        (
+            "robust northward mean",
+            solution.northward_mean,
+            -0.075_146_691_017_529_74,
+        ),
+        (
+            "robust eastward slope",
+            solution.eastward_slope_per_day,
+            0.000_739_585_526_115_897_6,
+        ),
+        (
+            "robust northward slope",
+            solution.northward_slope_per_day,
+            0.002_161_909_613_034_094_5,
+        ),
+    ] {
+        assert_close(label, actual, expected, 3e-11);
+    }
+    let diagnostics = solution.robust.as_ref().expect("robust diagnostics");
+    assert_eq!(diagnostics.iterations, 2);
+    let indices = [0, 1, 70, 71, 72, 217, 218, 219, 502, 503, 504, 744];
+    let expected_weights = [
+        0.938_389_168_459_219_7,
+        0.927_385_799_668_620_8,
+        0.985_308_419_455_378_7,
+        0.080_626_786_320_981_97,
+        0.985_778_464_704_937,
+        0.887_028_441_025_758_5,
+        0.105_719_095_502_464_94,
+        0.879_609_883_903_025_9,
+        0.905_775_564_509_730_2,
+        0.067_068_919_213_801_43,
+        0.922_123_625_774_698,
+        0.915_197_903_015_222_5,
+    ];
+    for (index, expected) in indices.into_iter().zip(expected_weights) {
+        assert_close(
+            &format!("robust vector weight[{index}]"),
+            diagnostics.weights[index],
+            expected,
+            3e-10,
+        );
+    }
+    assert_close(
+        "robust vector weight sum",
+        diagnostics.weights.iter().sum(),
+        690.821_363_451_973_6,
+        2e-8,
+    );
+
+    let colored = model
+        .solve_vector_robust_with_linear_confidence(
+            &eastward,
+            &northward,
+            RobustOptions::default(),
+            LinearConfidence::Colored,
+        )
+        .expect("converged robust vector colored solution");
+    for (label, actual, expected, tolerance) in [
+        (
+            "robust major CI",
+            colored.semi_major_ci.as_ref().expect("major CI"),
+            &[
+                0.019_021_861_841_394_26,
+                0.015_663_060_754_516_75,
+                0.025_512_587_765_766_263,
+                0.007_767_036_245_261_25,
+                0.004_587_458_651_368_575,
+            ],
+            3e-9,
+        ),
+        (
+            "robust minor CI",
+            colored.semi_minor_ci.as_ref().expect("minor CI"),
+            &[
+                0.026_922_542_442_636_678,
+                0.029_953_928_792_999_622,
+                0.021_023_072_531_914_273,
+                0.035_905_748_209_963_73,
+                0.038_382_077_594_627_93,
+            ],
+            3e-9,
+        ),
+        (
+            "robust inclination CI",
+            colored
+                .inclination_ci_degrees
+                .as_ref()
+                .expect("inclination CI"),
+            &[
+                938.445_433_969_345_5,
+                1_146.524_273_781_227,
+                829.665_047_623_809,
+                225.058_360_856_494_52,
+                53.380_941_043_150_585,
+            ],
+            3e-5,
+        ),
+        (
+            "robust vector phase CI",
+            colored.phase_ci_degrees.as_ref().expect("phase CI"),
+            &[
+                681.239_538_040_506,
+                645.224_183_570_930_8,
+                952.023_907_436_457_8,
+                54.457_715_882_511_83,
+                6.659_258_879_053_22,
+            ],
+            3e-5,
+        ),
+        (
+            "robust vector SNR",
+            colored.signal_to_noise.as_ref().expect("SNR"),
+            &[
+                0.010_729_456_592_531_265,
+                0.008_806_276_629_376_933,
+                0.014_968_421_077_119_544,
+                0.246_826_476_229_682_7,
+                4.404_546_799_827_36,
+            ],
+            3e-7,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{label}[{index}]"), *actual, *expected, tolerance);
+        }
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "freezes the irregular missing-data robust oracle surface"
+)]
+fn matches_python_utide_irregular_gappy_robust_scalar_confidence() {
+    let time = irregular_oracle_times();
+    let mut observations = oracle_observations();
+    for index in [0, 137, 411] {
+        observations[index] = f64::NAN;
+    }
+    for (index, offset) in [(71, 5.0), (218, -4.0), (503, 6.0)] {
+        observations[index] += offset;
+    }
+    let batch = GreenwichNodalBatch::prepare_modified_julian_days(&time, &CONSTITUENTS)
+        .expect("valid irregular robust batch");
+    let solution = batch
+        .solve_time_major_with_missing_robust_and_linear_confidence(
+            &observations,
+            &[LATITUDE_DEGREES_NORTH],
+            RobustOptions::default(),
+            LinearConfidence::Colored,
+        )
+        .expect("valid irregular gappy robust solution")
+        .pop()
+        .expect("one solution");
+
+    for (label, actual, expected, tolerance) in [
+        (
+            "irregular robust amplitude",
+            &solution.amplitude,
+            &[
+                0.657_927_742_975_213_3,
+                0.238_701_910_993_591_12,
+                0.155_956_854_288_977_46,
+                0.106_736_908_837_608_04,
+                0.060_364_270_942_384_876,
+            ],
+            3e-11,
+        ),
+        (
+            "irregular robust phase",
+            &solution.phase_degrees,
+            &[
+                189.122_416_169_234,
+                231.677_635_699_404_2,
+                161.153_429_767_961_37,
+                153.132_226_705_290_66,
+                23.340_449_062_890_297,
+            ],
+            3e-8,
+        ),
+        (
+            "irregular robust amplitude CI",
+            solution.amplitude_ci.as_ref().expect("amplitude CI"),
+            &[
+                0.010_414_147_275_322_905,
+                0.010_391_256_399_231_398,
+                0.010_402_205_691_361_75,
+                0.006_490_397_571_268_867,
+                0.006_517_219_634_566_622,
+            ],
+            3e-10,
+        ),
+        (
+            "irregular robust phase CI",
+            solution.phase_ci_degrees.as_ref().expect("phase CI"),
+            &[
+                0.903_503_456_428_789_4,
+                2.495_805_738_183_243,
+                3.815_965_584_190_676,
+                3.506_987_579_226_474_4,
+                6.175_706_127_678_937,
+            ],
+            3e-8,
+        ),
+        (
+            "irregular robust SNR",
+            solution.signal_to_noise.as_ref().expect("SNR"),
+            &[
+                15_332.787_333_378_024,
+                2_027.158_993_881_378,
+                863.515_627_774_444_5,
+                1_038.959_896_509_877_4,
+                329.569_753_913_328_04,
+            ],
+            3e-4,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{label}[{index}]"), *actual, *expected, tolerance);
+        }
+    }
+    assert_close(
+        "irregular robust mean",
+        solution.mean,
+        0.089_125_477_176_249_97,
+        3e-11,
+    );
+    assert_close(
+        "irregular robust slope",
+        solution.slope_per_day,
+        0.001_333_053_598_877_835_8,
+        3e-12,
+    );
+    let diagnostics = solution.robust.as_ref().expect("robust diagnostics");
+    assert_eq!(diagnostics.iterations, 5);
+    assert_close(
+        "irregular robust weight sum",
+        diagnostics.weights.iter().sum(),
+        636.801_555_578_963_6,
+        2e-8,
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "freezes the irregular vector robust oracle surface"
+)]
+fn matches_python_utide_irregular_gappy_robust_vector_confidence() {
+    let time = irregular_oracle_times();
+    let (mut eastward, mut northward) = synthetic_vector_observations(&time);
+    for index in [0, 137] {
+        eastward[index] = f64::NAN;
+    }
+    for index in [2, 411] {
+        northward[index] = f64::NAN;
+    }
+    eastward[71] += 5.0;
+    northward[218] -= 4.0;
+    eastward[503] += 4.0;
+    northward[503] += 3.0;
+    let batch = GreenwichNodalBatch::prepare_modified_julian_days(&time, &CONSTITUENTS)
+        .expect("valid irregular robust vector batch");
+    let solution = batch
+        .solve_vector_time_major_with_missing_robust_and_linear_confidence(
+            &eastward,
+            &northward,
+            &[LATITUDE_DEGREES_NORTH],
+            RobustOptions::default(),
+            LinearConfidence::Colored,
+        )
+        .expect("valid irregular gappy robust vector solution")
+        .pop()
+        .expect("one solution");
+
+    for (label, actual, expected, tolerance) in [
+        (
+            "irregular robust major",
+            &solution.semi_major,
+            &[
+                0.004_115_156_844_539_959,
+                0.005_218_003_164_742_43,
+                0.002_326_072_643_694_429_6,
+                0.009_857_054_281_994_973,
+                0.039_498_350_563_153_73,
+            ],
+            3e-11,
+        ),
+        (
+            "irregular robust minor",
+            &solution.semi_minor,
+            &[
+                0.000_916_731_988_710_150_5,
+                0.000_282_629_326_177_253_56,
+                -0.000_064_581_611_139_997_3,
+                -0.005_026_497_127_687_541,
+                0.001_331_153_217_211_611_4,
+            ],
+            3e-11,
+        ),
+        (
+            "irregular robust major CI",
+            solution.semi_major_ci.as_ref().expect("major CI"),
+            &[
+                0.032_268_877_105_344_485,
+                0.032_279_726_103_875_54,
+                0.006_672_687_737_287_073,
+                0.009_943_006_289_697_47,
+                0.005_836_982_751_398_109,
+            ],
+            3e-9,
+        ),
+        (
+            "irregular robust minor CI",
+            solution.semi_minor_ci.as_ref().expect("minor CI"),
+            &[
+                0.006_813_687_190_281_185_5,
+                0.009_993_422_011_621_261,
+                0.032_353_448_821_291_76,
+                0.035_365_207_874_963_035,
+                0.038_206_098_592_043_87,
+            ],
+            3e-9,
+        ),
+        (
+            "irregular robust inclination CI",
+            solution
+                .inclination_ci_degrees
+                .as_ref()
+                .expect("inclination CI"),
+            &[
+                144.814_112_360_895_54,
+                111.724_914_567_179_78,
+                798.004_037_913_649_1,
+                280.939_164_739_871_8,
+                55.653_325_452_181_85,
+            ],
+            3e-5,
+        ),
+        (
+            "irregular robust phase CI",
+            solution.phase_ci_degrees.as_ref().expect("phase CI"),
+            &[
+                471.984_783_023_444_9,
+                355.545_710_314_022_2,
+                165.884_275_265_114_33,
+                161.864_038_243_268_65,
+                8.654_641_100_289_224,
+            ],
+            3e-5,
+        ),
+        (
+            "irregular robust vector SNR",
+            solution.signal_to_noise.as_ref().expect("SNR"),
+            &[
+                0.062_778_047_938_033_27,
+                0.091_872_243_248_639_93,
+                0.019_061_670_487_992_278,
+                0.348_495_694_077_026_4,
+                4.016_774_717_067_462,
+            ],
+            3e-7,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{label}[{index}]"), *actual, *expected, tolerance);
+        }
+    }
+    let diagnostics = solution.robust.as_ref().expect("robust diagnostics");
+    assert_eq!(diagnostics.iterations, 3);
+    assert_close(
+        "irregular robust vector weight sum",
+        diagnostics.weights.iter().sum(),
+        681.384_349_164_300_4,
+        2e-8,
     );
 }
 

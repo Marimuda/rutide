@@ -6,8 +6,8 @@ use faer::Mat;
 use rayon::prelude::*;
 
 use crate::{
-    AnalysisError, Constituent, FixedRawOls, LinearConfidence, ScalarSolution, TidalConstituent,
-    VectorReconstruction, VectorSolution,
+    AnalysisError, Constituent, FixedRawOls, LinearConfidence, RobustOptions, ScalarSolution,
+    TidalConstituent, VectorReconstruction, VectorSolution,
     astronomy::at_modified_julian_day,
     catalog::{CONSTITUENT_COUNT, Metadata},
     scalar::{ConfidenceSampling, equidistant_sample_interval_hours, validate_time},
@@ -132,6 +132,35 @@ impl GreenwichNodalOls {
         self.model.solve_with_linear_confidence(observations, noise)
     }
 
+    /// Fit one scalar series with Cauchy iteratively reweighted least squares.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input, degenerate robust scaling,
+    /// invalid leverage, or non-convergence.
+    pub fn solve_robust(
+        &self,
+        observations: &[f64],
+        options: RobustOptions,
+    ) -> Result<ScalarSolution, AnalysisError> {
+        self.model.solve_robust(observations, options)
+    }
+
+    /// Robustly fit one series with linearized confidence intervals and SNR.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input or robust fitting failure.
+    pub fn solve_robust_with_linear_confidence(
+        &self,
+        observations: &[f64],
+        options: RobustOptions,
+        noise: LinearConfidence,
+    ) -> Result<ScalarSolution, AnalysisError> {
+        self.model
+            .solve_robust_with_linear_confidence(observations, options, noise)
+    }
+
     /// Fit complete series at the prepared latitude in time-major order.
     ///
     /// # Errors
@@ -186,6 +215,67 @@ impl GreenwichNodalOls {
         noise: LinearConfidence,
     ) -> Result<VectorSolution, AnalysisError> {
         self.solve_vector_impl(eastward, northward, Some(noise))
+    }
+
+    /// Jointly fit one current series with shared Cauchy robust weights.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid components or robust fitting failure.
+    pub fn solve_vector_robust(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        options: RobustOptions,
+    ) -> Result<VectorSolution, AnalysisError> {
+        if eastward.len() != northward.len() {
+            return Err(AnalysisError::ObservationShape {
+                actual: northward.len(),
+                expected: eastward.len(),
+            });
+        }
+        let mut time_major = Vec::with_capacity(eastward.len() * 2);
+        for (eastward, northward) in eastward.iter().copied().zip(northward.iter().copied()) {
+            time_major.extend([eastward, northward]);
+        }
+        let mut components = self
+            .model
+            .solve_two_component_robust(&time_major, options)?
+            .into_iter();
+        let eastward = components.next().ok_or(AnalysisError::EmptySeries)?;
+        let northward = components.next().ok_or(AnalysisError::EmptySeries)?;
+        from_component_solutions(&eastward, &northward)
+    }
+
+    /// Jointly robustly fit one current series with linearized ellipse intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input or robust fitting failure.
+    pub fn solve_vector_robust_with_linear_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        options: RobustOptions,
+        noise: LinearConfidence,
+    ) -> Result<VectorSolution, AnalysisError> {
+        if eastward.len() != northward.len() {
+            return Err(AnalysisError::ObservationShape {
+                actual: northward.len(),
+                expected: eastward.len(),
+            });
+        }
+        let mut time_major = Vec::with_capacity(eastward.len() * 2);
+        for (eastward, northward) in eastward.iter().copied().zip(northward.iter().copied()) {
+            time_major.extend([eastward, northward]);
+        }
+        let mut components = self
+            .model
+            .solve_two_component_robust_with_linear_confidence(&time_major, options, noise)?
+            .into_iter();
+        let eastward = components.next().ok_or(AnalysisError::EmptySeries)?;
+        let northward = components.next().ok_or(AnalysisError::EmptySeries)?;
+        from_component_solutions(&eastward, &northward)
     }
 
     fn solve_vector_impl(
@@ -624,7 +714,7 @@ impl GreenwichNodalBatch {
         observations: &[f64],
         latitudes: &[f64],
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_impl(observations, latitudes, None)
+        self.solve_time_major_impl(observations, latitudes, None, None)
     }
 
     /// Fit varying-latitude series with linearized confidence intervals and SNR.
@@ -639,7 +729,36 @@ impl GreenwichNodalBatch {
         latitudes: &[f64],
         noise: LinearConfidence,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_impl(observations, latitudes, Some(noise))
+        self.solve_time_major_impl(observations, latitudes, Some(noise), None)
+    }
+
+    /// Robustly fit varying-latitude complete scalar series in parallel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input or any non-convergent series.
+    pub fn solve_time_major_robust(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        options: RobustOptions,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_impl(observations, latitudes, None, Some(options))
+    }
+
+    /// Robustly fit complete scalar series with linear confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input or any robust fitting failure.
+    pub fn solve_time_major_robust_with_linear_confidence(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        options: RobustOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_impl(observations, latitudes, Some(noise), Some(options))
     }
 
     /// Fit scalar series while treating `NaN` observations as missing.
@@ -657,7 +776,7 @@ impl GreenwichNodalBatch {
         observations: &[f64],
         latitudes: &[f64],
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_with_missing_impl(observations, latitudes, None)
+        self.solve_time_major_with_missing_impl(observations, latitudes, None, None)
     }
 
     /// Fit possibly gappy scalar series with linearized confidence intervals.
@@ -675,7 +794,36 @@ impl GreenwichNodalBatch {
         latitudes: &[f64],
         noise: LinearConfidence,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_with_missing_impl(observations, latitudes, Some(noise))
+        self.solve_time_major_with_missing_impl(observations, latitudes, Some(noise), None)
+    }
+
+    /// Robustly fit scalar series while treating `NaN` observations as missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input or any robust fitting failure.
+    pub fn solve_time_major_with_missing_robust(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        options: RobustOptions,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_with_missing_impl(observations, latitudes, None, Some(options))
+    }
+
+    /// Robustly fit gappy scalar series with linear confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input or any robust fitting failure.
+    pub fn solve_time_major_with_missing_robust_and_linear_confidence(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        options: RobustOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_with_missing_impl(observations, latitudes, Some(noise), Some(options))
     }
 
     /// Jointly fit possibly gappy eastward/northward current series.
@@ -693,7 +841,7 @@ impl GreenwichNodalBatch {
         northward: &[f64],
         latitudes: &[f64],
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
-        self.solve_vector_time_major_with_missing_impl(eastward, northward, latitudes, None)
+        self.solve_vector_time_major_with_missing_impl(eastward, northward, latitudes, None, None)
     }
 
     /// Jointly fit gappy currents with linearized ellipse confidence intervals.
@@ -708,7 +856,56 @@ impl GreenwichNodalBatch {
         latitudes: &[f64],
         noise: LinearConfidence,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
-        self.solve_vector_time_major_with_missing_impl(eastward, northward, latitudes, Some(noise))
+        self.solve_vector_time_major_with_missing_impl(
+            eastward,
+            northward,
+            latitudes,
+            Some(noise),
+            None,
+        )
+    }
+
+    /// Robustly fit gappy currents with one shared weight per component pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input or any robust fitting failure.
+    pub fn solve_vector_time_major_with_missing_robust(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        options: RobustOptions,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_with_missing_impl(
+            eastward,
+            northward,
+            latitudes,
+            None,
+            Some(options),
+        )
+    }
+
+    /// Robustly fit gappy currents with linearized ellipse confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input or any robust fitting failure.
+    pub fn solve_vector_time_major_with_missing_robust_and_linear_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        options: RobustOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_with_missing_impl(
+            eastward,
+            northward,
+            latitudes,
+            Some(noise),
+            Some(options),
+        )
     }
 
     fn solve_vector_time_major_with_missing_impl(
@@ -717,6 +914,7 @@ impl GreenwichNodalBatch {
         northward: &[f64],
         latitudes: &[f64],
         confidence: Option<LinearConfidence>,
+        robust: Option<RobustOptions>,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
         validate_batch_shape_and_latitudes(self.time_count(), eastward, latitudes)?;
         if northward.len() != eastward.len() {
@@ -784,14 +982,26 @@ impl GreenwichNodalBatch {
                     component_values.push(eastward[time * series_count + series]);
                     component_values.push(northward[time * series_count + series]);
                 }
-                let mut components = match confidence {
-                    // Match Python UTide's asymmetric 2-D colored linear CI:
-                    // eastward remains white while northward is colored.
-                    Some(noise) => model.solve_many_time_major_with_linear_confidence_by_series(
-                        &component_values,
-                        &[LinearConfidence::White, noise],
-                    )?,
-                    None => model.solve_many_time_major(&component_values, 2)?,
+                let mut components = if let Some(options) = robust {
+                    match confidence {
+                        Some(noise) => model.solve_two_component_robust_with_linear_confidence(
+                            &component_values,
+                            options,
+                            noise,
+                        )?,
+                        None => model.solve_two_component_robust(&component_values, options)?,
+                    }
+                } else {
+                    match confidence {
+                        // Match Python UTide's asymmetric 2-D colored linear CI:
+                        // eastward remains white while northward is colored.
+                        Some(noise) => model
+                            .solve_many_time_major_with_linear_confidence_by_series(
+                                &component_values,
+                                &[LinearConfidence::White, noise],
+                            )?,
+                        None => model.solve_many_time_major(&component_values, 2)?,
+                    }
                 };
                 let northward = components.pop().expect("two requested component solutions");
                 let eastward = components.pop().expect("two requested component solutions");
@@ -805,6 +1015,7 @@ impl GreenwichNodalBatch {
         observations: &[f64],
         latitudes: &[f64],
         confidence: Option<LinearConfidence>,
+        robust: Option<RobustOptions>,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         validate_batch_shape_and_latitudes(self.time_count(), observations, latitudes)?;
         for (index, value) in observations.iter().copied().enumerate() {
@@ -816,7 +1027,7 @@ impl GreenwichNodalBatch {
             }
         }
         if observations.iter().all(|value| value.is_finite()) {
-            return self.solve_time_major_impl(observations, latitudes, confidence);
+            return self.solve_time_major_impl(observations, latitudes, confidence, robust);
         }
 
         let series_count = latitudes.len();
@@ -867,9 +1078,22 @@ impl GreenwichNodalBatch {
                     .copied()
                     .map(|time| observations[time * series_count + series])
                     .collect::<Vec<_>>();
-                match confidence {
-                    Some(noise) => model.solve_with_linear_confidence(&series_observations, noise),
-                    None => model.solve(&series_observations),
+                if let Some(options) = robust {
+                    match confidence {
+                        Some(noise) => model.solve_robust_with_linear_confidence(
+                            &series_observations,
+                            options,
+                            noise,
+                        ),
+                        None => model.solve_robust(&series_observations, options),
+                    }
+                } else {
+                    match confidence {
+                        Some(noise) => {
+                            model.solve_with_linear_confidence(&series_observations, noise)
+                        }
+                        None => model.solve(&series_observations),
+                    }
                 }
             })
             .collect()
@@ -880,6 +1104,7 @@ impl GreenwichNodalBatch {
         observations: &[f64],
         latitudes: &[f64],
         confidence: Option<LinearConfidence>,
+        robust: Option<RobustOptions>,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         validate_batch_shape_and_latitudes(self.time_count(), observations, latitudes)?;
         let series_count = latitudes.len();
@@ -912,9 +1137,22 @@ impl GreenwichNodalBatch {
                 for time in 0..self.time_count() {
                     series_observations.push(observations[time * series_count + series]);
                 }
-                match confidence {
-                    Some(noise) => model.solve_with_linear_confidence(&series_observations, noise),
-                    None => model.solve(&series_observations),
+                if let Some(options) = robust {
+                    match confidence {
+                        Some(noise) => model.solve_robust_with_linear_confidence(
+                            &series_observations,
+                            options,
+                            noise,
+                        ),
+                        None => model.solve_robust(&series_observations, options),
+                    }
+                } else {
+                    match confidence {
+                        Some(noise) => {
+                            model.solve_with_linear_confidence(&series_observations, noise)
+                        }
+                        None => model.solve(&series_observations),
+                    }
                 }
             })
             .collect()

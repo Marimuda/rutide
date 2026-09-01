@@ -91,6 +91,24 @@ pub enum AnalysisError {
         /// Time position of the invalid value.
         time: usize,
     },
+    /// The robust Cauchy tuning constant is not finite and positive.
+    InvalidRobustTuningConstant,
+    /// The robust convergence tolerance is not finite and positive.
+    InvalidRobustTolerance,
+    /// The robust iteration limit is zero.
+    InvalidRobustIterationLimit,
+    /// A model row has invalid leverage for robust residual normalization.
+    InvalidRobustLeverage {
+        /// Time position of the invalid leverage.
+        time: usize,
+    },
+    /// The residual MAD collapsed to zero even though the fit is not exact.
+    DegenerateRobustScale,
+    /// Robust fitting exhausted its configured iteration limit.
+    RobustDidNotConverge {
+        /// Number of completed iterations.
+        iterations: usize,
+    },
 }
 
 impl fmt::Display for AnalysisError {
@@ -162,6 +180,25 @@ impl fmt::Display for AnalysisError {
             Self::NonFiniteObservation { series, time } => write!(
                 formatter,
                 "observation for series {series} at time index {time} is not finite"
+            ),
+            Self::InvalidRobustTuningConstant => {
+                formatter.write_str("robust tuning constant must be finite and greater than zero")
+            }
+            Self::InvalidRobustTolerance => formatter
+                .write_str("robust convergence tolerance must be finite and greater than zero"),
+            Self::InvalidRobustIterationLimit => {
+                formatter.write_str("robust iteration limit must be greater than zero")
+            }
+            Self::InvalidRobustLeverage { time } => write!(
+                formatter,
+                "robust leverage at time index {time} must be finite and less than one"
+            ),
+            Self::DegenerateRobustScale => formatter.write_str(
+                "robust residual scale is zero for a non-exact fit; weights are undefined",
+            ),
+            Self::RobustDidNotConverge { iterations } => write!(
+                formatter,
+                "robust fit did not converge within {iterations} iterations"
             ),
         }
     }
