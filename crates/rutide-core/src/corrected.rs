@@ -1,6 +1,6 @@
 //! Exact Greenwich phase and nodal corrections for catalog constituents.
 
-use std::{collections::HashMap, f64::consts::TAU, sync::Arc};
+use std::{cmp::Reverse, collections::HashMap, f64::consts::TAU};
 
 use faer::Mat;
 use rayon::prelude::*;
@@ -13,6 +13,27 @@ use crate::{
     scalar::{ConfidenceSampling, equidistant_sample_interval_hours, validate_time},
     vector::from_component_solutions,
 };
+
+// Plan construction costs enough to require a moderately reused mask, while
+// bounding the group count prevents many distinct repeated masks from turning
+// the speed optimization into unbounded batch memory growth.
+const MIN_SHARED_LOMB_SERIES: usize = 16;
+const MAX_SHARED_LOMB_PLANS_PER_BATCH: usize = 4;
+
+fn shared_lomb_plan_groups(record_use_count: &[usize]) -> Vec<bool> {
+    let mut candidates = record_use_count
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, use_count)| *use_count >= MIN_SHARED_LOMB_SERIES)
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(index, use_count)| (Reverse(*use_count), *index));
+    let mut shared = vec![false; record_use_count.len()];
+    for (index, _) in candidates.into_iter().take(MAX_SHARED_LOMB_PLANS_PER_BATCH) {
+        shared[index] = true;
+    }
+    shared
+}
 
 /// A reusable fixed-constituent OLS model with exact Greenwich and nodal terms.
 ///
@@ -714,7 +735,8 @@ impl GreenwichNodalBatch {
             }
         }
 
-        let mut records = Vec::<RecordSubset>::new();
+        let mut unique_positions = Vec::<Vec<usize>>::new();
+        let mut record_use_count = Vec::<usize>::new();
         let mut record_by_positions = HashMap::<Vec<usize>, usize>::new();
         let mut record_for_series = Vec::with_capacity(series_count);
         for series in 0..series_count {
@@ -725,14 +747,29 @@ impl GreenwichNodalBatch {
                 })
                 .collect::<Vec<_>>();
             let record_index = if let Some(index) = record_by_positions.get(&positions) {
+                record_use_count[*index] += 1;
                 *index
             } else {
-                let index = records.len();
-                records.push(self.basis.record_subset(positions.clone())?);
-                record_by_positions.insert(positions, index);
+                let index = unique_positions.len();
+                record_by_positions.insert(positions.clone(), index);
+                unique_positions.push(positions);
+                record_use_count.push(1);
                 index
             };
             record_for_series.push(record_index);
+        }
+        let shared_lomb_plans = shared_lomb_plan_groups(&record_use_count);
+        let records = unique_positions
+            .into_iter()
+            .zip(shared_lomb_plans)
+            .map(|(positions, share_plan)| self.basis.record_subset(positions, share_plan))
+            .collect::<Result<Vec<_>, _>>()?;
+        if confidence == Some(LinearConfidence::Colored) {
+            for record in &records {
+                record
+                    .confidence_sampling
+                    .precompute_shared_irregular_plan();
+            }
         }
 
         (0..series_count)
@@ -783,7 +820,8 @@ impl GreenwichNodalBatch {
         }
 
         let series_count = latitudes.len();
-        let mut records = Vec::<RecordSubset>::new();
+        let mut unique_positions = Vec::<Vec<usize>>::new();
+        let mut record_use_count = Vec::<usize>::new();
         let mut record_by_positions = HashMap::<Vec<usize>, usize>::new();
         let mut record_for_series = Vec::with_capacity(series_count);
         for series in 0..series_count {
@@ -791,14 +829,29 @@ impl GreenwichNodalBatch {
                 .filter(|time| observations[time * series_count + series].is_finite())
                 .collect::<Vec<_>>();
             let record_index = if let Some(index) = record_by_positions.get(&positions) {
+                record_use_count[*index] += 1;
                 *index
             } else {
-                let index = records.len();
-                records.push(self.basis.record_subset(positions.clone())?);
-                record_by_positions.insert(positions, index);
+                let index = unique_positions.len();
+                record_by_positions.insert(positions.clone(), index);
+                unique_positions.push(positions);
+                record_use_count.push(1);
                 index
             };
             record_for_series.push(record_index);
+        }
+        let shared_lomb_plans = shared_lomb_plan_groups(&record_use_count);
+        let records = unique_positions
+            .into_iter()
+            .zip(shared_lomb_plans)
+            .map(|(positions, share_plan)| self.basis.record_subset(positions, share_plan))
+            .collect::<Result<Vec<_>, _>>()?;
+        if confidence == Some(LinearConfidence::Colored) {
+            for record in &records {
+                record
+                    .confidence_sampling
+                    .precompute_shared_irregular_plan();
+            }
         }
 
         (0..series_count)
@@ -839,10 +892,22 @@ impl GreenwichNodalBatch {
             }
         }
 
+        let positions = (0..self.time_count()).collect::<Vec<_>>();
+        let record = self
+            .basis
+            .record_subset(positions, series_count >= MIN_SHARED_LOMB_SERIES)?;
+        if confidence == Some(LinearConfidence::Colored) {
+            record
+                .confidence_sampling
+                .precompute_shared_irregular_plan();
+        }
+
         (0..series_count)
             .into_par_iter()
             .map(|series| {
-                let model = self.basis.model_at_latitude(latitudes[series])?;
+                let model = self
+                    .basis
+                    .model_at_latitude_for_record(latitudes[series], &record)?;
                 let mut series_observations = Vec::with_capacity(self.time_count());
                 for time in 0..self.time_count() {
                     series_observations.push(observations[time * series_count + series]);
@@ -936,11 +1001,15 @@ impl CorrectionBasis {
 
     fn model_at_latitude(&self, latitude: f64) -> Result<FixedRawOls, AnalysisError> {
         let positions = (0..self.time_terms.len()).collect::<Vec<_>>();
-        let record = self.record_subset(positions)?;
+        let record = self.record_subset(positions, true)?;
         self.model_at_latitude_for_record(latitude, &record)
     }
 
-    fn record_subset(&self, positions: Vec<usize>) -> Result<RecordSubset, AnalysisError> {
+    fn record_subset(
+        &self,
+        positions: Vec<usize>,
+        share_irregular_plan: bool,
+    ) -> Result<RecordSubset, AnalysisError> {
         let modified_julian_days = positions
             .iter()
             .copied()
@@ -952,24 +1021,19 @@ impl CorrectionBasis {
         let (reference_time, time_span_days, scalar_constituents, confidence_sampling) =
             if original_is_equidistant {
                 let full_count = self.time_terms.len();
-                let full_count_f64 = usize_to_f64(full_count);
                 (
                     self.reference_time_modified_julian_day,
                     self.time_span_days,
                     self.scalar_constituents.clone(),
-                    ConfidenceSampling {
-                        sample_interval_hours: self.sample_interval_hours,
-                        effective_record_length_days: self.time_span_days * full_count_f64
-                            / (full_count_f64 - 1.0),
-                        spectrum_time_count: full_count,
-                        observation_positions: (positions.len() != full_count)
-                            .then_some(positions.clone()),
-                        irregular_time_hours: None,
-                    },
+                    ConfidenceSampling::regular_gappy(
+                        self.sample_interval_hours
+                            .expect("equidistant record retains its sample interval"),
+                        self.time_span_days,
+                        full_count,
+                        positions.clone(),
+                    ),
                 )
             } else {
-                let count = positions.len();
-                let count_f64 = usize_to_f64(count);
                 (
                     subset_reference,
                     subset_span,
@@ -979,18 +1043,11 @@ impl CorrectionBasis {
                         &self.recipes,
                         subset_reference,
                     ),
-                    ConfidenceSampling {
-                        sample_interval_hours: None,
-                        effective_record_length_days: subset_span * count_f64 / (count_f64 - 1.0),
-                        spectrum_time_count: count,
-                        observation_positions: None,
-                        irregular_time_hours: Some(
-                            modified_julian_days
-                                .iter()
-                                .map(|time| time * 24.0)
-                                .collect::<Arc<[f64]>>(),
-                        ),
-                    },
+                    ConfidenceSampling::irregular(
+                        &modified_julian_days,
+                        subset_span,
+                        share_irregular_plan,
+                    ),
                 )
             };
         validate_derived_frequencies(&scalar_constituents)?;
@@ -1419,19 +1476,28 @@ fn dot6(left: [i8; 6], right: [f64; 6]) -> f64 {
     clippy::cast_precision_loss,
     reason = "practical record lengths are exactly representable as f64"
 )]
+#[cfg(test)]
 fn usize_to_f64(value: usize) -> f64 {
     value as f64
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{GreenwichNodalBatch, GreenwichNodalOls, usize_to_f64};
+    use super::{GreenwichNodalBatch, GreenwichNodalOls, shared_lomb_plan_groups, usize_to_f64};
     use crate::{AnalysisError, LinearConfidence, TidalConstituent};
 
     fn times() -> Vec<f64> {
         (0_u32..745)
             .map(|index| 58_113.0 + f64::from(index) / 24.0)
             .collect()
+    }
+
+    #[test]
+    fn shared_lomb_plans_require_amortization_and_are_batch_bounded() {
+        assert_eq!(
+            shared_lomb_plan_groups(&[2, 16, 30, 100, 50, 40, 20]),
+            [false, false, true, true, true, true, false]
+        );
     }
 
     #[test]

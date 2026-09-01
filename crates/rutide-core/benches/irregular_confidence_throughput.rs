@@ -23,6 +23,13 @@ fn setting(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn nonnegative_setting(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
 fn irregular_times() -> Vec<f64> {
     let mut times = (0_u32..745)
         .map(|index| 58_113.0 + f64::from(index) / 24.0)
@@ -97,7 +104,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let series_count = setting("RUTIDE_BENCH_SERIES", 100);
     let repetitions = setting("RUTIDE_BENCH_REPETITIONS", 5);
-    let warmups = setting("RUTIDE_BENCH_WARMUPS", 1);
+    let warmups = nonnegative_setting("RUTIDE_BENCH_WARMUPS", 1);
     let workers = setting("RUTIDE_BENCH_WORKERS", 1);
     set_global_parallelism(Par::Seq);
 

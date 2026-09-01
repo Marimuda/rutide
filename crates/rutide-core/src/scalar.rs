@@ -12,6 +12,7 @@ use faer::{
     Mat,
     linalg::solvers::{ColPivQr, DenseSolveCore, SolveLstsq},
 };
+use rayon::prelude::*;
 use rustfft::{Fft, FftPlanner, num_complex::Complex};
 
 use crate::AnalysisError;
@@ -147,7 +148,7 @@ pub struct FixedRawOls {
     sample_interval_hours: Option<f64>,
     spectrum_time_count: usize,
     spectrum_observation_positions: Option<Vec<usize>>,
-    irregular_spectrum_time_hours: Option<Arc<[f64]>>,
+    irregular_spectrum: Option<IrregularSpectrumSampling>,
     reference_time_days: f64,
     design: Mat<f64>,
     decomposition: ColPivQr<f64>,
@@ -212,7 +213,7 @@ impl FixedRawOls {
             sample_interval_hours: confidence_sampling.sample_interval_hours,
             spectrum_time_count: confidence_sampling.spectrum_time_count,
             spectrum_observation_positions: confidence_sampling.observation_positions,
-            irregular_spectrum_time_hours: confidence_sampling.irregular_time_hours,
+            irregular_spectrum: confidence_sampling.irregular_spectrum,
             reference_time_days,
             design,
             decomposition,
@@ -453,14 +454,14 @@ impl FixedRawOls {
                     &self.constituents,
                 )
             } else {
-                band_averaged_lomb_residual_power(
-                    &residual,
-                    self.irregular_spectrum_time_hours
-                        .as_deref()
-                        .expect("irregular confidence sampling retains timestamps"),
-                    self.effective_record_length_days,
-                    &self.constituents,
-                )
+                self.irregular_spectrum
+                    .as_ref()
+                    .expect("irregular confidence sampling retains timestamps")
+                    .band_averaged_residual_power(
+                        &residual,
+                        self.effective_record_length_days,
+                        &self.constituents,
+                    )
             }
         });
         let mut amplitude = Vec::with_capacity(self.constituents.len());
@@ -540,7 +541,7 @@ pub(crate) struct ConfidenceSampling {
     pub(crate) effective_record_length_days: f64,
     pub(crate) spectrum_time_count: usize,
     pub(crate) observation_positions: Option<Vec<usize>>,
-    pub(crate) irregular_time_hours: Option<Arc<[f64]>>,
+    irregular_spectrum: Option<IrregularSpectrumSampling>,
 }
 
 impl ConfidenceSampling {
@@ -553,12 +554,99 @@ impl ConfidenceSampling {
             effective_record_length_days: time_span_days * time_count_f64 / (time_count_f64 - 1.0),
             spectrum_time_count: time_count,
             observation_positions: None,
-            irregular_time_hours: sample_interval_hours.is_none().then(|| {
-                time_days
-                    .iter()
-                    .map(|time| time * 24.0)
-                    .collect::<Arc<[f64]>>()
-            }),
+            irregular_spectrum: sample_interval_hours
+                .is_none()
+                .then(|| IrregularSpectrumSampling::new(time_days, true)),
+        }
+    }
+
+    pub(crate) fn regular_gappy(
+        sample_interval_hours: f64,
+        time_span_days: f64,
+        spectrum_time_count: usize,
+        observation_positions: Vec<usize>,
+    ) -> Self {
+        let time_count_f64 = usize_to_f64(spectrum_time_count);
+        Self {
+            sample_interval_hours: Some(sample_interval_hours),
+            effective_record_length_days: time_span_days * time_count_f64 / (time_count_f64 - 1.0),
+            spectrum_time_count,
+            observation_positions: (observation_positions.len() != spectrum_time_count)
+                .then_some(observation_positions),
+            irregular_spectrum: None,
+        }
+    }
+
+    pub(crate) fn irregular(time_days: &[f64], time_span_days: f64, share_plan: bool) -> Self {
+        let time_count = time_days.len();
+        let time_count_f64 = usize_to_f64(time_count);
+        Self {
+            sample_interval_hours: None,
+            effective_record_length_days: time_span_days * time_count_f64 / (time_count_f64 - 1.0),
+            spectrum_time_count: time_count,
+            observation_positions: None,
+            irregular_spectrum: Some(IrregularSpectrumSampling::new(time_days, share_plan)),
+        }
+    }
+
+    pub(crate) fn precompute_shared_irregular_plan(&self) {
+        if let Some(sampling) = &self.irregular_spectrum {
+            sampling.precompute_shared_plan();
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct IrregularSpectrumSampling {
+    time_hours: Arc<[f64]>,
+    shared_plan: Option<Arc<OnceLock<LombScarglePlan>>>,
+}
+
+impl IrregularSpectrumSampling {
+    fn new(time_days: &[f64], share_plan: bool) -> Self {
+        let time_hours = time_days
+            .iter()
+            .map(|time| time * 24.0)
+            .collect::<Arc<[f64]>>();
+        let cache_fits_memory_budget =
+            estimated_lomb_basis_bytes(&time_hours) <= MAX_CACHED_LOMB_BASIS_BYTES;
+        Self {
+            time_hours,
+            shared_plan: (share_plan && cache_fits_memory_budget)
+                .then(|| Arc::new(OnceLock::new())),
+        }
+    }
+
+    fn band_averaged_residual_power(
+        &self,
+        residual: &[f64],
+        effective_record_length_days: f64,
+        constituents: &[Constituent],
+    ) -> Vec<f64> {
+        self.shared_plan.as_ref().map_or_else(
+            || {
+                band_averaged_lomb_residual_power(
+                    residual,
+                    &self.time_hours,
+                    effective_record_length_days,
+                    constituents,
+                )
+            },
+            |shared_plan| {
+                shared_plan
+                    .get_or_init(|| LombScarglePlan::new(&self.time_hours))
+                    .band_averaged_residual_power(
+                        residual,
+                        effective_record_length_days,
+                        constituents,
+                    )
+            },
+        )
+    }
+
+    fn precompute_shared_plan(&self) {
+        if let Some(shared_plan) = &self.shared_plan {
+            shared_plan.get_or_init(|| LombScarglePlan::new_parallel(&self.time_hours));
         }
     }
 }
@@ -581,6 +669,9 @@ const FREQUENCY_BANDS_CPH: [[f64; 2]; 9] = [
     [0.260_00, 0.290_00],
     [0.300_00, 0.500_00],
 ];
+// Each plan stores both phase-shifted bases. Long records fall back to the
+// direct kernel instead of silently allocating hundreds of megabytes per mask.
+const MAX_CACHED_LOMB_BASIS_BYTES: usize = 16 * 1024 * 1024;
 
 fn band_averaged_fft_residual_power(
     residual: &[f64],
@@ -704,6 +795,156 @@ fn band_averaged_lomb_residual_power(
     )
 }
 
+/// Timestamp-only work shared by every colored-confidence solve on one record.
+///
+/// The frequency-major layout keeps each projection contiguous. A plan is
+/// created lazily and only for records known to be reusable; unique missing-data
+/// masks retain the direct implementation above to avoid an `O(N * F)` memory
+/// allocation that cannot be amortized.
+#[derive(Debug)]
+struct LombScarglePlan {
+    sample_count: usize,
+    window: Vec<f64>,
+    frequencies: Vec<f64>,
+    frequency_bases: Vec<LombFrequencyBasis>,
+    normalization: f64,
+}
+
+impl LombScarglePlan {
+    fn new(time_hours: &[f64]) -> Self {
+        Self::new_with_parallelism(time_hours, false)
+    }
+
+    fn new_parallel(time_hours: &[f64]) -> Self {
+        Self::new_with_parallelism(time_hours, true)
+    }
+
+    fn new_with_parallelism(time_hours: &[f64], parallel: bool) -> Self {
+        let sample_count = time_hours.len() - time_hours.len() % 2;
+        let time_hours = &time_hours[..sample_count];
+        let first_time = time_hours[0];
+        let time_span = time_hours[sample_count - 1] - first_time;
+        let uniform_step = time_span / usize_to_f64(sample_count - 1);
+        let mut window_energy = 0.0;
+        let window = time_hours
+            .iter()
+            .map(|time| {
+                let uniform_position = ((*time - first_time) / uniform_step)
+                    .clamp(0.0, usize_to_f64(sample_count - 1));
+                let left = bounded_frequency_index(uniform_position.floor());
+                let right = (left + 1).min(sample_count - 1);
+                let fraction = uniform_position - usize_to_f64(left);
+                let left_window = periodic_hann(left, sample_count);
+                let right_window = periodic_hann(right, sample_count);
+                let value = left_window + fraction * (right_window - left_window);
+                window_energy += value * value;
+                value
+            })
+            .collect::<Vec<_>>();
+
+        let frequencies = lomb_frequencies(time_hours);
+        let build_basis =
+            |frequency: &f64| LombFrequencyBasis::new(time_hours, first_time, *frequency);
+        let frequency_bases = if parallel {
+            frequencies.par_iter().map(build_basis).collect()
+        } else {
+            frequencies.iter().map(build_basis).collect()
+        };
+
+        let delta_time = time_span / usize_to_f64(sample_count - 1);
+        let normalization = 2.0 * delta_time * usize_to_f64(sample_count) / window_energy;
+        Self {
+            sample_count,
+            window,
+            frequencies,
+            frequency_bases,
+            normalization,
+        }
+    }
+
+    fn band_averaged_residual_power(
+        &self,
+        residual: &[f64],
+        effective_record_length_days: f64,
+        constituents: &[Constituent],
+    ) -> Vec<f64> {
+        let residual = &residual[..self.sample_count];
+        let mean = residual.iter().sum::<f64>() / usize_to_f64(self.sample_count);
+        let windowed = residual
+            .iter()
+            .zip(&self.window)
+            .map(|(value, window)| (*value - mean) * window)
+            .collect::<Vec<_>>();
+        let spectrum = self
+            .frequency_bases
+            .iter()
+            .map(|basis| {
+                let (cosine_projection, sine_projection) =
+                    basis.cosine.iter().zip(&basis.sine).zip(&windowed).fold(
+                        (0.0, 0.0),
+                        |acc, ((cosine, sine), value)| {
+                            (acc.0 + value * cosine, acc.1 + value * sine)
+                        },
+                    );
+                self.normalization
+                    * (cosine_projection.powi(2) / basis.cosine_energy)
+                        .midpoint(sine_projection.powi(2) / basis.sine_energy)
+            })
+            .collect::<Vec<_>>();
+        band_power_by_constituent(
+            &self.frequencies,
+            &spectrum,
+            effective_record_length_days,
+            constituents,
+        )
+    }
+}
+
+#[derive(Debug)]
+struct LombFrequencyBasis {
+    cosine: Vec<f64>,
+    sine: Vec<f64>,
+    cosine_energy: f64,
+    sine_energy: f64,
+}
+
+impl LombFrequencyBasis {
+    fn new(time_hours: &[f64], first_time: f64, frequency: f64) -> Self {
+        let angular_frequency = TAU * frequency;
+        let mut sine = Vec::with_capacity(time_hours.len());
+        let mut cosine = Vec::with_capacity(time_hours.len());
+        let mut double_sine = 0.0;
+        let mut double_cosine = 0.0;
+        for time in time_hours {
+            let (basis_sine, basis_cosine) = (angular_frequency * (*time - first_time)).sin_cos();
+            sine.push(basis_sine);
+            cosine.push(basis_cosine);
+            double_sine += 2.0 * basis_sine * basis_cosine;
+            double_cosine += basis_cosine * basis_cosine - basis_sine * basis_sine;
+        }
+        let phase_shift = 0.5 * double_sine.atan2(double_cosine);
+        let (phase_sine, phase_cosine) = phase_shift.sin_cos();
+        let mut cosine_energy = 0.0;
+        let mut sine_energy = 0.0;
+        for index in 0..time_hours.len() {
+            let raw_sine = sine[index];
+            let raw_cosine = cosine[index];
+            let basis_sine = raw_sine * phase_cosine - raw_cosine * phase_sine;
+            let basis_cosine = raw_cosine * phase_cosine + raw_sine * phase_sine;
+            sine[index] = basis_sine;
+            cosine[index] = basis_cosine;
+            cosine_energy += basis_cosine * basis_cosine;
+            sine_energy += basis_sine * basis_sine;
+        }
+        Self {
+            cosine,
+            sine,
+            cosine_energy,
+            sine_energy,
+        }
+    }
+}
+
 fn periodic_hann(index: usize, length: usize) -> f64 {
     0.5 - 0.5 * (TAU * usize_to_f64(index) / usize_to_f64(length)).cos()
 }
@@ -739,6 +980,14 @@ fn lomb_frequencies(time_hours: &[f64]) -> Vec<f64> {
         }
     }
     frequencies
+}
+
+fn estimated_lomb_basis_bytes(time_hours: &[f64]) -> usize {
+    let sample_count = time_hours.len() - time_hours.len() % 2;
+    let frequency_count = lomb_frequencies(&time_hours[..sample_count]).len();
+    sample_count
+        .saturating_mul(frequency_count)
+        .saturating_mul(2 * std::mem::size_of::<f64>())
 }
 
 fn lomb_scargle_unnormalized(time_hours: &[f64], values: &[f64], frequency_cph: f64) -> f64 {
@@ -918,8 +1167,8 @@ pub(crate) fn validate_time(
 #[cfg(test)]
 mod tests {
     use super::{
-        Constituent, FixedRawOls, LinearConfidence, band_averaged_lomb_residual_power,
-        lomb_frequencies, usize_to_f64,
+        Constituent, FixedRawOls, IrregularSpectrumSampling, LinearConfidence, LombScarglePlan,
+        band_averaged_lomb_residual_power, lomb_frequencies, usize_to_f64,
     };
     use crate::AnalysisError;
     use std::f64::consts::TAU;
@@ -936,6 +1185,32 @@ mod tests {
         (0..745)
             .map(|index| 58_113.0 + f64::from(index) / 24.0)
             .collect()
+    }
+
+    #[test]
+    fn irregular_basis_cache_is_opt_in_and_memory_bounded() {
+        let short = (0_u32..745)
+            .map(|index| 58_113.0 + f64::from(index) / 24.0)
+            .collect::<Vec<_>>();
+        assert!(
+            IrregularSpectrumSampling::new(&short, true)
+                .shared_plan
+                .is_some()
+        );
+        assert!(
+            IrregularSpectrumSampling::new(&short, false)
+                .shared_plan
+                .is_none()
+        );
+
+        let long = (0_u32..5_000)
+            .map(|index| 58_113.0 + f64::from(index) / 24.0)
+            .collect::<Vec<_>>();
+        assert!(
+            IrregularSpectrumSampling::new(&long, true)
+                .shared_plan
+                .is_none()
+        );
     }
 
     fn signal(
@@ -1160,6 +1435,15 @@ mod tests {
             band_averaged_lomb_residual_power(values, times, effective_days, &constituents)
         };
         let random_jitter = calculate(&time_hours, &residual);
+        let planned_random_jitter = LombScarglePlan::new(&time_hours).band_averaged_residual_power(
+            &residual,
+            (time_hours[sample_count - 1] - time_hours[0]) / 24.0 * usize_to_f64(sample_count)
+                / usize_to_f64(sample_count - 1),
+            &constituents,
+        );
+        for (planned, direct) in planned_random_jitter.iter().zip(&random_jitter) {
+            assert_close(*planned, *direct, 5e-16);
+        }
         for (actual, expected) in random_jitter.iter().zip([
             3.070_558_088_690_660_4e-6,
             3.070_558_088_690_660_4e-6,
