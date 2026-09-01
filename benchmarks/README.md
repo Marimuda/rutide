@@ -64,6 +64,21 @@ uv run --project benchmarks/python --locked \
   --rust-output benchmark-results/rust-vector-correctness-32.nc
 ```
 
+Benchmark scalar or vector colored confidence on the shared deterministic
+irregular/gappy fixture with the dedicated Rust and pinned-Python probes:
+
+```console
+RUTIDE_BENCH_FIELD=scalar RUTIDE_BENCH_SERIES=100 \
+  cargo bench -p rutide-core --bench irregular_confidence_throughput
+uv run --project benchmarks/python --locked \
+  python -m rutide_baseline.irregular_benchmark \
+  --field scalar --series-count 100
+```
+
+Record the worker count explicitly when using the Rust probe. The Python probe is
+canonical single-process UTide with BLAS limited to one thread; it measures the
+existing one-series API that domain users call in a loop.
+
 The `fixed-raw` solver profile is the first Rust parity target. It fits M2, S2,
 N2, K1, and O1 with ordinary least squares, a mean and trend, raw phase, no nodal
 corrections, and no confidence intervals. This deliberately isolates harmonic

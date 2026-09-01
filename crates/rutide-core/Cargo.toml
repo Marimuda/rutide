@@ -22,5 +22,9 @@ harness = false
 name = "greenwich_nodal_throughput"
 harness = false
 
+[[bench]]
+name = "irregular_confidence_throughput"
+harness = false
+
 [lints]
 workspace = true
