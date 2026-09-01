@@ -104,7 +104,7 @@ records all iteration counts in
 on the 100-series worker matrix and 13.39–17.66x faster on 1,000 series at 16/32
 workers.
 
-## 3. Inferred constituents — planned
+## 3. Inferred constituents — in progress
 
 - Support inferred/reference names, amplitude ratios, phase offsets, and exact and
   approximate inference modes.
@@ -116,6 +116,14 @@ Acceptance requires resolved/unresolved scalar pairs, vector ellipses, invalid
 reference graphs, and exact/approximate Python-oracle fixtures. Python UTide does
 not implement Monte Carlo confidence combined with inference; RUTide must either
 retain that explicit boundary or specify and validate an extension.
+
+The scalar fixed-latitude kernel is complete: exact and Python-compatible
+approximate bases, grouped references, robust and bulk solves, white and colored
+linear confidence, PE/SNR, reconstruction, and invalid graph/value handling pass
+resolved and unresolved pinned-oracle fixtures. Inference confidence preserves a
+pinned Python column-order/indexing quirk inside this model only. Coupled vector
+inference, missing-value batch integration, and the CLI/NetCDF schema remain
+before this item can be marked complete.
 
 ## 4. Monte Carlo confidence intervals — planned
 

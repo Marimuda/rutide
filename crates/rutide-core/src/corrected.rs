@@ -1,6 +1,10 @@
 //! Exact Greenwich phase and nodal corrections for catalog constituents.
 
-use std::{cmp::Reverse, collections::HashMap, f64::consts::TAU};
+use std::{
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
+    f64::consts::{PI, TAU},
+};
 
 use faer::Mat;
 use rayon::prelude::*;
@@ -50,6 +54,75 @@ pub struct GreenwichNodalOls {
     base_constituents: Vec<TidalConstituent>,
     recipes: Vec<CorrectionRecipe>,
     model: FixedRawOls,
+}
+
+/// Basis treatment used while fitting inferred constituents.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InferenceMode {
+    /// Include the inferred constituent's exact astronomical basis in the
+    /// constrained reference columns.
+    Exact,
+    /// Reproduce Python `UTide`'s reference-only approximate fit.
+    Approximate,
+}
+
+/// One scalar inferred/reference amplitude and phase relationship.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScalarInferenceRelation {
+    /// Constituent whose coefficients are constrained by the reference.
+    pub inferred: TidalConstituent,
+    /// Independently fitted reference constituent.
+    pub reference: TidalConstituent,
+    /// Non-negative inferred/reference amplitude ratio.
+    pub amplitude_ratio: f64,
+    /// Inferred positive-frequency phase offset in degrees.
+    pub phase_offset_degrees: f64,
+}
+
+impl ScalarInferenceRelation {
+    /// Construct one scalar inference relationship.
+    #[must_use]
+    pub const fn new(
+        inferred: TidalConstituent,
+        reference: TidalConstituent,
+        amplitude_ratio: f64,
+        phase_offset_degrees: f64,
+    ) -> Self {
+        Self {
+            inferred,
+            reference,
+            amplitude_ratio,
+            phase_offset_degrees,
+        }
+    }
+}
+
+/// A reusable scalar exact-Greenwich model with constrained inferred constituents.
+///
+/// Reported constituents follow Python `UTide` order: ordinary requested
+/// constituents, unique references in first-use order, then inferred
+/// constituents grouped by reference. The QR factorization contains only the
+/// ordinary constituents and unique references.
+#[derive(Debug)]
+pub struct ScalarInferenceOls {
+    tidal_constituents: Vec<TidalConstituent>,
+    constituents: Vec<Constituent>,
+    relationships: Vec<ScalarInferenceRelation>,
+    mode: InferenceMode,
+    output_mappings: Vec<ScalarInferenceOutput>,
+    latitude_degrees_north: f64,
+    reference_time_modified_julian_day: f64,
+    base_constituents: Vec<TidalConstituent>,
+    recipes: Vec<CorrectionRecipe>,
+    model: FixedRawOls,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScalarInferenceOutput {
+    source_fit_index: usize,
+    ratio_real: f64,
+    ratio_imaginary: f64,
+    inferred: bool,
 }
 
 impl GreenwichNodalOls {
@@ -357,6 +430,354 @@ impl GreenwichNodalOls {
         )?
         .reconstruct_vector_at_latitude(solution, self.latitude_degrees_north, filter)
     }
+}
+
+impl ScalarInferenceOls {
+    /// Build and factorize a scalar inferred-constituent model from Modified
+    /// Julian Days.
+    ///
+    /// Constituents named anywhere in the relationships are removed from the
+    /// ordinary requested list. References and inferred constituents are then
+    /// appended in Python `UTide`'s stable grouping order.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AnalysisError` for invalid timestamps, latitude, constituents,
+    /// ratios, offsets, duplicate inferred constituents, or reference
+    /// chains/cycles.
+    pub fn prepare_modified_julian_days(
+        modified_julian_days: &[f64],
+        latitude_degrees_north: f64,
+        constituents: &[TidalConstituent],
+        relationships: &[ScalarInferenceRelation],
+        mode: InferenceMode,
+    ) -> Result<Self, AnalysisError> {
+        validate_latitude(latitude_degrees_north)?;
+        let layout = scalar_inference_layout(constituents, relationships)?;
+        let basis = CorrectionBasis::prepare_with_model_count(
+            modified_julian_days,
+            &layout.tidal_constituents,
+            layout.fit_count,
+        )?;
+        let model =
+            basis.scalar_inference_model_at_latitude(latitude_degrees_north, &layout, mode)?;
+
+        Ok(Self {
+            tidal_constituents: layout.tidal_constituents,
+            constituents: basis.scalar_constituents,
+            relationships: relationships.to_vec(),
+            mode,
+            output_mappings: layout.output_mappings,
+            latitude_degrees_north,
+            reference_time_modified_julian_day: basis.reference_time_modified_julian_day,
+            base_constituents: basis.base_constituents,
+            recipes: basis.recipes,
+            model,
+        })
+    }
+
+    /// Return every reported constituent in coefficient order.
+    #[must_use]
+    pub fn tidal_constituents(&self) -> &[TidalConstituent] {
+        &self.tidal_constituents
+    }
+
+    /// Return reported names and reference-time frequencies.
+    #[must_use]
+    pub fn constituents(&self) -> &[Constituent] {
+        &self.constituents
+    }
+
+    /// Return inference relationships in caller-supplied order.
+    #[must_use]
+    pub fn relationships(&self) -> &[ScalarInferenceRelation] {
+        &self.relationships
+    }
+
+    /// Return whether exact or Python-compatible approximate inference is used.
+    #[must_use]
+    pub const fn mode(&self) -> InferenceMode {
+        self.mode
+    }
+
+    /// Return the prepared latitude.
+    #[must_use]
+    pub const fn latitude_degrees_north(&self) -> f64 {
+        self.latitude_degrees_north
+    }
+
+    /// Return the fitted trend epoch as a Modified Julian Day.
+    #[must_use]
+    pub const fn reference_time_modified_julian_day(&self) -> f64 {
+        self.reference_time_modified_julian_day
+    }
+
+    /// Return the expected observation count.
+    #[must_use]
+    pub const fn time_count(&self) -> usize {
+        self.model.time_count()
+    }
+
+    /// Fit one finite scalar series and expand inferred coefficients.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid observation shape or value.
+    pub fn solve(&self, observations: &[f64]) -> Result<ScalarSolution, AnalysisError> {
+        self.model
+            .solve(observations)
+            .map(|solution| self.expand_solution(solution))
+    }
+
+    /// Fit one scalar series with linear confidence intervals and SNR.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid observation shape or value.
+    pub fn solve_with_linear_confidence(
+        &self,
+        observations: &[f64],
+        noise: LinearConfidence,
+    ) -> Result<ScalarSolution, AnalysisError> {
+        self.model
+            .solve_with_linear_confidence(observations, noise)
+            .map(|solution| self.expand_solution(solution))
+    }
+
+    /// Fit one scalar series with Cauchy IRLS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid observations, options, or convergence.
+    pub fn solve_robust(
+        &self,
+        observations: &[f64],
+        options: RobustOptions,
+    ) -> Result<ScalarSolution, AnalysisError> {
+        self.model
+            .solve_robust(observations, options)
+            .map(|solution| self.expand_solution(solution))
+    }
+
+    /// Robustly fit one scalar series with linear confidence intervals and SNR.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid observations, options, or convergence.
+    pub fn solve_robust_with_linear_confidence(
+        &self,
+        observations: &[f64],
+        options: RobustOptions,
+        noise: LinearConfidence,
+    ) -> Result<ScalarSolution, AnalysisError> {
+        self.model
+            .solve_robust_with_linear_confidence(observations, options, noise)
+            .map(|solution| self.expand_solution(solution))
+    }
+
+    /// Fit several complete time-major scalar series.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid series count, shape, or value.
+    pub fn solve_many_time_major(
+        &self,
+        observations: &[f64],
+        series_count: usize,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.model
+            .solve_many_time_major(observations, series_count)
+            .map(|solutions| {
+                solutions
+                    .into_iter()
+                    .map(|solution| self.expand_solution(solution))
+                    .collect()
+            })
+    }
+
+    /// Fit several complete time-major series with linear confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid series count, shape, or value.
+    pub fn solve_many_time_major_with_linear_confidence(
+        &self,
+        observations: &[f64],
+        series_count: usize,
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.model
+            .solve_many_time_major_with_linear_confidence(observations, series_count, noise)
+            .map(|solutions| {
+                solutions
+                    .into_iter()
+                    .map(|solution| self.expand_solution(solution))
+                    .collect()
+            })
+    }
+
+    /// Reconstruct an inferred solution with exact astronomical terms.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid target times, filters, or solution shapes.
+    pub fn reconstruct_modified_julian_days(
+        &self,
+        modified_julian_days: &[f64],
+        solution: &ScalarSolution,
+        filter: &ReconstructionFilter,
+    ) -> Result<Vec<f64>, AnalysisError> {
+        GreenwichNodalReconstructor::from_parts(
+            modified_julian_days,
+            self.reference_time_modified_julian_day,
+            self.tidal_constituents.clone(),
+            &self.base_constituents,
+            self.recipes.clone(),
+        )?
+        .reconstruct_at_latitude(solution, self.latitude_degrees_north, filter)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps coefficient, diagnostic, and confidence expansion in one audited transform"
+    )]
+    fn expand_solution(&self, solution: ScalarSolution) -> ScalarSolution {
+        let cosine_coefficient = self
+            .output_mappings
+            .iter()
+            .map(|mapping| {
+                let cosine = solution.cosine_coefficient[mapping.source_fit_index];
+                let sine = solution.sine_coefficient[mapping.source_fit_index];
+                mapping.ratio_real * cosine + mapping.ratio_imaginary * sine
+            })
+            .collect::<Vec<_>>();
+        let sine_coefficient = self
+            .output_mappings
+            .iter()
+            .map(|mapping| {
+                let cosine = solution.cosine_coefficient[mapping.source_fit_index];
+                let sine = solution.sine_coefficient[mapping.source_fit_index];
+                -mapping.ratio_imaginary * cosine + mapping.ratio_real * sine
+            })
+            .collect::<Vec<_>>();
+        let amplitude = cosine_coefficient
+            .iter()
+            .zip(&sine_coefficient)
+            .map(|(cosine, sine)| cosine.hypot(*sine))
+            .collect::<Vec<_>>();
+        let phase_degrees = cosine_coefficient
+            .iter()
+            .zip(&sine_coefficient)
+            .map(|(cosine, sine)| sine.atan2(*cosine).to_degrees().rem_euclid(360.0))
+            .collect::<Vec<_>>();
+        let total_energy = amplitude.iter().map(|value| value * value).sum::<f64>();
+        let percent_energy = amplitude
+            .iter()
+            .map(|value| 100.0 * value * value / total_energy)
+            .collect::<Vec<_>>();
+
+        let expanded_confidence = match (
+            solution.amplitude_ci.as_deref(),
+            solution.phase_ci_degrees.as_deref(),
+            solution.cosine_coefficient_variance.as_deref(),
+            solution.sine_coefficient_variance.as_deref(),
+        ) {
+            (Some(base_amplitude), Some(base_phase), Some(base_cosine), Some(base_sine)) => {
+                let mut amplitude_ci = Vec::with_capacity(self.output_mappings.len());
+                let mut phase_ci_degrees = Vec::with_capacity(self.output_mappings.len());
+                let mut cosine_variance = Vec::with_capacity(self.output_mappings.len());
+                let mut sine_variance = Vec::with_capacity(self.output_mappings.len());
+                for mapping in &self.output_mappings {
+                    let source = mapping.source_fit_index;
+                    if mapping.inferred {
+                        // This intentionally matches Python UTide's inference
+                        // propagation: inferred variance is derived from the
+                        // reference positive/negative complex coefficients, and
+                        // the linearization point remains the reference pair.
+                        let ratio_real_squared = mapping.ratio_real.powi(2);
+                        let ratio_imaginary_squared = mapping.ratio_imaginary.powi(2);
+                        let variance_cosine = (ratio_real_squared * base_cosine[source])
+                            .midpoint(ratio_imaginary_squared * base_sine[source]);
+                        let variance_sine = (ratio_real_squared * base_sine[source])
+                            .midpoint(ratio_imaginary_squared * base_cosine[source]);
+                        let (amplitude, phase) = scalar_linear_intervals(
+                            solution.cosine_coefficient[source],
+                            solution.sine_coefficient[source],
+                            variance_cosine,
+                            variance_sine,
+                        );
+                        amplitude_ci.push(amplitude);
+                        phase_ci_degrees.push(phase);
+                        cosine_variance.push(variance_cosine);
+                        sine_variance.push(variance_sine);
+                    } else {
+                        amplitude_ci.push(base_amplitude[source]);
+                        phase_ci_degrees.push(base_phase[source]);
+                        cosine_variance.push(base_cosine[source]);
+                        sine_variance.push(base_sine[source]);
+                    }
+                }
+                Some((
+                    amplitude_ci,
+                    phase_ci_degrees,
+                    cosine_variance,
+                    sine_variance,
+                ))
+            }
+            _ => None,
+        };
+        let (amplitude_ci, phase_ci_degrees, signal_to_noise, cosine_variance, sine_variance) =
+            match expanded_confidence {
+                Some((amplitude_ci, phase_ci, cosine_variance, sine_variance)) => {
+                    let signal_to_noise = amplitude
+                        .iter()
+                        .zip(&amplitude_ci)
+                        .map(|(amplitude, interval)| amplitude.powi(2) / (interval / 1.96).powi(2))
+                        .collect();
+                    (
+                        Some(amplitude_ci),
+                        Some(phase_ci),
+                        Some(signal_to_noise),
+                        Some(cosine_variance),
+                        Some(sine_variance),
+                    )
+                }
+                None => (None, None, None, None, None),
+            };
+
+        ScalarSolution {
+            cosine_coefficient,
+            sine_coefficient,
+            amplitude,
+            phase_degrees,
+            percent_energy,
+            amplitude_ci,
+            phase_ci_degrees,
+            signal_to_noise,
+            cosine_coefficient_variance: cosine_variance,
+            sine_coefficient_variance: sine_variance,
+            mean: solution.mean,
+            slope_per_day: solution.slope_per_day,
+            reference_time_days: solution.reference_time_days,
+            robust: solution.robust,
+        }
+    }
+}
+
+fn scalar_linear_intervals(
+    cosine: f64,
+    sine: f64,
+    cosine_variance: f64,
+    sine_variance: f64,
+) -> (f64, f64) {
+    let magnitude_squared = cosine * cosine + sine * sine;
+    let amplitude_sigma = ((cosine * cosine * cosine_variance + sine * sine * sine_variance)
+        / magnitude_squared)
+        .sqrt();
+    let phase_sigma = ((sine * sine * cosine_variance + cosine * cosine * sine_variance)
+        / magnitude_squared.powi(2))
+    .sqrt();
+    (1.96 * amplitude_sigma, 1.96 * phase_sigma * 180.0 / PI)
 }
 
 /// Constituent selection applied during reconstruction.
@@ -1171,6 +1592,114 @@ struct CorrectionBasis {
     sample_interval_hours: Option<f64>,
 }
 
+#[derive(Debug)]
+struct ScalarInferenceLayout {
+    tidal_constituents: Vec<TidalConstituent>,
+    output_mappings: Vec<ScalarInferenceOutput>,
+    reference_groups: Vec<ScalarInferenceReferenceGroup>,
+    fit_count: usize,
+}
+
+#[derive(Debug)]
+struct ScalarInferenceReferenceGroup {
+    fit_index: usize,
+    inferred_outputs: Vec<usize>,
+}
+
+fn scalar_inference_layout(
+    requested: &[TidalConstituent],
+    relationships: &[ScalarInferenceRelation],
+) -> Result<ScalarInferenceLayout, AnalysisError> {
+    validate_tidal_constituents(requested)?;
+    if relationships.is_empty() {
+        return Err(AnalysisError::EmptyInference);
+    }
+
+    let mut inferred = HashSet::with_capacity(relationships.len());
+    for (index, relationship) in relationships.iter().enumerate() {
+        if !relationship.amplitude_ratio.is_finite() || relationship.amplitude_ratio < 0.0 {
+            return Err(AnalysisError::InvalidInferenceAmplitudeRatio { index });
+        }
+        if !relationship.phase_offset_degrees.is_finite() {
+            return Err(AnalysisError::InvalidInferencePhaseOffset { index });
+        }
+        if relationship.inferred == relationship.reference {
+            return Err(AnalysisError::SelfInference { index });
+        }
+        if !inferred.insert(relationship.inferred) {
+            return Err(AnalysisError::DuplicateInferredConstituent { index });
+        }
+    }
+    for relationship in relationships {
+        if inferred.contains(&relationship.reference) {
+            return Err(AnalysisError::InferenceReferenceIsInferred {
+                name: relationship.reference.name(),
+            });
+        }
+    }
+
+    let references = relationships
+        .iter()
+        .map(|relationship| relationship.reference)
+        .fold(Vec::new(), |mut references, reference| {
+            if !references.contains(&reference) {
+                references.push(reference);
+            }
+            references
+        });
+    let reference_set = references.iter().copied().collect::<HashSet<_>>();
+    let ordinary = requested
+        .iter()
+        .copied()
+        .filter(|constituent| {
+            !inferred.contains(constituent) && !reference_set.contains(constituent)
+        })
+        .collect::<Vec<_>>();
+    let fit_count = ordinary.len() + references.len();
+    let mut tidal_constituents = ordinary;
+    tidal_constituents.extend(references.iter().copied());
+    let mut output_mappings = (0..fit_count)
+        .map(|source_fit_index| ScalarInferenceOutput {
+            source_fit_index,
+            ratio_real: 1.0,
+            ratio_imaginary: 0.0,
+            inferred: false,
+        })
+        .collect::<Vec<_>>();
+    let ordinary_count = fit_count - references.len();
+    let mut reference_groups = Vec::with_capacity(references.len());
+    for (reference_position, reference) in references.iter().copied().enumerate() {
+        let fit_index = ordinary_count + reference_position;
+        let mut inferred_outputs = Vec::new();
+        for relationship in relationships
+            .iter()
+            .filter(|relationship| relationship.reference == reference)
+        {
+            let phase = relationship.phase_offset_degrees.to_radians();
+            let output_index = tidal_constituents.len();
+            tidal_constituents.push(relationship.inferred);
+            output_mappings.push(ScalarInferenceOutput {
+                source_fit_index: fit_index,
+                ratio_real: relationship.amplitude_ratio * phase.cos(),
+                ratio_imaginary: relationship.amplitude_ratio * phase.sin(),
+                inferred: true,
+            });
+            inferred_outputs.push(output_index);
+        }
+        reference_groups.push(ScalarInferenceReferenceGroup {
+            fit_index,
+            inferred_outputs,
+        });
+    }
+
+    Ok(ScalarInferenceLayout {
+        tidal_constituents,
+        output_mappings,
+        reference_groups,
+        fit_count,
+    })
+}
+
 #[derive(Clone, Debug)]
 enum CorrectionRecipe {
     Base { base_index: usize },
@@ -1188,9 +1717,17 @@ impl CorrectionBasis {
         modified_julian_days: &[f64],
         constituents: &[TidalConstituent],
     ) -> Result<Self, AnalysisError> {
+        Self::prepare_with_model_count(modified_julian_days, constituents, constituents.len())
+    }
+
+    fn prepare_with_model_count(
+        modified_julian_days: &[f64],
+        constituents: &[TidalConstituent],
+        model_constituent_count: usize,
+    ) -> Result<Self, AnalysisError> {
         validate_tidal_constituents(constituents)?;
         let (reference_time, time_span_days) =
-            validate_time(modified_julian_days, constituents.len())?;
+            validate_time(modified_julian_days, model_constituent_count)?;
         let (base_constituents, recipes) = dependency_recipes(constituents);
         let scalar_constituents = scalar_constituents_at_reference(
             constituents,
@@ -1241,6 +1778,67 @@ impl CorrectionBasis {
         let positions = (0..self.time_terms.len()).collect::<Vec<_>>();
         let record = self.record_subset(positions, true)?;
         self.model_at_latitude_for_record(latitude, &record)
+    }
+
+    fn scalar_inference_model_at_latitude(
+        &self,
+        latitude: f64,
+        layout: &ScalarInferenceLayout,
+        mode: InferenceMode,
+    ) -> Result<FixedRawOls, AnalysisError> {
+        let positions = (0..self.time_terms.len()).collect::<Vec<_>>();
+        let record = self.record_subset(positions, true)?;
+        validate_latitude(latitude)?;
+        let harmonic_columns = layout.fit_count * 2;
+        let mut design = Mat::zeros(record.positions.len(), harmonic_columns + 2);
+        let latitude_factors = latitude_factors(latitude);
+        for (time_index, position) in record.positions.iter().copied().enumerate() {
+            let terms = &self.time_terms[position];
+            let base_corrections = terms
+                .base_nodal_terms
+                .iter()
+                .copied()
+                .map(|terms| nodal_correction(terms, latitude_factors))
+                .collect::<Vec<_>>();
+            let basis_values = (0..self.tidal_constituents.len())
+                .map(|constituent_index| {
+                    let (nodal_amplitude, nodal_phase) =
+                        self.recipes[constituent_index].combine_nodal(&base_corrections);
+                    let angle = TAU * (nodal_phase + terms.greenwich_phase[constituent_index]);
+                    (nodal_amplitude * angle.cos(), nodal_amplitude * angle.sin())
+                })
+                .collect::<Vec<_>>();
+
+            for fit_index in 0..layout.fit_count {
+                design[(time_index, fit_index * 2)] = basis_values[fit_index].0;
+                design[(time_index, fit_index * 2 + 1)] = basis_values[fit_index].1;
+            }
+            if mode == InferenceMode::Exact {
+                for group in &layout.reference_groups {
+                    for output_index in &group.inferred_outputs {
+                        let mapping = layout.output_mappings[*output_index];
+                        let (cosine, sine) = basis_values[*output_index];
+                        design[(time_index, group.fit_index * 2)] +=
+                            mapping.ratio_real * cosine - mapping.ratio_imaginary * sine;
+                        design[(time_index, group.fit_index * 2 + 1)] +=
+                            mapping.ratio_imaginary * cosine + mapping.ratio_real * sine;
+                    }
+                }
+            }
+            design[(time_index, harmonic_columns)] = 1.0;
+            design[(time_index, harmonic_columns + 1)] =
+                (terms.modified_julian_day - record.reference_time) / record.time_span_days;
+        }
+        Ok(FixedRawOls::from_design_with_confidence_constituents(
+            record.scalar_constituents[..layout.fit_count].to_vec(),
+            record.scalar_constituents,
+            Some(layout.fit_count - layout.reference_groups.len()),
+            record.positions.len(),
+            record.time_span_days,
+            record.reference_time,
+            record.confidence_sampling,
+            design,
+        ))
     }
 
     fn record_subset(

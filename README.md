@@ -80,7 +80,8 @@ Large FVCOM data and generated benchmark results also remain outside Git.
 The completed compatibility surface and remaining scientific, interface, and
 resource tasks are tracked in [`ROADMAP.md`](ROADMAP.md). Irregular scalar and
 vector colored confidence use Lomb–Scargle residual spectra, robust fitting is
-complete, and inferred constituents are the next scientific increment.
+complete. Scalar inferred constituents now pass exact and approximate Python
+oracle fixtures; coupled vector inference is the active scientific increment.
 
 ## Development
 

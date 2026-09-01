@@ -75,6 +75,33 @@ pub enum AnalysisError {
         /// Position of the latter duplicate constituent.
         index: usize,
     },
+    /// No inferred/reference relationships were supplied.
+    EmptyInference,
+    /// An inference amplitude ratio is negative, NaN, or infinite.
+    InvalidInferenceAmplitudeRatio {
+        /// Position of the invalid relationship.
+        index: usize,
+    },
+    /// An inference phase offset is NaN or infinite.
+    InvalidInferencePhaseOffset {
+        /// Position of the invalid relationship.
+        index: usize,
+    },
+    /// The same constituent is inferred more than once.
+    DuplicateInferredConstituent {
+        /// Position of the latter relationship.
+        index: usize,
+    },
+    /// A relationship attempts to infer a constituent from itself.
+    SelfInference {
+        /// Position of the invalid relationship.
+        index: usize,
+    },
+    /// An inferred constituent is also used as a reference, forming a chain or cycle.
+    InferenceReferenceIsInferred {
+        /// Conventional catalog name of the invalid reference.
+        name: &'static str,
+    },
     /// No observation series were supplied.
     EmptySeries,
     /// The flattened time-major observation shape does not match the model.
@@ -112,6 +139,10 @@ pub enum AnalysisError {
 }
 
 impl fmt::Display for AnalysisError {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps every public error variant's user-facing message exhaustive in one match"
+    )]
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyTime => formatter.write_str("at least one timestamp is required"),
@@ -171,6 +202,29 @@ impl fmt::Display for AnalysisError {
             Self::DuplicateFrequency { index } => write!(
                 formatter,
                 "constituent at index {index} duplicates an earlier frequency"
+            ),
+            Self::EmptyInference => {
+                formatter.write_str("at least one inferred/reference relationship is required")
+            }
+            Self::InvalidInferenceAmplitudeRatio { index } => write!(
+                formatter,
+                "inference amplitude ratio at index {index} must be finite and non-negative"
+            ),
+            Self::InvalidInferencePhaseOffset { index } => write!(
+                formatter,
+                "inference phase offset at index {index} must be finite"
+            ),
+            Self::DuplicateInferredConstituent { index } => write!(
+                formatter,
+                "inferred constituent at index {index} duplicates an earlier relationship"
+            ),
+            Self::SelfInference { index } => write!(
+                formatter,
+                "inference relationship at index {index} uses the same constituent as reference and inferred"
+            ),
+            Self::InferenceReferenceIsInferred { name } => write!(
+                formatter,
+                "inference reference {name} is itself inferred; chains and cycles are unsupported"
             ),
             Self::EmptySeries => formatter.write_str("at least one observation series is required"),
             Self::ObservationShape { actual, expected } => write!(

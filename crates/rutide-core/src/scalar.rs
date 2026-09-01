@@ -9,7 +9,7 @@ use std::{
 };
 
 use faer::{
-    Mat,
+    Mat, c64,
     linalg::solvers::{ColPivQr, DenseSolveCore, SolveLstsq},
 };
 use rayon::prelude::*;
@@ -147,6 +147,8 @@ impl ScalarSolution {
 #[derive(Debug)]
 pub struct FixedRawOls {
     constituents: Vec<Constituent>,
+    confidence_constituents: Vec<Constituent>,
+    python_inference_non_reference_count: Option<usize>,
     time_count: usize,
     time_span_days: f64,
     effective_record_length_days: f64,
@@ -209,9 +211,38 @@ impl FixedRawOls {
         confidence_sampling: ConfidenceSampling,
         design: Mat<f64>,
     ) -> Self {
+        let confidence_constituents = constituents.clone();
+        Self::from_design_with_confidence_constituents(
+            constituents,
+            confidence_constituents,
+            None,
+            time_count,
+            time_span_days,
+            reference_time_days,
+            confidence_sampling,
+            design,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "prepared inference models carry distinct fit/report constituents and sampling metadata"
+    )]
+    pub(crate) fn from_design_with_confidence_constituents(
+        constituents: Vec<Constituent>,
+        confidence_constituents: Vec<Constituent>,
+        python_inference_non_reference_count: Option<usize>,
+        time_count: usize,
+        time_span_days: f64,
+        reference_time_days: f64,
+        confidence_sampling: ConfidenceSampling,
+        design: Mat<f64>,
+    ) -> Self {
         let decomposition = design.col_piv_qr();
         Self {
             constituents,
+            confidence_constituents,
+            python_inference_non_reference_count,
             time_count,
             time_span_days,
             effective_record_length_days: confidence_sampling.effective_record_length_days,
@@ -593,6 +624,9 @@ impl FixedRawOls {
     }
 
     fn linear_variance_weights(&self, weights: Option<&[f64]>) -> Vec<f64> {
+        if let Some(non_reference_count) = self.python_inference_non_reference_count {
+            return self.python_complex_variance_weights(weights, non_reference_count);
+        }
         let column_count = self.design.ncols();
         let normal = Mat::from_fn(column_count, column_count, |row, column| {
             (0..self.time_count)
@@ -607,6 +641,89 @@ impl FixedRawOls {
         (0..column_count)
             .map(|index| covariance[(index, index)])
             .collect()
+    }
+
+    fn python_complex_variance_weights(
+        &self,
+        weights: Option<&[f64]>,
+        non_reference_count: usize,
+    ) -> Vec<f64> {
+        let constituent_count = self.constituents.len();
+        let reference_count = constituent_count - non_reference_count;
+        let column_count = constituent_count * 2 + 2;
+        let basis = Mat::from_fn(self.time_count, column_count, |time, column| {
+            if column < non_reference_count {
+                c64::new(
+                    self.design[(time, column * 2)],
+                    self.design[(time, column * 2 + 1)],
+                )
+            } else if column < non_reference_count * 2 {
+                let constituent = column - non_reference_count;
+                c64::new(
+                    self.design[(time, constituent * 2)],
+                    -self.design[(time, constituent * 2 + 1)],
+                )
+            } else if column < non_reference_count * 2 + reference_count {
+                let constituent = non_reference_count + column - non_reference_count * 2;
+                c64::new(
+                    self.design[(time, constituent * 2)],
+                    self.design[(time, constituent * 2 + 1)],
+                )
+            } else if column < constituent_count * 2 {
+                let constituent =
+                    non_reference_count + column - (non_reference_count * 2 + reference_count);
+                c64::new(
+                    self.design[(time, constituent * 2)],
+                    -self.design[(time, constituent * 2 + 1)],
+                )
+            } else {
+                c64::new(self.design[(time, column)], 0.0)
+            }
+        });
+        let covariance_normal = Mat::from_fn(column_count, column_count, |row, column| {
+            (0..self.time_count)
+                .map(|time| {
+                    basis[(time, row)].conj()
+                        * weights.map_or(1.0, |weights| weights[time])
+                        * basis[(time, column)]
+                })
+                .sum::<c64>()
+        });
+        let pseudo_normal = Mat::from_fn(column_count, column_count, |row, column| {
+            (0..self.time_count)
+                .map(|time| {
+                    basis[(time, row)]
+                        * weights.map_or(1.0, |weights| weights[time])
+                        * basis[(time, column)]
+                })
+                .sum::<c64>()
+        });
+        let covariance = covariance_normal.partial_piv_lu().inverse();
+        let pseudo_covariance = pseudo_normal.partial_piv_lu().inverse();
+        let mut variance_weights = vec![0.0; self.design.ncols()];
+        for constituent in 0..constituent_count {
+            let positive = constituent;
+            let negative = constituent + constituent_count;
+            let gall_positive_positive =
+                covariance[(positive, positive)] + pseudo_covariance[(positive, positive)];
+            let gall_negative_negative =
+                covariance[(negative, negative)] + pseudo_covariance[(negative, negative)];
+            let gall_positive_negative =
+                covariance[(positive, negative)] + pseudo_covariance[(positive, negative)];
+            let hall_positive_positive =
+                covariance[(positive, positive)] - pseudo_covariance[(positive, positive)];
+            let hall_negative_negative =
+                covariance[(negative, negative)] - pseudo_covariance[(negative, negative)];
+            let hall_positive_negative =
+                covariance[(positive, negative)] - pseudo_covariance[(positive, negative)];
+            variance_weights[constituent * 2] =
+                (gall_positive_positive + gall_negative_negative + gall_positive_negative * 2.0).re
+                    / 2.0;
+            variance_weights[constituent * 2 + 1] =
+                (hall_positive_positive + hall_negative_negative - hall_positive_negative * 2.0).re
+                    / 2.0;
+        }
+        variance_weights
     }
 
     #[allow(
@@ -646,7 +763,7 @@ impl FixedRawOls {
                     &residual,
                     sample_interval_hours,
                     self.effective_record_length_days,
-                    &self.constituents,
+                    &self.confidence_constituents,
                 )
             } else {
                 self.irregular_spectrum
@@ -655,7 +772,7 @@ impl FixedRawOls {
                     .band_averaged_residual_power(
                         &residual,
                         self.effective_record_length_days,
-                        &self.constituents,
+                        &self.confidence_constituents,
                     )
             }
         });

@@ -18,7 +18,8 @@ pub use catalog::{
     UnknownTidalConstituent,
 };
 pub use corrected::{
-    GreenwichNodalBatch, GreenwichNodalOls, GreenwichNodalReconstructor, ReconstructionFilter,
+    GreenwichNodalBatch, GreenwichNodalOls, GreenwichNodalReconstructor, InferenceMode,
+    ReconstructionFilter, ScalarInferenceOls, ScalarInferenceRelation,
 };
 pub use error::AnalysisError;
 pub use robust::{RobustDiagnostics, RobustOptions, RobustTermination};
