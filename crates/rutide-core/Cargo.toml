@@ -26,5 +26,9 @@ harness = false
 name = "irregular_confidence_throughput"
 harness = false
 
+[[bench]]
+name = "robust_throughput"
+harness = false
+
 [lints]
 workspace = true
