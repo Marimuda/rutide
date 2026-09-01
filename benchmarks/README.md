@@ -96,6 +96,24 @@ maximum. Use the same field, series count, warm-up count, repetitions, and worke
 count in comparisons. The Python probe exposes `coef.rf.iterations` from the
 pinned solver rather than inferring work from elapsed time.
 
+Benchmark exact or approximate inferred-constituent OLS with colored confidence
+on either the regular FFT route or the shared-mask irregular Lomb–Scargle route:
+
+```console
+RUTIDE_BENCH_FIELD=vector RUTIDE_BENCH_SAMPLING=irregular \
+  RUTIDE_BENCH_INFERENCE_MODE=exact RUTIDE_BENCH_SERIES=100 \
+  cargo bench -p rutide-core --bench inference_throughput
+uv run --project benchmarks/python --locked \
+  python -m rutide_baseline.inference_benchmark \
+  --field vector --sampling irregular --inference-mode exact \
+  --series-count 100 --workers 1
+```
+
+The scalar probe constrains S2 from M2 and O1 from K1. Vector mode applies the
+same relationships with independent positive/negative rotary ratios. Both sum
+all reported amplitude or semi-major confidence intervals as a cross-language
+checksum; preparation remains outside the repeated solve-only timing.
+
 The `fixed-raw` solver profile is the first Rust parity target. It fits M2, S2,
 N2, K1, and O1 with ordinary least squares, a mean and trend, raw phase, no nodal
 corrections, and no confidence intervals. This deliberately isolates harmonic
