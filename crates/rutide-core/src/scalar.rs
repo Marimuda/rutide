@@ -41,7 +41,7 @@ impl Constituent {
 pub enum LinearConfidence {
     /// One variance estimate shared by all frequencies.
     White,
-    /// `UTide`'s band-averaged residual spectrum for equidistant timestamps.
+    /// `UTide`'s band-averaged FFT or Lomb–Scargle residual spectrum.
     Colored,
 }
 
@@ -55,14 +55,6 @@ enum ConfidenceSpec<'noise> {
 impl ConfidenceSpec<'_> {
     fn is_enabled(self) -> bool {
         !matches!(self, Self::None)
-    }
-
-    fn uses_colored(self) -> bool {
-        match self {
-            Self::None => false,
-            Self::Shared(noise) => noise == LinearConfidence::Colored,
-            Self::BySeries(noise) => noise.contains(&LinearConfidence::Colored),
-        }
     }
 
     fn for_series(self, series: usize) -> Option<LinearConfidence> {
@@ -155,6 +147,7 @@ pub struct FixedRawOls {
     sample_interval_hours: Option<f64>,
     spectrum_time_count: usize,
     spectrum_observation_positions: Option<Vec<usize>>,
+    irregular_spectrum_time_hours: Option<Arc<[f64]>>,
     reference_time_days: f64,
     design: Mat<f64>,
     decomposition: ColPivQr<f64>,
@@ -219,6 +212,7 @@ impl FixedRawOls {
             sample_interval_hours: confidence_sampling.sample_interval_hours,
             spectrum_time_count: confidence_sampling.spectrum_time_count,
             spectrum_observation_positions: confidence_sampling.observation_positions,
+            irregular_spectrum_time_hours: confidence_sampling.irregular_time_hours,
             reference_time_days,
             design,
             decomposition,
@@ -237,6 +231,10 @@ impl FixedRawOls {
         self.time_count
     }
 
+    pub(crate) const fn has_irregular_confidence_sampling(&self) -> bool {
+        self.sample_interval_hours.is_none()
+    }
+
     /// Fit one complete, finite scalar observation series.
     ///
     /// # Errors
@@ -252,8 +250,7 @@ impl FixedRawOls {
     ///
     /// # Errors
     ///
-    /// Returns [`AnalysisError`] for an invalid observation series or when the
-    /// colored-noise model is requested for non-equidistant timestamps.
+    /// Returns [`AnalysisError`] for an invalid observation series.
     pub fn solve_with_linear_confidence(
         &self,
         observations: &[f64],
@@ -286,8 +283,7 @@ impl FixedRawOls {
     ///
     /// # Errors
     ///
-    /// Returns [`AnalysisError`] for invalid observation data or when colored
-    /// noise is requested for non-equidistant timestamps.
+    /// Returns [`AnalysisError`] for invalid observation data.
     pub fn solve_many_time_major_with_linear_confidence(
         &self,
         observations: &[f64],
@@ -317,9 +313,6 @@ impl FixedRawOls {
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         if series_count == 0 {
             return Err(AnalysisError::EmptySeries);
-        }
-        if confidence.uses_colored() && self.sample_interval_hours.is_none() {
-            return Err(AnalysisError::UnevenTimeForColoredConfidence);
         }
         let expected = self.time_count.saturating_mul(series_count);
         if observations.len() != expected {
@@ -455,14 +448,24 @@ impl FixedRawOls {
         let white_variance = (observation_energy - model_observation_product)
             / usize_to_f64(self.time_count - self.design.ncols());
         let colored_power = (noise == LinearConfidence::Colored).then(|| {
-            let residual = self.residual_on_regular_spectrum_grid(&residual);
-            band_averaged_residual_power(
-                &residual,
-                self.sample_interval_hours
-                    .expect("colored confidence validates equidistant timestamps"),
-                self.effective_record_length_days,
-                &self.constituents,
-            )
+            if let Some(sample_interval_hours) = self.sample_interval_hours {
+                let residual = self.residual_on_regular_spectrum_grid(&residual);
+                band_averaged_fft_residual_power(
+                    &residual,
+                    sample_interval_hours,
+                    self.effective_record_length_days,
+                    &self.constituents,
+                )
+            } else {
+                band_averaged_lomb_residual_power(
+                    &residual,
+                    self.irregular_spectrum_time_hours
+                        .as_deref()
+                        .expect("irregular confidence sampling retains timestamps"),
+                    self.effective_record_length_days,
+                    &self.constituents,
+                )
+            }
         });
         let mut amplitude = Vec::with_capacity(self.constituents.len());
         let mut phase_degrees = Vec::with_capacity(self.constituents.len());
@@ -541,17 +544,25 @@ pub(crate) struct ConfidenceSampling {
     pub(crate) effective_record_length_days: f64,
     pub(crate) spectrum_time_count: usize,
     pub(crate) observation_positions: Option<Vec<usize>>,
+    pub(crate) irregular_time_hours: Option<Arc<[f64]>>,
 }
 
 impl ConfidenceSampling {
     pub(crate) fn complete(time_days: &[f64], time_span_days: f64) -> Self {
         let time_count = time_days.len();
         let time_count_f64 = usize_to_f64(time_count);
+        let sample_interval_hours = equidistant_sample_interval_hours(time_days);
         Self {
-            sample_interval_hours: equidistant_sample_interval_hours(time_days),
+            sample_interval_hours,
             effective_record_length_days: time_span_days * time_count_f64 / (time_count_f64 - 1.0),
             spectrum_time_count: time_count,
             observation_positions: None,
+            irregular_time_hours: sample_interval_hours.is_none().then(|| {
+                time_days
+                    .iter()
+                    .map(|time| time * 24.0)
+                    .collect::<Arc<[f64]>>()
+            }),
         }
     }
 }
@@ -575,7 +586,7 @@ const FREQUENCY_BANDS_CPH: [[f64; 2]; 9] = [
     [0.300_00, 0.500_00],
 ];
 
-fn band_averaged_residual_power(
+fn band_averaged_fft_residual_power(
     residual: &[f64],
     sample_interval_hours: f64,
     effective_record_length_days: f64,
@@ -646,6 +657,170 @@ fn band_averaged_residual_power(
                 .map_or(0.0, |(_, power)| power * density_to_power)
         })
         .collect()
+}
+
+fn band_averaged_lomb_residual_power(
+    residual: &[f64],
+    time_hours: &[f64],
+    effective_record_length_days: f64,
+    constituents: &[Constituent],
+) -> Vec<f64> {
+    let sample_count = residual.len() - residual.len() % 2;
+    let residual = &residual[..sample_count];
+    let time_hours = &time_hours[..sample_count];
+    let mean = residual.iter().sum::<f64>() / usize_to_f64(sample_count);
+    let first_time = time_hours[0];
+    let time_span = time_hours[sample_count - 1] - first_time;
+    let uniform_step = time_span / usize_to_f64(sample_count - 1);
+    let mut window_energy = 0.0;
+    let windowed = residual
+        .iter()
+        .zip(time_hours)
+        .map(|(value, time)| {
+            let uniform_position =
+                ((*time - first_time) / uniform_step).clamp(0.0, usize_to_f64(sample_count - 1));
+            let left = bounded_frequency_index(uniform_position.floor());
+            let right = (left + 1).min(sample_count - 1);
+            let fraction = uniform_position - usize_to_f64(left);
+            let left_window = periodic_hann(left, sample_count);
+            let right_window = periodic_hann(right, sample_count);
+            let window = left_window + fraction * (right_window - left_window);
+            window_energy += window * window;
+            (*value - mean) * window
+        })
+        .collect::<Vec<_>>();
+
+    let frequencies = lomb_frequencies(time_hours);
+    let delta_time = time_span / usize_to_f64(sample_count - 1);
+    let normalization = 2.0 * delta_time * usize_to_f64(sample_count) / window_energy;
+    let spectrum = frequencies
+        .iter()
+        .copied()
+        .map(|frequency| {
+            normalization * lomb_scargle_unnormalized(time_hours, &windowed, frequency)
+        })
+        .collect::<Vec<_>>();
+    band_power_by_constituent(
+        &frequencies,
+        &spectrum,
+        effective_record_length_days,
+        constituents,
+    )
+}
+
+fn periodic_hann(index: usize, length: usize) -> f64 {
+    0.5 - 0.5 * (TAU * usize_to_f64(index) / usize_to_f64(length)).cos()
+}
+
+fn lomb_frequencies(time_hours: &[f64]) -> Vec<f64> {
+    const MAX_PER_BAND: usize = 500;
+
+    let sample_count = time_hours.len();
+    let delta_time =
+        (time_hours[sample_count - 1] - time_hours[0]) / usize_to_f64(sample_count - 1);
+    let record_length = usize_to_f64(sample_count) * delta_time;
+    let base_count = sample_count / 2 - 1;
+    let base = (1..=base_count)
+        .map(|index| usize_to_f64(index) / record_length)
+        .collect::<Vec<_>>();
+    let mut frequencies = Vec::new();
+    for [lower, upper] in FREQUENCY_BANDS_CPH {
+        let start = base.partition_point(|frequency| *frequency < lower);
+        let upper_insertion = base.partition_point(|frequency| *frequency < upper);
+        let stop = (upper_insertion + 1).min(base.len());
+        if stop <= start {
+            continue;
+        }
+        let count = stop - start;
+        if count > MAX_PER_BAND {
+            let first = base[start];
+            let last = base[stop - 1];
+            frequencies.extend((0..MAX_PER_BAND).map(|index| {
+                first + (last - first) * usize_to_f64(index) / usize_to_f64(MAX_PER_BAND - 1)
+            }));
+        } else {
+            frequencies.extend_from_slice(&base[start..stop]);
+        }
+    }
+    frequencies
+}
+
+fn lomb_scargle_unnormalized(time_hours: &[f64], values: &[f64], frequency_cph: f64) -> f64 {
+    let angular_frequency = TAU * frequency_cph;
+    let (double_sine, double_cosine) = time_hours.iter().fold((0.0, 0.0), |acc, time| {
+        let angle = 2.0 * angular_frequency * time;
+        (acc.0 + angle.sin(), acc.1 + angle.cos())
+    });
+    let phase_shift = 0.5 * double_sine.atan2(double_cosine);
+    let (cosine_projection, cosine_energy, sine_projection, sine_energy) = time_hours
+        .iter()
+        .zip(values)
+        .fold((0.0, 0.0, 0.0, 0.0), |acc, (time, value)| {
+            let (sine, cosine) = (angular_frequency * time - phase_shift).sin_cos();
+            (
+                acc.0 + value * cosine,
+                acc.1 + cosine * cosine,
+                acc.2 + value * sine,
+                acc.3 + sine * sine,
+            )
+        });
+    (cosine_projection.powi(2) / cosine_energy).midpoint(sine_projection.powi(2) / sine_energy)
+}
+
+fn band_power_by_constituent(
+    frequencies: &[f64],
+    spectrum: &[f64],
+    effective_record_length_days: f64,
+    constituents: &[Constituent],
+) -> Vec<f64> {
+    let mut excluded = vec![false; frequencies.len()];
+    for constituent in constituents {
+        let interpolated = interpolated_frequency_index(frequencies, constituent.frequency_cph);
+        let nearest = interpolated
+            .round_ties_even()
+            .clamp(0.0, usize_to_f64(frequencies.len() - 1));
+        excluded[bounded_frequency_index(nearest)] = true;
+    }
+    let band_power = FREQUENCY_BANDS_CPH.map(|[lower, upper]| {
+        let start = frequencies.partition_point(|frequency| *frequency < lower);
+        let upper_insertion = frequencies.partition_point(|frequency| *frequency < upper);
+        let stop = (upper_insertion + 1).min(frequencies.len());
+        let mut sum = 0.0;
+        let mut count = 0_usize;
+        for index in start..stop {
+            if !excluded[index] {
+                sum += spectrum[index];
+                count += 1;
+            }
+        }
+        sum / usize_to_f64(count)
+    });
+    let density_to_power = 1.0 / (effective_record_length_days * 24.0);
+    constituents
+        .iter()
+        .map(|constituent| {
+            FREQUENCY_BANDS_CPH
+                .iter()
+                .zip(band_power)
+                .find(|([lower, upper], _)| {
+                    constituent.frequency_cph >= *lower && constituent.frequency_cph <= *upper
+                })
+                .map_or(0.0, |(_, power)| power * density_to_power)
+        })
+        .collect()
+}
+
+fn interpolated_frequency_index(frequencies: &[f64], frequency: f64) -> f64 {
+    if frequency <= frequencies[0] {
+        return 0.0;
+    }
+    let last = frequencies.len() - 1;
+    if frequency >= frequencies[last] {
+        return usize_to_f64(last);
+    }
+    let right = frequencies.partition_point(|candidate| *candidate < frequency);
+    let left = right - 1;
+    usize_to_f64(left) + (frequency - frequencies[left]) / (frequencies[right] - frequencies[left])
 }
 
 type FftPlan = Arc<dyn Fft<f64>>;
@@ -746,7 +921,10 @@ pub(crate) fn validate_time(
 
 #[cfg(test)]
 mod tests {
-    use super::{Constituent, FixedRawOls, LinearConfidence};
+    use super::{
+        Constituent, FixedRawOls, LinearConfidence, band_averaged_lomb_residual_power,
+        lomb_frequencies, usize_to_f64,
+    };
     use crate::AnalysisError;
     use std::f64::consts::TAU;
 
@@ -881,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn supports_white_confidence_but_rejects_colored_noise_for_irregular_time() {
+    fn supports_white_and_colored_confidence_for_irregular_time() {
         let constituents = constituents();
         let mut time = times();
         time[20] += 0.001;
@@ -899,10 +1077,124 @@ mod tests {
                 .solve_with_linear_confidence(&observations, LinearConfidence::White)
                 .is_ok()
         );
-        assert_eq!(
-            model.solve_with_linear_confidence(&observations, LinearConfidence::Colored),
-            Err(AnalysisError::UnevenTimeForColoredConfidence)
+        assert!(
+            model
+                .solve_with_linear_confidence(&observations, LinearConfidence::Colored)
+                .is_ok()
         );
+    }
+
+    #[test]
+    fn lomb_scargle_band_power_matches_python_utide() {
+        let sample_count = 744_usize;
+        let mut time_hours = Vec::with_capacity(sample_count);
+        time_hours.push(58_113.0 * 24.0);
+        for index in 1..sample_count {
+            let index = usize_to_f64(index);
+            let step = 1.0 + 0.08 * (index * 0.37).sin() + 0.03 * (index * 0.11).cos();
+            time_hours.push(time_hours[time_hours.len() - 1] + step);
+        }
+        let residual = (0..sample_count)
+            .map(|index| {
+                let index = usize_to_f64(index);
+                0.3 * (index * 0.071).sin()
+                    + 0.2 * (index * 0.173).cos()
+                    + 0.04 * (index * index * 0.003).sin()
+            })
+            .collect::<Vec<_>>();
+        let constituents = constituents();
+        let effective_record_length_days = (time_hours[sample_count - 1] - time_hours[0]) / 24.0
+            * usize_to_f64(sample_count)
+            / usize_to_f64(sample_count - 1);
+
+        let frequencies = lomb_frequencies(&time_hours);
+        assert_eq!(frequencies.len(), 258);
+        assert_close(frequencies[0], 0.001_343_755_858_561_583_2, 5e-15);
+        assert_close(
+            frequencies[frequencies.len() - 1],
+            0.498_533_423_526_347_4,
+            2e-12,
+        );
+        let power = band_averaged_lomb_residual_power(
+            &residual,
+            &time_hours,
+            effective_record_length_days,
+            &constituents,
+        );
+        for (actual, expected) in power.iter().zip([
+            5.806_375_784_746_85e-6,
+            5.806_375_784_746_85e-6,
+            7.338_218_018_124_799_5e-6,
+        ]) {
+            assert_close(*actual, expected, 2e-14);
+        }
+    }
+
+    #[test]
+    fn lomb_scargle_matches_random_jitter_clustered_gap_and_band_edges() {
+        let sample_count = 744_usize;
+        let mut state = 0x1234_5678_u32;
+        let mut time_hours = Vec::with_capacity(sample_count);
+        time_hours.push(58_113.0 * 24.0);
+        for _ in 1..sample_count {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let step = 0.85 + 0.3 * f64::from(state) / 4_294_967_296.0;
+            time_hours.push(time_hours[time_hours.len() - 1] + step);
+        }
+        let residual = (0..sample_count)
+            .map(|index| {
+                let index = usize_to_f64(index);
+                0.3 * (index * 0.071).sin()
+                    + 0.2 * (index * 0.173).cos()
+                    + 0.04 * (index * index * 0.003).sin()
+            })
+            .collect::<Vec<_>>();
+        let constituents = [
+            Constituent::new("M2", 0.080_511_400_671_577_2),
+            Constituent::new("S2", 1.0 / 12.0),
+            Constituent::new("K1", 0.041_780_746_221_637_22),
+            Constituent::new("lower band upper edge", 0.004_17),
+            Constituent::new("diurnal lower edge", 0.031_92),
+        ];
+
+        let calculate = |times: &[f64], values: &[f64]| {
+            let effective_days = (times[times.len() - 1] - times[0]) / 24.0
+                * usize_to_f64(times.len())
+                / usize_to_f64(times.len() - 1);
+            band_averaged_lomb_residual_power(values, times, effective_days, &constituents)
+        };
+        let random_jitter = calculate(&time_hours, &residual);
+        for (actual, expected) in random_jitter.iter().zip([
+            3.070_558_088_690_660_4e-6,
+            3.070_558_088_690_660_4e-6,
+            6.552_421_375_679_652e-6,
+            1.397_353_459_283_417_8e-5,
+            6.552_421_375_679_652e-6,
+        ]) {
+            assert_close(*actual, expected, 2e-13);
+        }
+
+        let retained = (0..sample_count)
+            .filter(|index| !(250..310).contains(index))
+            .collect::<Vec<_>>();
+        let clustered_time = retained
+            .iter()
+            .map(|index| time_hours[*index])
+            .collect::<Vec<_>>();
+        let clustered_residual = retained
+            .iter()
+            .map(|index| residual[*index])
+            .collect::<Vec<_>>();
+        let clustered_gap = calculate(&clustered_time, &clustered_residual);
+        for (actual, expected) in clustered_gap.iter().zip([
+            5.830_275_141_122_778_5e-6,
+            5.830_275_141_122_778_5e-6,
+            5.425_865_304_226_831e-5,
+            4.865_532_439_775_149e-4,
+            5.425_865_304_226_831e-5,
+        ]) {
+            assert_close(*actual, expected, 2e-12);
+        }
     }
 
     #[test]

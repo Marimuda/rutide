@@ -151,6 +151,16 @@ fn oracle_times() -> Vec<f64> {
         .collect()
 }
 
+fn irregular_oracle_times() -> Vec<f64> {
+    let mut times = oracle_times();
+    let final_index = times.len() - 1;
+    for (index, time) in times.iter_mut().enumerate().take(final_index).skip(1) {
+        let index = f64::from(u32::try_from(index).expect("fixture index fits u32"));
+        *time += 0.002 * (index * 0.37).sin() + 0.0007 * (index * 0.11).cos();
+    }
+    times
+}
+
 fn oracle_observations() -> Vec<f64> {
     include_str!("data/fvcom_node_0_zeta_f32.hex")
         .lines()
@@ -480,6 +490,149 @@ fn matches_python_utide_for_gappy_equidistant_scalar_observations() {
         solution.reference_time_days,
         58_128.5,
         0.0,
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one oracle test keeps the complete irregular scalar reference together"
+)]
+fn matches_python_utide_lomb_scargle_confidence_for_irregular_scalar_observations() {
+    let time = irregular_oracle_times();
+    let mut observations = oracle_observations();
+    for index in [0, 137, 411] {
+        observations[index] = f64::NAN;
+    }
+    let batch = GreenwichNodalBatch::prepare_modified_julian_days(&time, &CONSTITUENTS)
+        .expect("valid irregular corrected oracle batch");
+    let solution = batch
+        .solve_time_major_with_missing_and_linear_confidence(
+            &observations,
+            &[LATITUDE_DEGREES_NORTH],
+            LinearConfidence::Colored,
+        )
+        .expect("valid irregular colored solution")
+        .pop()
+        .expect("one solution");
+
+    for (label, actual, expected, tolerance) in [
+        (
+            "irregular amplitude",
+            &solution.amplitude,
+            &[
+                0.654_244_444_119_638_3,
+                0.225_093_924_932_780_27,
+                0.157_258_414_492_770_03,
+                0.111_820_151_047_458_36,
+                0.067_598_797_087_460_1,
+            ],
+            3e-12,
+        ),
+        (
+            "irregular phase",
+            &solution.phase_degrees,
+            &[
+                189.385_326_025_101,
+                229.311_114_833_716_77,
+                163.441_755_838_302_3,
+                153.491_412_732_848_03,
+                21.234_738_319_774_65,
+            ],
+            3e-9,
+        ),
+        (
+            "irregular colored amplitude CI",
+            solution.amplitude_ci.as_ref().expect("amplitude CI"),
+            &[
+                0.015_522_659_450_016_2,
+                0.015_499_371_970_084_946,
+                0.015_492_939_103_060_327,
+                0.010_278_475_329_965_786,
+                0.010_298_920_863_638_402,
+            ],
+            2e-10,
+        ),
+        (
+            "irregular colored phase CI",
+            solution.phase_ci_degrees.as_ref().expect("phase CI"),
+            &[
+                1.355_181_069_898_776,
+                3.944_824_843_568_596,
+                5.648_820_583_983_031,
+                5.280_968_612_410_327,
+                8.718_322_709_819_404,
+            ],
+            2e-8,
+        ),
+        (
+            "irregular colored SNR",
+            solution.signal_to_noise.as_ref().expect("SNR"),
+            &[
+                6_824.329_220_307_737,
+                810.235_912_193_672_8,
+                395.796_819_916_912_97,
+                454.668_530_767_094_5,
+                165.503_291_805_900_1,
+            ],
+            2e-4,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{label}[{index}]"), *actual, *expected, tolerance);
+        }
+    }
+    for (label, actual, expected) in [
+        (
+            "irregular cosine variance",
+            solution
+                .cosine_coefficient_variance
+                .as_ref()
+                .expect("cosine variance"),
+            &[
+                6.273_296_097_747_199e-5,
+                6.248_402_438_138_547e-5,
+                6.247_327_888_939_909e-5,
+                2.745_107_443_210_023_5e-5,
+                2.762_256_173_493_316_7e-5,
+            ],
+        ),
+        (
+            "irregular sine variance",
+            solution
+                .sine_coefficient_variance
+                .as_ref()
+                .expect("sine variance"),
+            &[
+                6.232_197_048_334_572e-5,
+                6.257_090_707_943_217e-5,
+                6.258_165_257_141_862e-5,
+                2.770_066_174_747_745e-5,
+                2.752_917_444_464_449_4e-5,
+            ],
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{label}[{index}]"), *actual, *expected, 2e-12);
+        }
+    }
+    assert_close(
+        "irregular mean",
+        solution.mean,
+        0.091_510_994_992_299_66,
+        3e-12,
+    );
+    assert_close(
+        "irregular slope",
+        solution.slope_per_day,
+        0.001_690_339_784_294_292_8,
+        3e-12,
+    );
+    assert_close(
+        "irregular reference time",
+        solution.reference_time_days,
+        58_128.521_542_833_4,
+        1e-12,
     );
 }
 

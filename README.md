@@ -114,12 +114,10 @@ changed with `--rayleigh-min X`.
 
 Add `--confidence linear` for UTide-compatible colored-noise linear confidence
 intervals and SNR. `--white-noise` selects the white residual-noise alternative.
-Colored confidence currently requires equidistant timestamps; the white model
-also supports irregular timestamps. Missing observations on an originally
-equidistant grid remain supported for colored confidence by linearly
-interpolating fitted residuals onto the full grid before the FFT, matching the
-pinned Python behavior. Truly irregular colored spectra are rejected explicitly
-until a Lomb–Scargle implementation is added.
+Colored and white scalar confidence support regular and irregular timestamps.
+Missing observations on an originally equidistant grid use Python-compatible
+linear interpolation of fitted residuals onto the full grid before the FFT;
+truly irregular timestamps use a Lomb–Scargle residual spectrum.
 
 Add `--reconstruct` to write `reconstruction(time, series)` at every original
 FVCOM timestamp. With no filter it includes every fitted constituent. Use

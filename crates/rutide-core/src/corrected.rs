@@ -1,6 +1,6 @@
 //! Exact Greenwich phase and nodal corrections for catalog constituents.
 
-use std::{collections::HashMap, f64::consts::TAU};
+use std::{collections::HashMap, f64::consts::TAU, sync::Arc};
 
 use faer::Mat;
 use rayon::prelude::*;
@@ -102,8 +102,7 @@ impl GreenwichNodalOls {
     ///
     /// # Errors
     ///
-    /// Returns [`AnalysisError`] for invalid observations or when colored noise
-    /// is requested for non-equidistant timestamps.
+    /// Returns [`AnalysisError`] for invalid observations.
     pub fn solve_with_linear_confidence(
         &self,
         observations: &[f64],
@@ -130,8 +129,7 @@ impl GreenwichNodalOls {
     ///
     /// # Errors
     ///
-    /// Returns [`AnalysisError`] for invalid observations or when colored noise
-    /// is requested for non-equidistant timestamps.
+    /// Returns [`AnalysisError`] for invalid observations.
     pub fn solve_many_time_major_with_linear_confidence(
         &self,
         observations: &[f64],
@@ -176,6 +174,11 @@ impl GreenwichNodalOls {
         northward: &[f64],
         confidence: Option<LinearConfidence>,
     ) -> Result<VectorSolution, AnalysisError> {
+        if confidence == Some(LinearConfidence::Colored)
+            && self.model.has_irregular_confidence_sampling()
+        {
+            return Err(AnalysisError::UnevenTimeForColoredConfidence);
+        }
         if eastward.len() != northward.len() {
             return Err(AnalysisError::ObservationShape {
                 actual: northward.len(),
@@ -645,14 +648,12 @@ impl GreenwichNodalBatch {
     /// Fit possibly gappy scalar series with linearized confidence intervals.
     ///
     /// Colored intervals interpolate residuals from gappy observations onto an
-    /// originally equidistant timestamp grid, matching Python `UTide`. Truly
-    /// irregular input timestamps are rejected until Lomb–Scargle spectra are
-    /// implemented. White intervals support either sampling pattern.
+    /// originally equidistant timestamp grid, matching Python `UTide`, and use
+    /// Lomb–Scargle residual spectra for truly irregular timestamps.
     ///
     /// # Errors
     ///
-    /// Returns [`AnalysisError`] for invalid inputs or unsupported irregular
-    /// colored spectra.
+    /// Returns [`AnalysisError`] for invalid inputs.
     pub fn solve_time_major_with_missing_and_linear_confidence(
         &self,
         observations: &[f64],
@@ -703,6 +704,11 @@ impl GreenwichNodalBatch {
         latitudes: &[f64],
         confidence: Option<LinearConfidence>,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        if confidence == Some(LinearConfidence::Colored)
+            && self.basis.sample_interval_hours.is_none()
+        {
+            return Err(AnalysisError::UnevenTimeForColoredConfidence);
+        }
         validate_batch_shape_and_latitudes(self.time_count(), eastward, latitudes)?;
         if northward.len() != eastward.len() {
             return Err(AnalysisError::ObservationShape {
@@ -970,6 +976,7 @@ impl CorrectionBasis {
                         spectrum_time_count: full_count,
                         observation_positions: (positions.len() != full_count)
                             .then_some(positions.clone()),
+                        irregular_time_hours: None,
                     },
                 )
             } else {
@@ -989,6 +996,12 @@ impl CorrectionBasis {
                         effective_record_length_days: subset_span * count_f64 / (count_f64 - 1.0),
                         spectrum_time_count: count,
                         observation_positions: None,
+                        irregular_time_hours: Some(
+                            modified_julian_days
+                                .iter()
+                                .map(|time| time * 24.0)
+                                .collect::<Arc<[f64]>>(),
+                        ),
                     },
                 )
             };
@@ -1499,7 +1512,7 @@ mod tests {
     }
 
     #[test]
-    fn irregular_gappy_records_support_white_but_reject_colored_confidence() {
+    fn irregular_gappy_records_support_white_and_colored_confidence() {
         let mut time = times();
         time[20] += 0.001;
         let constituents = [TidalConstituent::M2, TidalConstituent::K1];
@@ -1519,13 +1532,20 @@ mod tests {
         assert!(
             (white[0].reference_time_days - time[1].midpoint(time[time.len() - 1])).abs() < 1e-12
         );
-        assert_eq!(
-            batch.solve_time_major_with_missing_and_linear_confidence(
+        let colored = batch
+            .solve_time_major_with_missing_and_linear_confidence(
                 &observations,
                 &[60.0],
                 LinearConfidence::Colored,
-            ),
-            Err(AnalysisError::UnevenTimeForColoredConfidence)
+            )
+            .expect("colored confidence uses Lomb-Scargle for irregular data");
+        assert!(
+            colored[0]
+                .amplitude_ci
+                .as_ref()
+                .expect("colored confidence intervals")
+                .iter()
+                .all(|value| value.is_finite())
         );
 
         let mut northward = observations

@@ -25,14 +25,15 @@ defined behavior, and representative oracle tests are versioned.
 - FVCOM `zeta` and depth-averaged `ua` / `va` NetCDF applications.
 - Whole-field scalar and vector correctness and performance benchmarks.
 
-## 1. Irregular colored-noise confidence — next
+## 1. Irregular colored-noise confidence — in progress
 
 The harmonic least-squares fit already supports irregular timestamps. This item
 concerns only the colored residual spectrum used to estimate confidence intervals.
-Until it is complete, truly irregular colored-confidence requests must continue
-to return `UnevenTimeForColoredConfidence` rather than use an FFT incorrectly.
+Until the vector increment is complete, truly irregular vector colored-confidence
+requests must continue to return `UnevenTimeForColoredConfidence` rather than use
+an unverified component path.
 
-### 1a. Scalar Lomb–Scargle spectrum
+### 1a. Scalar Lomb–Scargle spectrum — complete
 
 - Reproduce UTide's nine residual-noise frequency bands and oversampled frequency
   grid, including the per-band frequency cap.
@@ -48,7 +49,7 @@ jitter, isolated gaps, clustered gaps, and at least one band-boundary constituen
 Tests must compare band powers, coefficient variances, amplitude/phase intervals,
 and SNR, not only the final amplitude.
 
-### 1b. Vector Lomb–Scargle spectrum
+### 1b. Vector Lomb–Scargle spectrum — next
 
 - Compute eastward and northward residual auto-spectra using the scalar kernel.
 - Add the UTide-compatible irregular cross-spectrum needed by full vector
