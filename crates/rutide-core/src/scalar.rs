@@ -17,7 +17,7 @@ use rustfft::{Fft, FftPlanner, num_complex::Complex};
 
 use crate::{
     AnalysisError, RobustDiagnostics, RobustOptions,
-    robust::{RobustFit, fit as robust_fit},
+    robust::{RobustFit, fit_with_initial as robust_fit_with_initial},
 };
 
 /// A named tidal constituent with a fixed frequency.
@@ -275,7 +275,7 @@ impl FixedRawOls {
         options: RobustOptions,
     ) -> Result<ScalarSolution, AnalysisError> {
         let observations = self.observation_matrix(observations, 1)?;
-        let fit = robust_fit(&self.design, &observations, options)?;
+        let fit = self.robust_fit(&observations, options)?;
         Ok(self.robust_component_solution(&fit, observations.as_ref(), 0, None))
     }
 
@@ -291,7 +291,7 @@ impl FixedRawOls {
         noise: LinearConfidence,
     ) -> Result<ScalarSolution, AnalysisError> {
         let observations = self.observation_matrix(observations, 1)?;
-        let fit = robust_fit(&self.design, &observations, options)?;
+        let fit = self.robust_fit(&observations, options)?;
         Ok(self.robust_component_solution(&fit, observations.as_ref(), 0, Some(noise)))
     }
 
@@ -301,7 +301,7 @@ impl FixedRawOls {
         options: RobustOptions,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         let observations = self.observation_matrix(observations, 2)?;
-        let fit = robust_fit(&self.design, &observations, options)?;
+        let fit = self.robust_fit(&observations, options)?;
         Ok((0..2)
             .map(|component| {
                 self.robust_component_solution(&fit, observations.as_ref(), component, None)
@@ -316,7 +316,7 @@ impl FixedRawOls {
         noise: LinearConfidence,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         let observations = self.observation_matrix(observations, 2)?;
-        let fit = robust_fit(&self.design, &observations, options)?;
+        let fit = self.robust_fit(&observations, options)?;
         Ok([LinearConfidence::White, noise]
             .into_iter()
             .enumerate()
@@ -502,6 +502,15 @@ impl FixedRawOls {
             component_count,
             |time, component| observations[time * component_count + component],
         ))
+    }
+
+    fn robust_fit(
+        &self,
+        observations: &Mat<f64>,
+        options: RobustOptions,
+    ) -> Result<RobustFit, AnalysisError> {
+        let initial_coefficients = self.decomposition.solve_lstsq(observations.as_ref());
+        robust_fit_with_initial(&self.design, observations, initial_coefficients, options)
     }
 
     fn robust_component_solution(

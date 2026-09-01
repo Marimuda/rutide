@@ -89,14 +89,27 @@ struct Iteration {
     weight_scale: Option<f64>,
 }
 
-pub(crate) fn fit(
+#[cfg(test)]
+fn fit(
     design: &Mat<f64>,
     observations: &Mat<f64>,
+    options: RobustOptions,
+) -> Result<RobustFit, AnalysisError> {
+    let initial_coefficients = design.col_piv_qr().solve_lstsq(observations.as_ref());
+    fit_with_initial(design, observations, initial_coefficients, options)
+}
+
+pub(crate) fn fit_with_initial(
+    design: &Mat<f64>,
+    observations: &Mat<f64>,
+    initial_coefficients: Mat<f64>,
     options: RobustOptions,
 ) -> Result<RobustFit, AnalysisError> {
     options.validate()?;
     debug_assert_eq!(design.nrows(), observations.nrows());
     debug_assert!(matches!(observations.ncols(), 1 | 2));
+    debug_assert_eq!(initial_coefficients.nrows(), design.ncols());
+    debug_assert_eq!(initial_coefficients.ncols(), observations.ncols());
 
     let leverage = leverage(design)?;
     let residual_factor = leverage
@@ -108,8 +121,13 @@ pub(crate) fn fit(
     let mut previous: Option<Iteration> = None;
     let mut ols_rms_residual = 0.0;
 
+    let mut initial_coefficients = Some(initial_coefficients);
     for iteration_index in 0..options.max_iterations {
-        let current = solve_iteration(design, observations, weights, weight_scale);
+        let current = if let Some(coefficients) = initial_coefficients.take() {
+            iteration_from_coefficients(design, observations, coefficients, weights, weight_scale)
+        } else {
+            solve_iteration(design, observations, weights, weight_scale)
+        };
         if iteration_index == 0 {
             ols_rms_residual = (current.residual_sum_squares / usize_to_f64(design.nrows())).sqrt();
         }
@@ -185,6 +203,16 @@ fn solve_iteration(
     let coefficients = weighted_design
         .col_piv_qr()
         .solve_lstsq(weighted_observations.as_ref());
+    iteration_from_coefficients(design, observations, coefficients, weights, weight_scale)
+}
+
+fn iteration_from_coefficients(
+    design: &Mat<f64>,
+    observations: &Mat<f64>,
+    coefficients: Mat<f64>,
+    weights: Vec<f64>,
+    weight_scale: Option<f64>,
+) -> Iteration {
     let residuals = residuals(design, observations, &coefficients);
     let residual_sum_squares = residuals
         .iter()
