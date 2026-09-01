@@ -61,6 +61,11 @@ The local `UTide/` checkout is deliberately ignored. It is the pinned Python
 behavioral oracle described in the benchmark plan, not vendored RUTide source.
 Large FVCOM data and generated benchmark results also remain outside Git.
 
+The completed compatibility surface and remaining scientific, interface, and
+resource tasks are tracked in [`ROADMAP.md`](ROADMAP.md). The next scientific
+increment is Lomb–Scargle residual spectra for colored confidence intervals on
+truly irregular timestamps.
+
 ## Development
 
 Install [rustup](https://rustup.rs/) and the NetCDF C development library, then

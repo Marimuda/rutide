@@ -340,5 +340,7 @@ Missing-value grouping and scalar/vector current support are now complete. Scala
 and vector fits use per-series valid-time masks, vector fits use the joint
 component mask, and equidistant gaps retain Python-compatible colored FFT
 behavior. Truly irregular colored spectra are rejected explicitly until a
-Lomb–Scargle path is implemented. Each further expansion remains subject to the
-same parity and resource gates above.
+Lomb–Scargle path is implemented. [`ROADMAP.md`](ROADMAP.md) is the authoritative
+ordered task list and acceptance contract for that work and the later robust,
+inference, Monte Carlo, option-parity, and resource increments. Each expansion
+remains subject to the same parity and resource gates above.
