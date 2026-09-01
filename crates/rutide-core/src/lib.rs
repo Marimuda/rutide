@@ -8,6 +8,7 @@ mod astronomy;
 mod catalog;
 mod corrected;
 mod error;
+mod monte_carlo;
 mod robust;
 mod scalar;
 mod selection;
@@ -23,6 +24,7 @@ pub use corrected::{
     VectorInferenceBatch, VectorInferenceOls, VectorInferenceRelation,
 };
 pub use error::AnalysisError;
+pub use monte_carlo::MonteCarloOptions;
 pub use robust::{RobustDiagnostics, RobustOptions, RobustTermination};
 pub use scalar::{Constituent, FixedRawOls, LinearConfidence, ScalarSolution};
 pub use selection::{RayleighSelection, select_constituents_by_rayleigh};

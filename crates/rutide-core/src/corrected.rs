@@ -13,8 +13,9 @@ use faer::{
 use rayon::prelude::*;
 
 use crate::{
-    AnalysisError, Constituent, FixedRawOls, LinearConfidence, RobustDiagnostics, RobustOptions,
-    ScalarSolution, TidalConstituent, VectorReconstruction, VectorSolution,
+    AnalysisError, Constituent, FixedRawOls, LinearConfidence, MonteCarloOptions,
+    RobustDiagnostics, RobustOptions, ScalarSolution, TidalConstituent, VectorReconstruction,
+    VectorSolution,
     astronomy::at_modified_julian_day,
     catalog::{CONSTITUENT_COUNT, Metadata},
     robust::fit_complex_with_initial as robust_complex_fit_with_initial,
@@ -303,6 +304,21 @@ impl GreenwichNodalOls {
         self.model.solve_with_linear_confidence(observations, noise)
     }
 
+    /// Fit one series with reproducible nonlinear Monte Carlo confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid observations, options, or covariance.
+    pub fn solve_with_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<ScalarSolution, AnalysisError> {
+        self.model
+            .solve_with_monte_carlo_confidence(observations, options, noise)
+    }
+
     /// Fit one scalar series with Cauchy iteratively reweighted least squares.
     ///
     /// # Errors
@@ -361,6 +377,27 @@ impl GreenwichNodalOls {
             .solve_many_time_major_with_linear_confidence(observations, series_count, noise)
     }
 
+    /// Fit complete series with reproducible nonlinear Monte Carlo intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid shapes, values, options, or covariance.
+    pub fn solve_many_time_major_with_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        series_count: usize,
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.model
+            .solve_many_time_major_with_monte_carlo_confidence(
+                observations,
+                series_count,
+                options,
+                noise,
+            )
+    }
+
     /// Jointly fit one eastward/northward current series.
     ///
     /// # Errors
@@ -386,6 +423,32 @@ impl GreenwichNodalOls {
         noise: LinearConfidence,
     ) -> Result<VectorSolution, AnalysisError> {
         self.solve_vector_impl(eastward, northward, Some(noise))
+    }
+
+    /// Jointly fit one current series with nonlinear Monte Carlo ellipse intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid components, options, or covariance.
+    pub fn solve_vector_with_monte_carlo_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<VectorSolution, AnalysisError> {
+        if eastward.len() != northward.len() {
+            return Err(AnalysisError::ObservationShape {
+                actual: northward.len(),
+                expected: eastward.len(),
+            });
+        }
+        let mut time_major = Vec::with_capacity(eastward.len() * 2);
+        for (eastward, northward) in eastward.iter().copied().zip(northward.iter().copied()) {
+            time_major.extend([eastward, northward]);
+        }
+        self.model
+            .solve_vector_with_monte_carlo_confidence(&time_major, options, noise, 0)
     }
 
     /// Jointly fit one current series with shared Cauchy robust weights.

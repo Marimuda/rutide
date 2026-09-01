@@ -215,7 +215,7 @@ pub(crate) fn from_component_solutions(
     })
 }
 
-fn ellipse_parameters(
+pub(crate) fn ellipse_parameters(
     eastward_cosine: f64,
     eastward_sine: f64,
     northward_cosine: f64,

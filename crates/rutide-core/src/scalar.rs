@@ -16,8 +16,10 @@ use rayon::prelude::*;
 use rustfft::{Fft, FftPlanner, num_complex::Complex};
 
 use crate::{
-    AnalysisError, RobustDiagnostics, RobustOptions,
+    AnalysisError, MonteCarloOptions, RobustDiagnostics, RobustOptions, VectorSolution,
+    monte_carlo::{scalar_intervals as scalar_monte_carlo_intervals, vector_intervals},
     robust::{RobustFit, fit_with_initial as robust_fit_with_initial},
+    vector::from_component_solutions,
 };
 
 /// A named tidal constituent with a fixed frequency.
@@ -294,6 +296,26 @@ impl FixedRawOls {
         solutions.pop().ok_or(AnalysisError::EmptySeries)
     }
 
+    /// Fit one series with reproducible nonlinear Monte Carlo confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid observations, options, or covariance.
+    pub fn solve_with_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<ScalarSolution, AnalysisError> {
+        let mut solutions = self.solve_many_time_major_with_monte_carlo_confidence(
+            observations,
+            1,
+            options,
+            noise,
+        )?;
+        solutions.pop().ok_or(AnalysisError::EmptySeries)
+    }
+
     /// Fit one series with Cauchy iteratively reweighted least squares.
     ///
     /// # Errors
@@ -389,6 +411,110 @@ impl FixedRawOls {
         self.solve_many_time_major_impl(observations, series_count, ConfidenceSpec::Shared(noise))
     }
 
+    /// Fit multiple series with reproducible nonlinear Monte Carlo intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid shapes, values, options, or covariance.
+    pub fn solve_many_time_major_with_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        series_count: usize,
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_many_time_major_with_monte_carlo_confidence_from_stream(
+            observations,
+            series_count,
+            options,
+            noise,
+            0,
+        )
+    }
+
+    pub(crate) fn solve_many_time_major_with_monte_carlo_confidence_from_stream(
+        &self,
+        observations: &[f64],
+        series_count: usize,
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+        first_stream: u64,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        options.validate()?;
+        if series_count == 0 {
+            return Err(AnalysisError::EmptySeries);
+        }
+        let expected = self.time_count.saturating_mul(series_count);
+        if observations.len() != expected {
+            return Err(AnalysisError::ObservationShape {
+                actual: observations.len(),
+                expected,
+            });
+        }
+        for (index, value) in observations.iter().copied().enumerate() {
+            if !value.is_finite() {
+                return Err(AnalysisError::NonFiniteObservation {
+                    series: index % series_count,
+                    time: index / series_count,
+                });
+            }
+        }
+        let right_hand_sides = Mat::from_fn(self.time_count, series_count, |time, series| {
+            observations[time * series_count + series]
+        });
+        let coefficients = self.decomposition.solve_lstsq(right_hand_sides.as_ref());
+        let normal_inverse = self.coefficient_normal_inverse(None);
+        (0..series_count)
+            .map(|series| {
+                let mut solution = self.component_solution(coefficients.as_ref(), series, None);
+                let covariances = self.scalar_coefficient_covariances(
+                    observations,
+                    series_count,
+                    series,
+                    coefficients.as_ref(),
+                    &normal_inverse,
+                    noise,
+                    None,
+                );
+                let stream = first_stream.wrapping_add(
+                    u64::try_from(series).expect("series index is representable as u64"),
+                );
+                self.apply_scalar_monte_carlo_intervals(
+                    &mut solution,
+                    &covariances,
+                    options,
+                    stream,
+                )?;
+                Ok(solution)
+            })
+            .collect()
+    }
+
+    pub(crate) fn solve_vector_with_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+        stream: u64,
+    ) -> Result<VectorSolution, AnalysisError> {
+        options.validate()?;
+        let observations = self.observation_matrix(observations, 2)?;
+        let coefficients = self.decomposition.solve_lstsq(observations.as_ref());
+        let eastward = self.component_solution(coefficients.as_ref(), 0, None);
+        let northward = self.component_solution(coefficients.as_ref(), 1, None);
+        let mut solution = from_component_solutions(&eastward, &northward)?;
+        let normal_inverse = self.coefficient_normal_inverse(None);
+        let covariances = self.vector_coefficient_covariances(
+            observations.as_ref(),
+            coefficients.as_ref(),
+            &normal_inverse,
+            noise,
+            None,
+        );
+        self.apply_vector_monte_carlo_intervals(&mut solution, &covariances, options, stream)?;
+        Ok(solution)
+    }
+
     pub(crate) fn solve_many_time_major_with_linear_confidence_by_series(
         &self,
         observations: &[f64],
@@ -430,37 +556,14 @@ impl FixedRawOls {
             observations[time * series_count + series]
         });
         let coefficients = self.decomposition.solve_lstsq(right_hand_sides.as_ref());
-        let harmonic_columns = self.constituents.len() * 2;
         let variance_weights = confidence
             .is_enabled()
             .then(|| self.linear_variance_weights(None));
 
         Ok((0..series_count)
             .map(|series| {
-                let mut amplitude = Vec::with_capacity(self.constituents.len());
-                let mut phase_degrees = Vec::with_capacity(self.constituents.len());
-                let mut cosine_coefficient = Vec::with_capacity(self.constituents.len());
-                let mut sine_coefficient = Vec::with_capacity(self.constituents.len());
-                for constituent in 0..self.constituents.len() {
-                    let cosine = coefficients[(constituent * 2, series)];
-                    let sine = coefficients[(constituent * 2 + 1, series)];
-                    cosine_coefficient.push(cosine);
-                    sine_coefficient.push(sine);
-                    amplitude.push(cosine.hypot(sine));
-                    phase_degrees.push(sine.atan2(cosine).to_degrees().rem_euclid(360.0));
-                }
-                let total_energy = amplitude.iter().map(|value| value * value).sum::<f64>();
-                let percent_energy = amplitude
-                    .iter()
-                    .map(|value| 100.0 * (value * value) / total_energy)
-                    .collect();
-                let (
-                    amplitude_ci,
-                    phase_ci_degrees,
-                    signal_to_noise,
-                    cosine_coefficient_variance,
-                    sine_coefficient_variance,
-                ) = if let (Some(noise), Some(variance_weights)) =
+                let mut solution = self.component_solution(coefficients.as_ref(), series, None);
+                if let (Some(noise), Some(variance_weights)) =
                     (confidence.for_series(series), variance_weights.as_ref())
                 {
                     let intervals = self.linear_confidence_intervals(
@@ -472,40 +575,66 @@ impl FixedRawOls {
                         noise,
                         None,
                     );
-                    let signal_to_noise = amplitude
-                        .iter()
-                        .zip(&intervals.amplitude)
-                        .map(|(amplitude, interval)| amplitude.powi(2) / (interval / 1.96).powi(2))
-                        .collect();
-                    (
-                        Some(intervals.amplitude),
-                        Some(intervals.phase_degrees),
-                        Some(signal_to_noise),
-                        Some(intervals.cosine_variance),
-                        Some(intervals.sine_variance),
-                    )
-                } else {
-                    (None, None, None, None, None)
-                };
-                ScalarSolution {
-                    cosine_coefficient,
-                    sine_coefficient,
-                    amplitude,
-                    phase_degrees,
-                    percent_energy,
-                    amplitude_ci,
-                    phase_ci_degrees,
-                    signal_to_noise,
-                    cosine_coefficient_variance,
-                    sine_coefficient_variance,
-                    mean: coefficients[(harmonic_columns, series)],
-                    slope_per_day: coefficients[(harmonic_columns + 1, series)]
-                        / self.time_span_days,
-                    reference_time_days: self.reference_time_days,
-                    robust: None,
+                    solution.signal_to_noise = Some(
+                        solution
+                            .amplitude
+                            .iter()
+                            .zip(&intervals.amplitude)
+                            .map(|(amplitude, interval)| {
+                                amplitude.powi(2) / (interval / 1.96).powi(2)
+                            })
+                            .collect(),
+                    );
+                    solution.amplitude_ci = Some(intervals.amplitude);
+                    solution.phase_ci_degrees = Some(intervals.phase_degrees);
+                    solution.cosine_coefficient_variance = Some(intervals.cosine_variance);
+                    solution.sine_coefficient_variance = Some(intervals.sine_variance);
                 }
+                solution
             })
             .collect())
+    }
+
+    fn component_solution(
+        &self,
+        coefficients: faer::MatRef<'_, f64>,
+        component: usize,
+        robust: Option<RobustDiagnostics>,
+    ) -> ScalarSolution {
+        let mut cosine_coefficient = Vec::with_capacity(self.constituents.len());
+        let mut sine_coefficient = Vec::with_capacity(self.constituents.len());
+        let mut amplitude = Vec::with_capacity(self.constituents.len());
+        let mut phase_degrees = Vec::with_capacity(self.constituents.len());
+        for constituent in 0..self.constituents.len() {
+            let cosine = coefficients[(constituent * 2, component)];
+            let sine = coefficients[(constituent * 2 + 1, component)];
+            cosine_coefficient.push(cosine);
+            sine_coefficient.push(sine);
+            amplitude.push(cosine.hypot(sine));
+            phase_degrees.push(sine.atan2(cosine).to_degrees().rem_euclid(360.0));
+        }
+        let total_energy = amplitude.iter().map(|value| value * value).sum::<f64>();
+        let percent_energy = amplitude
+            .iter()
+            .map(|value| 100.0 * value * value / total_energy)
+            .collect();
+        let harmonic_columns = self.constituents.len() * 2;
+        ScalarSolution {
+            cosine_coefficient,
+            sine_coefficient,
+            amplitude,
+            phase_degrees,
+            percent_energy,
+            amplitude_ci: None,
+            phase_ci_degrees: None,
+            signal_to_noise: None,
+            cosine_coefficient_variance: None,
+            sine_coefficient_variance: None,
+            mean: coefficients[(harmonic_columns, component)],
+            slope_per_day: coefficients[(harmonic_columns + 1, component)] / self.time_span_days,
+            reference_time_days: self.reference_time_days,
+            robust,
+        }
     }
 
     fn observation_matrix(
@@ -623,10 +752,7 @@ impl FixedRawOls {
         }
     }
 
-    fn linear_variance_weights(&self, weights: Option<&[f64]>) -> Vec<f64> {
-        if let Some(non_reference_count) = self.python_inference_non_reference_count {
-            return self.python_complex_variance_weights(weights, non_reference_count);
-        }
+    fn coefficient_normal_inverse(&self, weights: Option<&[f64]>) -> Mat<f64> {
         let column_count = self.design.ncols();
         let normal = Mat::from_fn(column_count, column_count, |row, column| {
             (0..self.time_count)
@@ -637,8 +763,289 @@ impl FixedRawOls {
                 })
                 .sum::<f64>()
         });
-        let covariance = normal.partial_piv_lu().inverse();
-        (0..column_count)
+        normal.partial_piv_lu().inverse()
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "observation layout, fitted coefficients, covariance, noise, and robust weights are explicit"
+    )]
+    fn scalar_coefficient_covariances(
+        &self,
+        observations: &[f64],
+        series_count: usize,
+        series: usize,
+        coefficients: faer::MatRef<'_, f64>,
+        normal_inverse: &Mat<f64>,
+        noise: LinearConfidence,
+        weights: Option<&[f64]>,
+    ) -> Vec<[[f64; 2]; 2]> {
+        let mut residual = Vec::with_capacity(self.time_count);
+        let mut misfit = 0.0;
+        for time in 0..self.time_count {
+            let fitted = (0..self.design.ncols())
+                .map(|column| self.design[(time, column)] * coefficients[(column, series)])
+                .sum::<f64>();
+            let observation = observations[time * series_count + series];
+            let weight = weights.map_or(1.0, |weights| weights[time]);
+            residual.push(weight * (observation - fitted));
+            misfit += weight * observation * (observation - fitted);
+        }
+        let variance = misfit / usize_to_f64(self.time_count - self.design.ncols());
+        let colored_power =
+            (noise == LinearConfidence::Colored).then(|| self.colored_residual_power(&residual));
+        (0..self.constituents.len())
+            .map(|constituent| {
+                let cosine = constituent * 2;
+                let sine = cosine + 1;
+                let mut covariance = [
+                    [
+                        variance * normal_inverse[(cosine, cosine)],
+                        variance * normal_inverse[(cosine, sine)],
+                    ],
+                    [
+                        variance * normal_inverse[(sine, cosine)],
+                        variance * normal_inverse[(sine, sine)],
+                    ],
+                ];
+                if let Some(power) = &colored_power {
+                    let scale = power[constituent] / (covariance[0][0] + covariance[1][1]);
+                    for row in &mut covariance {
+                        for value in row {
+                            *value *= scale;
+                        }
+                    }
+                }
+                covariance
+            })
+            .collect()
+    }
+
+    fn vector_coefficient_covariances(
+        &self,
+        observations: faer::MatRef<'_, f64>,
+        coefficients: faer::MatRef<'_, f64>,
+        normal_inverse: &Mat<f64>,
+        noise: LinearConfidence,
+        weights: Option<&[f64]>,
+    ) -> Vec<[[f64; 4]; 4]> {
+        let mut eastward_residual = Vec::with_capacity(self.time_count);
+        let mut northward_residual = Vec::with_capacity(self.time_count);
+        let mut eastward_misfit = 0.0;
+        let mut northward_misfit = 0.0;
+        let mut cross_misfit = 0.0;
+        for time in 0..self.time_count {
+            let fitted = |component| {
+                (0..self.design.ncols())
+                    .map(|column| self.design[(time, column)] * coefficients[(column, component)])
+                    .sum::<f64>()
+            };
+            let fitted_eastward = fitted(0);
+            let fitted_northward = fitted(1);
+            let eastward = observations[(time, 0)];
+            let northward = observations[(time, 1)];
+            let weight = weights.map_or(1.0, |weights| weights[time]);
+            let eastward_error = eastward - fitted_eastward;
+            let northward_error = northward - fitted_northward;
+            eastward_residual.push(weight * eastward_error);
+            northward_residual.push(weight * northward_error);
+            eastward_misfit += weight * eastward * eastward_error;
+            northward_misfit += weight * northward * northward_error;
+            cross_misfit +=
+                weight * (eastward * northward_error + northward * eastward_error) / 2.0;
+        }
+        let degrees_of_freedom = usize_to_f64(self.time_count - self.design.ncols());
+        let residual_covariance = [
+            eastward_misfit / degrees_of_freedom,
+            northward_misfit / degrees_of_freedom,
+            cross_misfit / degrees_of_freedom,
+        ];
+        let colored_power = (noise == LinearConfidence::Colored)
+            .then(|| self.vector_colored_residual_power(&eastward_residual, &northward_residual));
+        (0..self.constituents.len())
+            .map(|constituent| {
+                let indices = [constituent * 2, constituent * 2 + 1];
+                let mut eastward = [[0.0; 2]; 2];
+                let mut northward = [[0.0; 2]; 2];
+                let mut cross = [[0.0; 2]; 2];
+                for row in 0..2 {
+                    for column in 0..2 {
+                        let design_covariance = normal_inverse[(indices[row], indices[column])];
+                        eastward[row][column] = residual_covariance[0] * design_covariance;
+                        northward[row][column] = residual_covariance[1] * design_covariance;
+                        cross[row][column] = residual_covariance[2] * design_covariance;
+                    }
+                }
+                if let Some(power) = &colored_power {
+                    let eastward_trace = matrix_trace(&eastward);
+                    let northward_trace = matrix_trace(&northward);
+                    let cross_absolute_sum = matrix_absolute_sum(&cross);
+                    scale_matrix(&mut eastward, power.eastward[constituent], eastward_trace);
+                    scale_matrix(
+                        &mut northward,
+                        power.northward[constituent],
+                        northward_trace,
+                    );
+                    scale_matrix(&mut cross, power.cross[constituent], cross_absolute_sum);
+                }
+                [
+                    [eastward[0][0], eastward[0][1], cross[0][0], cross[0][1]],
+                    [eastward[1][0], eastward[1][1], cross[1][0], cross[1][1]],
+                    [cross[0][0], cross[1][0], northward[0][0], northward[0][1]],
+                    [cross[0][1], cross[1][1], northward[1][0], northward[1][1]],
+                ]
+            })
+            .collect()
+    }
+
+    fn apply_scalar_monte_carlo_intervals(
+        &self,
+        solution: &mut ScalarSolution,
+        covariances: &[[[f64; 2]; 2]],
+        options: MonteCarloOptions,
+        stream: u64,
+    ) -> Result<(), AnalysisError> {
+        let mut amplitude = Vec::with_capacity(self.constituents.len());
+        let mut phase = Vec::with_capacity(self.constituents.len());
+        let mut cosine_variance = Vec::with_capacity(self.constituents.len());
+        let mut sine_variance = Vec::with_capacity(self.constituents.len());
+        for (constituent, covariance) in covariances.iter().copied().enumerate() {
+            let constituent_stream = constituent_stream(stream, constituent);
+            let intervals = scalar_monte_carlo_intervals(
+                [
+                    solution.cosine_coefficient[constituent],
+                    solution.sine_coefficient[constituent],
+                ],
+                covariance,
+                options,
+                constituent_stream,
+            )
+            .ok_or(AnalysisError::InvalidConfidenceCovariance { constituent })?;
+            amplitude.push(intervals.amplitude);
+            phase.push(intervals.phase_degrees);
+            cosine_variance.push(covariance[0][0]);
+            sine_variance.push(covariance[1][1]);
+        }
+        solution.signal_to_noise = Some(
+            solution
+                .amplitude
+                .iter()
+                .zip(&amplitude)
+                .map(|(value, interval)| value.powi(2) / (interval / 1.96).powi(2))
+                .collect(),
+        );
+        solution.amplitude_ci = Some(amplitude);
+        solution.phase_ci_degrees = Some(phase);
+        solution.cosine_coefficient_variance = Some(cosine_variance);
+        solution.sine_coefficient_variance = Some(sine_variance);
+        Ok(())
+    }
+
+    fn apply_vector_monte_carlo_intervals(
+        &self,
+        solution: &mut VectorSolution,
+        covariances: &[[[f64; 4]; 4]],
+        options: MonteCarloOptions,
+        stream: u64,
+    ) -> Result<(), AnalysisError> {
+        let mut semi_major = Vec::with_capacity(self.constituents.len());
+        let mut semi_minor = Vec::with_capacity(self.constituents.len());
+        let mut inclination = Vec::with_capacity(self.constituents.len());
+        let mut phase = Vec::with_capacity(self.constituents.len());
+        let (eastward, northward) = solution.component_solutions();
+        for (constituent, covariance) in covariances.iter().copied().enumerate() {
+            let intervals = vector_intervals(
+                [
+                    eastward.cosine_coefficient[constituent],
+                    eastward.sine_coefficient[constituent],
+                    northward.cosine_coefficient[constituent],
+                    northward.sine_coefficient[constituent],
+                ],
+                covariance,
+                options,
+                constituent_stream(stream, constituent),
+            )
+            .ok_or(AnalysisError::InvalidConfidenceCovariance { constituent })?;
+            semi_major.push(intervals.semi_major);
+            semi_minor.push(intervals.semi_minor);
+            inclination.push(intervals.inclination_degrees);
+            phase.push(intervals.phase_degrees);
+        }
+        solution.signal_to_noise = Some(
+            solution
+                .semi_major
+                .iter()
+                .zip(&solution.semi_minor)
+                .zip(&semi_major)
+                .zip(&semi_minor)
+                .map(|(((major, minor), major_ci), minor_ci)| {
+                    (major.powi(2) + minor.powi(2))
+                        / ((major_ci / 1.96).powi(2) + (minor_ci / 1.96).powi(2))
+                })
+                .collect(),
+        );
+        solution.semi_major_ci = Some(semi_major);
+        solution.semi_minor_ci = Some(semi_minor);
+        solution.inclination_ci_degrees = Some(inclination);
+        solution.phase_ci_degrees = Some(phase);
+        Ok(())
+    }
+
+    fn colored_residual_power(&self, residual: &[f64]) -> Vec<f64> {
+        if let Some(sample_interval_hours) = self.sample_interval_hours {
+            let residual = self.residual_on_regular_spectrum_grid(residual);
+            band_averaged_fft_residual_power(
+                &residual,
+                sample_interval_hours,
+                self.effective_record_length_days,
+                &self.confidence_constituents,
+            )
+        } else {
+            self.irregular_spectrum
+                .as_ref()
+                .expect("irregular confidence sampling retains timestamps")
+                .band_averaged_residual_power(
+                    residual,
+                    self.effective_record_length_days,
+                    &self.confidence_constituents,
+                )
+        }
+    }
+
+    fn vector_colored_residual_power(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+    ) -> VectorResidualPower {
+        if let Some(sample_interval_hours) = self.sample_interval_hours {
+            let eastward = self.residual_on_regular_spectrum_grid(eastward);
+            let northward = self.residual_on_regular_spectrum_grid(northward);
+            band_averaged_fft_vector_residual_power(
+                &eastward,
+                &northward,
+                sample_interval_hours,
+                self.effective_record_length_days,
+                &self.confidence_constituents,
+            )
+        } else {
+            self.irregular_spectrum
+                .as_ref()
+                .expect("irregular confidence sampling retains timestamps")
+                .band_averaged_vector_residual_power(
+                    eastward,
+                    northward,
+                    self.effective_record_length_days,
+                    &self.confidence_constituents,
+                )
+        }
+    }
+
+    fn linear_variance_weights(&self, weights: Option<&[f64]>) -> Vec<f64> {
+        if let Some(non_reference_count) = self.python_inference_non_reference_count {
+            return self.python_complex_variance_weights(weights, non_reference_count);
+        }
+        let covariance = self.coefficient_normal_inverse(weights);
+        (0..self.design.ncols())
             .map(|index| covariance[(index, index)])
             .collect()
     }
@@ -1005,6 +1412,36 @@ impl IrregularSpectrumSampling {
         )
     }
 
+    fn band_averaged_vector_residual_power(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        effective_record_length_days: f64,
+        constituents: &[Constituent],
+    ) -> VectorResidualPower {
+        self.shared_plan.as_ref().map_or_else(
+            || {
+                band_averaged_lomb_vector_residual_power(
+                    eastward,
+                    northward,
+                    &self.time_hours,
+                    effective_record_length_days,
+                    constituents,
+                )
+            },
+            |shared_plan| {
+                shared_plan
+                    .get_or_init(|| LombScarglePlan::new(&self.time_hours))
+                    .band_averaged_vector_residual_power(
+                        eastward,
+                        northward,
+                        effective_record_length_days,
+                        constituents,
+                    )
+            },
+        )
+    }
+
     fn precompute_shared_plan(&self) {
         if let Some(shared_plan) = &self.shared_plan {
             shared_plan.get_or_init(|| LombScarglePlan::new_parallel(&self.time_hours));
@@ -1017,6 +1454,43 @@ struct LinearIntervals {
     phase_degrees: Vec<f64>,
     cosine_variance: Vec<f64>,
     sine_variance: Vec<f64>,
+}
+
+struct VectorResidualPower {
+    eastward: Vec<f64>,
+    northward: Vec<f64>,
+    cross: Vec<f64>,
+}
+
+fn matrix_trace(matrix: &[[f64; 2]; 2]) -> f64 {
+    matrix[0][0] + matrix[1][1]
+}
+
+fn matrix_absolute_sum(matrix: &[[f64; 2]; 2]) -> f64 {
+    matrix.iter().flatten().map(|value| value.abs()).sum()
+}
+
+fn scale_matrix(matrix: &mut [[f64; 2]; 2], numerator: f64, denominator: f64) {
+    if denominator == 0.0 {
+        for row in matrix {
+            row.fill(0.0);
+        }
+        return;
+    }
+    let scale = numerator / denominator;
+    for row in matrix {
+        for value in row {
+            *value *= scale;
+        }
+    }
+}
+
+fn constituent_stream(series_stream: u64, constituent: usize) -> u64 {
+    series_stream
+        .wrapping_mul(0xD134_2543_DE82_EF95)
+        .wrapping_add(
+            u64::try_from(constituent).expect("constituent index is representable as u64"),
+        )
 }
 
 const FREQUENCY_BANDS_CPH: [[f64; 2]; 9] = [
@@ -1066,6 +1540,96 @@ fn band_averaged_fft_residual_power(
         *value *= 2.0;
     }
 
+    regular_band_power_by_constituent(
+        frequency_spacing,
+        &power,
+        effective_record_length_days,
+        constituents,
+    )
+}
+
+fn band_averaged_fft_vector_residual_power(
+    eastward: &[f64],
+    northward: &[f64],
+    sample_interval_hours: f64,
+    effective_record_length_days: f64,
+    constituents: &[Constituent],
+) -> VectorResidualPower {
+    debug_assert_eq!(eastward.len(), northward.len());
+    let sample_count = eastward.len() - eastward.len() % 2;
+    let denominator = usize_to_f64(sample_count);
+    let eastward_mean = eastward[..sample_count].iter().sum::<f64>() / denominator;
+    let northward_mean = northward[..sample_count].iter().sum::<f64>() / denominator;
+    let mut window_energy = 0.0;
+    let mut eastward_spectrum = Vec::with_capacity(sample_count);
+    let mut northward_spectrum = Vec::with_capacity(sample_count);
+    for index in 0..sample_count {
+        let window = periodic_hann(index, sample_count);
+        window_energy += window * window;
+        eastward_spectrum.push(Complex::new(
+            (eastward[index] - eastward_mean) * window,
+            0.0,
+        ));
+        northward_spectrum.push(Complex::new(
+            (northward[index] - northward_mean) * window,
+            0.0,
+        ));
+    }
+    let transform = cached_forward_fft(sample_count);
+    transform.process(&mut eastward_spectrum);
+    transform.process(&mut northward_spectrum);
+
+    let frequency_count = sample_count / 2 + 1;
+    let frequency_spacing = 1.0 / (denominator * sample_interval_hours);
+    let normalization = sample_interval_hours / window_energy;
+    let mut eastward_power = Vec::with_capacity(frequency_count);
+    let mut northward_power = Vec::with_capacity(frequency_count);
+    let mut cross_power = Vec::with_capacity(frequency_count);
+    for (index, (eastward, northward)) in eastward_spectrum[..frequency_count]
+        .iter()
+        .zip(&northward_spectrum[..frequency_count])
+        .enumerate()
+    {
+        let one_sided = if index == 0 || index + 1 == frequency_count {
+            1.0
+        } else {
+            2.0
+        };
+        eastward_power.push(eastward.norm_sqr() * normalization * one_sided);
+        northward_power.push(northward.norm_sqr() * normalization * one_sided);
+        cross_power.push((eastward.conj() * northward).re * normalization * one_sided);
+    }
+
+    VectorResidualPower {
+        eastward: regular_band_power_by_constituent(
+            frequency_spacing,
+            &eastward_power,
+            effective_record_length_days,
+            constituents,
+        ),
+        northward: regular_band_power_by_constituent(
+            frequency_spacing,
+            &northward_power,
+            effective_record_length_days,
+            constituents,
+        ),
+        cross: regular_band_power_by_constituent(
+            frequency_spacing,
+            &cross_power,
+            effective_record_length_days,
+            constituents,
+        ),
+    }
+}
+
+fn regular_band_power_by_constituent(
+    frequency_spacing: f64,
+    spectrum: &[f64],
+    effective_record_length_days: f64,
+    constituents: &[Constituent],
+) -> Vec<f64> {
+    let frequency_count = spectrum.len();
+
     let mut excluded = vec![false; frequency_count];
     for constituent in constituents {
         let nearest = (constituent.frequency_cph / frequency_spacing)
@@ -1086,7 +1650,7 @@ fn band_averaged_fft_residual_power(
         let mut count = 0_usize;
         for index in start..stop {
             if !excluded[index] {
-                sum += power[index];
+                sum += spectrum[index];
                 count += 1;
             }
         }
@@ -1154,6 +1718,79 @@ fn band_averaged_lomb_residual_power(
         effective_record_length_days,
         constituents,
     )
+}
+
+fn band_averaged_lomb_vector_residual_power(
+    eastward: &[f64],
+    northward: &[f64],
+    time_hours: &[f64],
+    effective_record_length_days: f64,
+    constituents: &[Constituent],
+) -> VectorResidualPower {
+    debug_assert_eq!(eastward.len(), northward.len());
+    let sample_count = eastward.len() - eastward.len() % 2;
+    let eastward = &eastward[..sample_count];
+    let northward = &northward[..sample_count];
+    let time_hours = &time_hours[..sample_count];
+    let denominator = usize_to_f64(sample_count);
+    let eastward_mean = eastward.iter().sum::<f64>() / denominator;
+    let northward_mean = northward.iter().sum::<f64>() / denominator;
+    let first_time = time_hours[0];
+    let time_span = time_hours[sample_count - 1] - first_time;
+    let uniform_step = time_span / usize_to_f64(sample_count - 1);
+    let mut window_energy = 0.0;
+    let mut eastward_windowed = Vec::with_capacity(sample_count);
+    let mut northward_windowed = Vec::with_capacity(sample_count);
+    for index in 0..sample_count {
+        let uniform_position = ((time_hours[index] - first_time) / uniform_step)
+            .clamp(0.0, usize_to_f64(sample_count - 1));
+        let left = bounded_frequency_index(uniform_position.floor());
+        let right = (left + 1).min(sample_count - 1);
+        let fraction = uniform_position - usize_to_f64(left);
+        let window = periodic_hann(left, sample_count)
+            + fraction * (periodic_hann(right, sample_count) - periodic_hann(left, sample_count));
+        window_energy += window * window;
+        eastward_windowed.push((eastward[index] - eastward_mean) * window);
+        northward_windowed.push((northward[index] - northward_mean) * window);
+    }
+
+    let frequencies = lomb_frequencies(time_hours);
+    let delta_time = time_span / usize_to_f64(sample_count - 1);
+    let normalization = 2.0 * delta_time * denominator / window_energy;
+    let mut eastward_spectrum = Vec::with_capacity(frequencies.len());
+    let mut northward_spectrum = Vec::with_capacity(frequencies.len());
+    let mut cross_spectrum = Vec::with_capacity(frequencies.len());
+    for frequency in &frequencies {
+        let (eastward_power, northward_power, cross_power) = lomb_scargle_unnormalized_vector(
+            time_hours,
+            &eastward_windowed,
+            &northward_windowed,
+            *frequency,
+        );
+        eastward_spectrum.push(normalization * eastward_power);
+        northward_spectrum.push(normalization * northward_power);
+        cross_spectrum.push(normalization * cross_power);
+    }
+    VectorResidualPower {
+        eastward: band_power_by_constituent(
+            &frequencies,
+            &eastward_spectrum,
+            effective_record_length_days,
+            constituents,
+        ),
+        northward: band_power_by_constituent(
+            &frequencies,
+            &northward_spectrum,
+            effective_record_length_days,
+            constituents,
+        ),
+        cross: band_power_by_constituent(
+            &frequencies,
+            &cross_spectrum,
+            effective_record_length_days,
+            constituents,
+        ),
+    }
 }
 
 /// Timestamp-only work shared by every colored-confidence solve on one record.
@@ -1258,6 +1895,87 @@ impl LombScarglePlan {
             effective_record_length_days,
             constituents,
         )
+    }
+
+    fn band_averaged_vector_residual_power(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        effective_record_length_days: f64,
+        constituents: &[Constituent],
+    ) -> VectorResidualPower {
+        debug_assert_eq!(eastward.len(), northward.len());
+        let eastward = &eastward[..self.sample_count];
+        let northward = &northward[..self.sample_count];
+        let denominator = usize_to_f64(self.sample_count);
+        let eastward_mean = eastward.iter().sum::<f64>() / denominator;
+        let northward_mean = northward.iter().sum::<f64>() / denominator;
+        let eastward_windowed = eastward
+            .iter()
+            .zip(&self.window)
+            .map(|(value, window)| (*value - eastward_mean) * window)
+            .collect::<Vec<_>>();
+        let northward_windowed = northward
+            .iter()
+            .zip(&self.window)
+            .map(|(value, window)| (*value - northward_mean) * window)
+            .collect::<Vec<_>>();
+        let mut eastward_spectrum = Vec::with_capacity(self.frequencies.len());
+        let mut northward_spectrum = Vec::with_capacity(self.frequencies.len());
+        let mut cross_spectrum = Vec::with_capacity(self.frequencies.len());
+        for basis in &self.frequency_bases {
+            let projections = basis
+                .cosine
+                .iter()
+                .zip(&basis.sine)
+                .zip(&eastward_windowed)
+                .zip(&northward_windowed)
+                .fold(
+                    [0.0; 4],
+                    |mut sums, (((cosine, sine), eastward), northward)| {
+                        sums[0] += eastward * cosine;
+                        sums[1] += eastward * sine;
+                        sums[2] += northward * cosine;
+                        sums[3] += northward * sine;
+                        sums
+                    },
+                );
+            eastward_spectrum.push(
+                self.normalization
+                    * (projections[0].powi(2) / basis.cosine_energy)
+                        .midpoint(projections[1].powi(2) / basis.sine_energy),
+            );
+            northward_spectrum.push(
+                self.normalization
+                    * (projections[2].powi(2) / basis.cosine_energy)
+                        .midpoint(projections[3].powi(2) / basis.sine_energy),
+            );
+            cross_spectrum.push(
+                self.normalization
+                    * (projections[0] * projections[2] / basis.cosine_energy)
+                        .midpoint(projections[1] * projections[3] / basis.sine_energy),
+            );
+        }
+        VectorResidualPower {
+            eastward: band_power_by_constituent(
+                &self.frequencies,
+                &eastward_spectrum,
+                effective_record_length_days,
+                constituents,
+            ),
+            northward: band_power_by_constituent(
+                &self.frequencies,
+                &northward_spectrum,
+                effective_record_length_days,
+                constituents,
+            ),
+            cross: band_power_by_constituent(
+                &self.frequencies,
+                &cross_spectrum,
+                effective_record_length_days,
+                constituents,
+            ),
+        }
     }
 }
 
@@ -1371,6 +2089,39 @@ fn lomb_scargle_unnormalized(time_hours: &[f64], values: &[f64], frequency_cph: 
             )
         });
     (cosine_projection.powi(2) / cosine_energy).midpoint(sine_projection.powi(2) / sine_energy)
+}
+
+fn lomb_scargle_unnormalized_vector(
+    time_hours: &[f64],
+    eastward: &[f64],
+    northward: &[f64],
+    frequency_cph: f64,
+) -> (f64, f64, f64) {
+    let angular_frequency = TAU * frequency_cph;
+    let (double_sine, double_cosine) = time_hours.iter().fold((0.0, 0.0), |acc, time| {
+        let angle = 2.0 * angular_frequency * time;
+        (acc.0 + angle.sin(), acc.1 + angle.cos())
+    });
+    let phase_shift = 0.5 * double_sine.atan2(double_cosine);
+    let projections = time_hours.iter().zip(eastward).zip(northward).fold(
+        [0.0; 6],
+        |mut sums, ((time, eastward), northward)| {
+            let (sine, cosine) = (angular_frequency * time - phase_shift).sin_cos();
+            sums[0] += eastward * cosine;
+            sums[1] += eastward * sine;
+            sums[2] += northward * cosine;
+            sums[3] += northward * sine;
+            sums[4] += cosine * cosine;
+            sums[5] += sine * sine;
+            sums
+        },
+    );
+    (
+        (projections[0].powi(2) / projections[4]).midpoint(projections[1].powi(2) / projections[5]),
+        (projections[2].powi(2) / projections[4]).midpoint(projections[3].powi(2) / projections[5]),
+        (projections[0] * projections[2] / projections[4])
+            .midpoint(projections[1] * projections[3] / projections[5]),
+    )
 }
 
 fn band_power_by_constituent(
@@ -1529,7 +2280,8 @@ pub(crate) fn validate_time(
 mod tests {
     use super::{
         Constituent, FixedRawOls, IrregularSpectrumSampling, LinearConfidence, LombScarglePlan,
-        band_averaged_lomb_residual_power, lomb_frequencies, usize_to_f64,
+        band_averaged_fft_vector_residual_power, band_averaged_lomb_residual_power,
+        band_averaged_lomb_vector_residual_power, lomb_frequencies, usize_to_f64,
     };
     use crate::AnalysisError;
     use std::f64::consts::TAU;
@@ -1759,6 +2511,110 @@ mod tests {
             7.338_218_018_124_799_5e-6,
         ]) {
             assert_close(*actual, expected, 2e-14);
+        }
+    }
+
+    #[test]
+    fn vector_cross_spectra_match_python_utide_for_regular_and_irregular_time() {
+        let sample_count = 744_usize;
+        let eastward = (0..sample_count)
+            .map(|index| {
+                let index = usize_to_f64(index);
+                0.3 * (index * 0.071).sin()
+                    + 0.2 * (index * 0.173).cos()
+                    + 0.04 * (index * index * 0.003).sin()
+            })
+            .collect::<Vec<_>>();
+        let northward = (0..sample_count)
+            .map(|index| {
+                let index = usize_to_f64(index);
+                -0.17 * (index * 0.053).cos()
+                    + 0.11 * (index * 0.131).sin()
+                    + 0.025 * (index * index * 0.002).cos()
+            })
+            .collect::<Vec<_>>();
+        let constituents = constituents();
+        let regular = band_averaged_fft_vector_residual_power(
+            &eastward,
+            &northward,
+            1.0,
+            31.0,
+            &constituents,
+        );
+        for (actual, expected) in regular.eastward.iter().zip([
+            6.320_636_150_930_253e-8,
+            6.320_636_150_930_253e-8,
+            9.910_877_830_793_654e-8,
+        ]) {
+            assert_close(*actual, expected, 1e-17);
+        }
+        for (actual, expected) in regular.northward.iter().zip([
+            1.673_595_936_245_554_2e-7,
+            1.673_595_936_245_554_2e-7,
+            1.383_637_853_460_331_8e-8,
+        ]) {
+            assert_close(*actual, expected, 1e-17);
+        }
+        for (actual, expected) in regular.cross.iter().zip([
+            -1.124_815_607_960_934_4e-8,
+            -1.124_815_607_960_934_4e-8,
+            7.508_596_259_390_926e-9,
+        ]) {
+            assert_close(*actual, expected, 1e-17);
+        }
+
+        let mut time_hours = Vec::with_capacity(sample_count);
+        time_hours.push(58_113.0 * 24.0);
+        for index in 1..sample_count {
+            let index = usize_to_f64(index);
+            let step = 1.0 + 0.08 * (index * 0.37).sin() + 0.03 * (index * 0.11).cos();
+            time_hours.push(time_hours[time_hours.len() - 1] + step);
+        }
+        let effective_record_length_days = (time_hours[sample_count - 1] - time_hours[0]) / 24.0
+            * usize_to_f64(sample_count)
+            / usize_to_f64(sample_count - 1);
+        let irregular = band_averaged_lomb_vector_residual_power(
+            &eastward,
+            &northward,
+            &time_hours,
+            effective_record_length_days,
+            &constituents,
+        );
+        let planned = LombScarglePlan::new(&time_hours).band_averaged_vector_residual_power(
+            &eastward,
+            &northward,
+            effective_record_length_days,
+            &constituents,
+        );
+        for (actual, expected) in irregular.eastward.iter().zip([
+            5.806_375_783_887_969e-6,
+            5.806_375_783_887_969e-6,
+            7.338_218_018_561_512e-6,
+        ]) {
+            assert_close(*actual, expected, 2e-15);
+        }
+        for (actual, expected) in irregular.northward.iter().zip([
+            1.245_734_923_566_412_4e-6,
+            1.245_734_923_566_412_4e-6,
+            1.933_804_951_157_388_8e-6,
+        ]) {
+            assert_close(*actual, expected, 2e-15);
+        }
+        for (actual, expected) in irregular.cross.iter().zip([
+            -1.011_981_330_836_897_9e-7,
+            -1.011_981_330_836_897_9e-7,
+            -1.231_584_575_732_415e-7,
+        ]) {
+            assert_close(*actual, expected, 2e-16);
+        }
+        for (direct, cached) in [
+            (&irregular.eastward, &planned.eastward),
+            (&irregular.northward, &planned.northward),
+            (&irregular.cross, &planned.cross),
+        ] {
+            for (direct, cached) in direct.iter().zip(cached) {
+                assert_close(*direct, *cached, 2e-15);
+            }
         }
     }
 

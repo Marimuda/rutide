@@ -2,7 +2,7 @@
 
 use rutide_core::{
     AnalysisError, GreenwichNodalBatch, GreenwichNodalOls, GreenwichNodalReconstructor,
-    LinearConfidence, ReconstructionFilter, RobustOptions, TidalConstituent,
+    LinearConfidence, MonteCarloOptions, ReconstructionFilter, RobustOptions, TidalConstituent,
 };
 
 const CONSTITUENTS: [TidalConstituent; 5] = [
@@ -198,6 +198,11 @@ fn assert_close(label: &str, actual: f64, expected: f64, tolerance: f64) {
         (actual - expected).abs() <= tolerance,
         "{label}: actual={actual:.16e}, expected={expected:.16e}, tolerance={tolerance:.3e}"
     );
+}
+
+fn assert_relative_close(label: &str, actual: f64, expected: f64, relative_tolerance: f64) {
+    let tolerance = relative_tolerance * expected.abs().max(f64::MIN_POSITIVE);
+    assert_close(label, actual, expected, tolerance);
 }
 
 #[test]
@@ -1044,6 +1049,238 @@ fn matches_python_utide_linear_confidence_and_derived_snr() {
         colored.constituent_indices_by_signal_to_noise(),
         Some(vec![0, 1, 3, 2, 4])
     );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the complete seeded scalar/vector Python distribution fixture is kept together"
+)]
+fn matches_python_utide_monte_carlo_distributions_and_is_seeded() {
+    let time = oracle_times();
+    let observations = oracle_observations();
+    let (eastward, northward) = synthetic_vector_observations(&time);
+    let model = GreenwichNodalOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE_DEGREES_NORTH,
+        &CONSTITUENTS,
+    )
+    .expect("valid corrected oracle model");
+    let options = MonteCarloOptions {
+        realizations: 200,
+        seed: 20_260_901,
+    };
+    let python_scalar = [
+        (
+            [
+                0.015_390_187_735_185_013,
+                0.014_836_832_580_709_936,
+                0.013_180_176_073_152_965,
+                0.017_751_814_120_816_43,
+                0.017_032_818_560_040_974,
+            ],
+            [
+                1.077_601_599_482_886,
+                3.494_841_552_403_972,
+                5.276_068_182_594_5,
+                7.793_996_513_296_821,
+                12.539_001_774_507_195,
+            ],
+        ),
+        (
+            [
+                0.016_600_237_688_198_165,
+                0.015_590_733_709_989_545,
+                0.014_168_073_155_724_216,
+                0.011_308_226_576_140_666,
+                0.010_074_011_256_927_688,
+            ],
+            [
+                1.161_783_655_626_603_5,
+                3.673_015_853_736_915_3,
+                5.660_455_518_062_66,
+                4.908_830_759_160_057,
+                7.579_216_505_486_345,
+            ],
+        ),
+    ];
+    let python_vector = [
+        (
+            [
+                0.019_116_448_084_726_47,
+                0.019_828_077_985_657_63,
+                0.021_674_660_608_658_535,
+                0.023_583_065_303_905_526,
+                0.026_280_447_483_522_176,
+            ],
+            [
+                0.017_363_586_620_039_867,
+                0.018_998_717_659_692_067,
+                0.016_339_548_572_974_375,
+                0.018_369_063_144_899_625,
+                0.031_536_679_923_300_025,
+            ],
+            [
+                127.801_151_729_750_15,
+                147.205_186_135_319_93,
+                171.578_067_238_242_14,
+                147.743_267_306_170_74,
+                61.443_804_943_222_21,
+            ],
+            [
+                257.763_199_814_040_04,
+                281.405_982_861_164_8,
+                249.320_177_967_104_54,
+                267.156_504_526_476_97,
+                45.186_434_076_137_985,
+            ],
+        ),
+        (
+            [
+                0.000_682_426_272_567_639_9,
+                0.000_766_865_388_369_797_1,
+                0.000_755_744_378_294_567,
+                0.009_403_599_432_942_817,
+                0.001_400_852_483_438_941_2,
+            ],
+            [
+                0.000_250_856_434_448_247_1,
+                0.000_251_238_099_642_961_2,
+                0.000_342_506_221_146_407_5,
+                0.002_587_006_800_046_218_3,
+                0.011_678_164_704_629_158,
+            ],
+            [
+                6.088_866_589_127_396,
+                8.392_193_596_345_162,
+                30.339_031_245_947_03,
+                114.526_858_502_183_1,
+                18.071_897_363_741_993,
+            ],
+            [
+                20.947_486_290_729_515,
+                16.929_445_892_401_93,
+                38.401_645_027_718_12,
+                129.185_762_626_979_3,
+                3.468_237_859_626_629,
+            ],
+        ),
+    ];
+    let rust_seeded_scalar = [
+        [
+            0.014_818_281_824_986_958,
+            0.014_529_575_594_899_912,
+            0.013_507_954_506_873_678,
+            0.015_281_429_463_492_627,
+            0.018_867_370_059_998_73,
+        ],
+        [
+            0.015_962_825_514_650_22,
+            0.015_273_346_047_457_018,
+            0.014_531_561_933_941_829,
+            0.009_556_599_593_868_124,
+            0.011_133_272_612_067_546,
+        ],
+    ];
+
+    for (noise_index, noise) in [LinearConfidence::White, LinearConfidence::Colored]
+        .into_iter()
+        .enumerate()
+    {
+        let scalar = model
+            .solve_with_monte_carlo_confidence(&observations, options, noise)
+            .expect("scalar MC");
+        let repeated_scalar = model
+            .solve_with_monte_carlo_confidence(&observations, options, noise)
+            .expect("repeated scalar MC");
+        assert_eq!(scalar, repeated_scalar);
+        let scalar_amplitude = scalar.amplitude_ci.as_ref().expect("scalar amplitude CI");
+        let scalar_phase = scalar.phase_ci_degrees.as_ref().expect("scalar phase CI");
+        for (index, ((actual, seeded), oracle)) in scalar_amplitude
+            .iter()
+            .zip(rust_seeded_scalar[noise_index])
+            .zip(python_scalar[noise_index].0)
+            .enumerate()
+        {
+            assert_close(
+                &format!("seeded scalar amplitude[{index}]"),
+                *actual,
+                seeded,
+                1e-14,
+            );
+            assert_relative_close(
+                &format!("Python scalar amplitude distribution[{index}]"),
+                *actual,
+                oracle,
+                0.3,
+            );
+        }
+        for (index, (actual, oracle)) in scalar_phase
+            .iter()
+            .zip(python_scalar[noise_index].1)
+            .enumerate()
+        {
+            assert_relative_close(
+                &format!("Python scalar phase distribution[{index}]"),
+                *actual,
+                oracle,
+                0.3,
+            );
+        }
+
+        let vector = model
+            .solve_vector_with_monte_carlo_confidence(&eastward, &northward, options, noise)
+            .expect("vector MC");
+        let repeated_vector = model
+            .solve_vector_with_monte_carlo_confidence(&eastward, &northward, options, noise)
+            .expect("repeated vector MC");
+        assert_eq!(vector, repeated_vector);
+        for (label, actual, oracle) in [
+            (
+                "semi-major",
+                vector.semi_major_ci.as_ref().expect("semi-major CI"),
+                python_vector[noise_index].0,
+            ),
+            (
+                "semi-minor",
+                vector.semi_minor_ci.as_ref().expect("semi-minor CI"),
+                python_vector[noise_index].1,
+            ),
+        ] {
+            for (index, (actual, oracle)) in actual.iter().zip(oracle).enumerate() {
+                assert_relative_close(
+                    &format!("Python vector {label} distribution[{index}]"),
+                    *actual,
+                    oracle,
+                    0.4,
+                );
+            }
+        }
+        for (label, actual, oracle) in [
+            (
+                "inclination",
+                vector
+                    .inclination_ci_degrees
+                    .as_ref()
+                    .expect("inclination CI"),
+                python_vector[noise_index].2,
+            ),
+            (
+                "phase",
+                vector.phase_ci_degrees.as_ref().expect("phase CI"),
+                python_vector[noise_index].3,
+            ),
+        ] {
+            for (index, (actual, oracle)) in actual.iter().zip(oracle).enumerate() {
+                assert_close(
+                    &format!("Python vector {label} distribution[{index}]"),
+                    *actual,
+                    oracle,
+                    65.0,
+                );
+            }
+        }
+    }
 }
 
 #[test]

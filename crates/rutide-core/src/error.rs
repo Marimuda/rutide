@@ -136,6 +136,13 @@ pub enum AnalysisError {
         /// Number of completed iterations.
         iterations: usize,
     },
+    /// A Monte Carlo confidence calculation requested fewer than two realizations.
+    InvalidMonteCarloRealizationCount,
+    /// A coefficient covariance matrix was not finite and positive definite.
+    InvalidConfidenceCovariance {
+        /// Constituent position whose covariance could not be sampled.
+        constituent: usize,
+    },
 }
 
 impl fmt::Display for AnalysisError {
@@ -253,6 +260,13 @@ impl fmt::Display for AnalysisError {
             Self::RobustDidNotConverge { iterations } => write!(
                 formatter,
                 "robust fit did not converge within {iterations} iterations"
+            ),
+            Self::InvalidMonteCarloRealizationCount => {
+                formatter.write_str("Monte Carlo confidence requires at least two realizations")
+            }
+            Self::InvalidConfidenceCovariance { constituent } => write!(
+                formatter,
+                "coefficient covariance for constituent {constituent} is not finite and positive definite"
             ),
         }
     }
