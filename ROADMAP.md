@@ -25,10 +25,11 @@ defined behavior, and representative oracle tests are versioned.
 - FVCOM `zeta` and depth-averaged `ua` / `va` NetCDF applications.
 - Whole-field scalar and vector correctness and performance benchmarks.
 
-## 1. Irregular colored-noise confidence — in progress
+## 1. Irregular colored-noise confidence — complete
 
 The harmonic least-squares fit already supports irregular timestamps. This item
 concerns only the colored residual spectrum used to estimate confidence intervals.
+
 ### 1a. Scalar Lomb–Scargle spectrum — complete
 
 - Reproduce UTide's nine residual-noise frequency bands and oversampled frequency
@@ -55,12 +56,18 @@ Acceptance requires rotary/ellipse fixtures with correlated and uncorrelated
 component noise, asymmetric missingness resolved through the joint mask, and
 comparison of all four ellipse confidence intervals plus SNR.
 
-### 1c. Performance and sampling diagnostics
+### 1c. Performance — complete
 
-- Cache frequency grids, windows, and reusable trigonometric work by valid-time
-  mask where mathematically valid.
-- Benchmark representative observation records separately from the regular FVCOM
-  whole-field profile; Lomb–Scargle is an `O(samples * frequencies)` path.
+- The dedicated scalar/vector probes benchmark representative irregular records
+  separately from the regular FVCOM whole-field profile; Lomb–Scargle remains an
+  `O(samples * frequencies)` path.
+- The retained measurements and environment are recorded in
+  `benchmarks/results/irregular-confidence-2026-09-01.md`.
+- Cache frequency grids, windows, or phase-shifted trigonometric work by valid-time
+  mask only when a real workload justifies the additional per-mask memory.
+
+### 1d. Sampling diagnostics — planned
+
 - Report record span, retained observation count, largest gap, and spectral-band
   coverage so Lomb–Scargle is not presented as a cure for inadequate sampling.
 

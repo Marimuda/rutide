@@ -27,6 +27,10 @@ reports a 5.39-second Rust median versus 126.97 seconds for the 32-process Pytho
 UTide baseline across all 144,860 current elements, a 23.6x process-boundary
 speedup with Python-compatible ellipse and colored-CI correctness.
 
+The focused [irregular-confidence snapshot](benchmarks/results/irregular-confidence-2026-09-01.md)
+records Lomb–Scargle scalar and vector parity and a 3.29x/6.24x advantage over a
+prewarmed 32-process Python baseline on its 100-series observational workload.
+
 The implemented scalar kernels now cover fixed-constituent OLS with mean and
 trend in both raw-phase mode and exact Greenwich/nodal mode. The exact-correction
 catalog contains all 146 constituents, 162 satellite corrections, and 251
@@ -62,9 +66,9 @@ behavioral oracle described in the benchmark plan, not vendored RUTide source.
 Large FVCOM data and generated benchmark results also remain outside Git.
 
 The completed compatibility surface and remaining scientific, interface, and
-resource tasks are tracked in [`ROADMAP.md`](ROADMAP.md). The next scientific
-increment is Lomb–Scargle residual spectra for colored confidence intervals on
-truly irregular timestamps.
+resource tasks are tracked in [`ROADMAP.md`](ROADMAP.md). Irregular scalar and
+vector colored confidence now use Lomb–Scargle residual spectra; robust fitting is
+the next scientific increment.
 
 ## Development
 
