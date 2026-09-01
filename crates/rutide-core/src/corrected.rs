@@ -348,6 +348,27 @@ impl GreenwichNodalOls {
             .solve_robust_with_linear_confidence(observations, options, noise)
     }
 
+    /// Robustly fit one series with nonlinear Monte Carlo confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input, robust fitting failure,
+    /// invalid Monte Carlo options, or an unsampleable covariance.
+    pub fn solve_robust_with_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<ScalarSolution, AnalysisError> {
+        self.model.solve_robust_with_monte_carlo_confidence(
+            observations,
+            robust_options,
+            monte_carlo_options,
+            noise,
+        )
+    }
+
     /// Fit complete series at the prepared latitude in time-major order.
     ///
     /// # Errors
@@ -510,6 +531,39 @@ impl GreenwichNodalOls {
         let eastward = components.next().ok_or(AnalysisError::EmptySeries)?;
         let northward = components.next().ok_or(AnalysisError::EmptySeries)?;
         from_component_solutions(&eastward, &northward)
+    }
+
+    /// Jointly robustly fit one current series with Monte Carlo ellipse intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input, robust fitting failure,
+    /// invalid Monte Carlo options, or an unsampleable covariance.
+    pub fn solve_vector_robust_with_monte_carlo_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<VectorSolution, AnalysisError> {
+        if eastward.len() != northward.len() {
+            return Err(AnalysisError::ObservationShape {
+                actual: northward.len(),
+                expected: eastward.len(),
+            });
+        }
+        let mut time_major = Vec::with_capacity(eastward.len() * 2);
+        for (eastward, northward) in eastward.iter().copied().zip(northward.iter().copied()) {
+            time_major.extend([eastward, northward]);
+        }
+        self.model.solve_vector_robust_with_monte_carlo_confidence(
+            &time_major,
+            robust_options,
+            monte_carlo_options,
+            noise,
+            0,
+        )
     }
 
     fn solve_vector_impl(

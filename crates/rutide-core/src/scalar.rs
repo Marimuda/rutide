@@ -348,6 +348,43 @@ impl FixedRawOls {
         Ok(self.robust_component_solution(&fit, observations.as_ref(), 0, Some(noise)))
     }
 
+    /// Robustly fit one series with nonlinear Monte Carlo confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid input, robust fitting failure,
+    /// invalid Monte Carlo options, or an unsampleable covariance.
+    pub fn solve_robust_with_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<ScalarSolution, AnalysisError> {
+        monte_carlo_options.validate()?;
+        let observation_matrix = self.observation_matrix(observations, 1)?;
+        let fit = self.robust_fit(&observation_matrix, robust_options)?;
+        let mut solution =
+            self.component_solution(fit.coefficients.as_ref(), 0, Some(fit.diagnostics.clone()));
+        let normal_inverse = self.coefficient_normal_inverse(Some(&fit.diagnostics.weights));
+        let covariances = self.scalar_coefficient_covariances(
+            observations,
+            1,
+            0,
+            fit.coefficients.as_ref(),
+            &normal_inverse,
+            noise,
+            Some(&fit.diagnostics.weights),
+        );
+        self.apply_scalar_monte_carlo_intervals(
+            &mut solution,
+            &covariances,
+            monte_carlo_options,
+            0,
+        )?;
+        Ok(solution)
+    }
+
     pub(crate) fn solve_two_component_robust(
         &self,
         observations: &[f64],
@@ -377,6 +414,39 @@ impl FixedRawOls {
                 self.robust_component_solution(&fit, observations.as_ref(), component, Some(noise))
             })
             .collect())
+    }
+
+    pub(crate) fn solve_vector_robust_with_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+        stream: u64,
+    ) -> Result<VectorSolution, AnalysisError> {
+        monte_carlo_options.validate()?;
+        let observations = self.observation_matrix(observations, 2)?;
+        let fit = self.robust_fit(&observations, robust_options)?;
+        let eastward =
+            self.component_solution(fit.coefficients.as_ref(), 0, Some(fit.diagnostics.clone()));
+        let northward =
+            self.component_solution(fit.coefficients.as_ref(), 1, Some(fit.diagnostics.clone()));
+        let mut solution = from_component_solutions(&eastward, &northward)?;
+        let normal_inverse = self.coefficient_normal_inverse(Some(&fit.diagnostics.weights));
+        let covariances = self.vector_coefficient_covariances(
+            observations.as_ref(),
+            fit.coefficients.as_ref(),
+            &normal_inverse,
+            noise,
+            Some(&fit.diagnostics.weights),
+        );
+        self.apply_vector_monte_carlo_intervals(
+            &mut solution,
+            &covariances,
+            monte_carlo_options,
+            stream,
+        )?;
+        Ok(solution)
     }
 
     /// Fit several complete scalar series stored in time-major order.

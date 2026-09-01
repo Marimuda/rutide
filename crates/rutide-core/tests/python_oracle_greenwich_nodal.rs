@@ -738,6 +738,173 @@ fn matches_python_utide_cauchy_robust_vector_fit() {
 #[test]
 #[allow(
     clippy::too_many_lines,
+    reason = "keeps the scalar/vector robust Monte Carlo distribution fixture together"
+)]
+fn matches_python_utide_robust_monte_carlo_distributions() {
+    let time = oracle_times();
+    let mut scalar = oracle_observations();
+    for value in &mut scalar[300..331] {
+        *value += 2.5;
+    }
+    let (mut eastward, mut northward) = synthetic_vector_observations(&time);
+    eastward[71] += 5.0;
+    northward[218] -= 4.0;
+    eastward[503] += 4.0;
+    northward[503] += 3.0;
+    let model = GreenwichNodalOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE_DEGREES_NORTH,
+        &CONSTITUENTS,
+    )
+    .expect("valid robust Monte Carlo model");
+    let monte_carlo = MonteCarloOptions {
+        realizations: 200,
+        seed: 20_260_901,
+    };
+    let scalar_solution = model
+        .solve_robust_with_monte_carlo_confidence(
+            &scalar,
+            RobustOptions::default(),
+            monte_carlo,
+            LinearConfidence::Colored,
+        )
+        .expect("valid robust scalar Monte Carlo solution");
+    let repeated_scalar = model
+        .solve_robust_with_monte_carlo_confidence(
+            &scalar,
+            RobustOptions::default(),
+            monte_carlo,
+            LinearConfidence::Colored,
+        )
+        .expect("repeated robust scalar Monte Carlo solution");
+    assert_eq!(scalar_solution, repeated_scalar);
+    for (label, actual, expected) in [
+        (
+            "robust scalar amplitude",
+            scalar_solution.amplitude_ci.as_ref().expect("amplitude CI"),
+            [
+                0.011_431_456_519_778_508,
+                0.009_684_383_682_427_149,
+                0.009_439_902_243_920_658,
+                0.007_469_864_766_697_188,
+                0.006_041_246_282_303_7,
+            ],
+        ),
+        (
+            "robust scalar phase",
+            scalar_solution.phase_ci_degrees.as_ref().expect("phase CI"),
+            [
+                0.777_964_488_039_244_8,
+                2.392_433_116_570_795_3,
+                3.729_879_411_361_814_3,
+                3.741_124_458_639_11,
+                6.696_069_382_811_561,
+            ],
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_relative_close(
+                &format!("Python {label} distribution[{index}]"),
+                *actual,
+                expected,
+                0.4,
+            );
+        }
+    }
+
+    let vector_solution = model
+        .solve_vector_robust_with_monte_carlo_confidence(
+            &eastward,
+            &northward,
+            RobustOptions::default(),
+            monte_carlo,
+            LinearConfidence::Colored,
+        )
+        .expect("valid robust vector Monte Carlo solution");
+    let repeated_vector = model
+        .solve_vector_robust_with_monte_carlo_confidence(
+            &eastward,
+            &northward,
+            RobustOptions::default(),
+            monte_carlo,
+            LinearConfidence::Colored,
+        )
+        .expect("repeated robust vector Monte Carlo solution");
+    assert_eq!(vector_solution, repeated_vector);
+    for (label, actual, expected) in [
+        (
+            "robust semi-major",
+            vector_solution.semi_major_ci.as_ref().expect("major CI"),
+            [
+                0.001_277_301_854_155_115_8,
+                0.001_312_428_842_497_684_7,
+                0.000_744_371_441_394_875,
+                0.005_388_622_301_025_978_5,
+                0.002_225_152_684_396_533,
+            ],
+        ),
+        (
+            "robust semi-minor",
+            vector_solution.semi_minor_ci.as_ref().expect("minor CI"),
+            [
+                0.000_799_296_664_879_357_7,
+                0.000_843_586_778_021_803_7,
+                0.001_365_395_275_044_186_8,
+                0.009_971_925_857_103_667,
+                0.011_992_608_950_899_849,
+            ],
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_relative_close(
+                &format!("Python {label} distribution[{index}]"),
+                *actual,
+                expected,
+                0.5,
+            );
+        }
+    }
+    for (label, actual, expected) in [
+        (
+            "robust inclination",
+            vector_solution
+                .inclination_ci_degrees
+                .as_ref()
+                .expect("inclination CI"),
+            [
+                25.804_778_818_913_476,
+                29.111_393_916_986_2,
+                55.116_758_138_846_265,
+                81.886_804_436_116_32,
+                17.385_958_019_492_02,
+            ],
+        ),
+        (
+            "robust phase",
+            vector_solution.phase_ci_degrees.as_ref().expect("phase CI"),
+            [
+                61.364_398_346_163_63,
+                56.614_228_443_396_534,
+                36.135_518_507_707_41,
+                31.273_255_490_590_09,
+                3.578_451_831_924_899_5,
+            ],
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(
+                &format!("Python {label} distribution[{index}]"),
+                *actual,
+                expected,
+                65.0,
+            );
+        }
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
     reason = "freezes the irregular missing-data robust oracle surface"
 )]
 fn matches_python_utide_irregular_gappy_robust_scalar_confidence() {
