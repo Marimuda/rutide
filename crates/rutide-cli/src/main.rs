@@ -9,9 +9,13 @@ use std::{
 
 use rutide_cli::{
     AnalysisMethod, AnalyzeConfig, ConfidenceInterval, ConstituentSelection, DEFAULT_CONSTITUENTS,
-    NodeSelection, VectorAnalyzeConfig, analyze_scalar, analyze_vector,
+    NodeSelection, ScalarInferenceConfig, VectorAnalyzeConfig, VectorInferenceConfig,
+    analyze_scalar, analyze_vector,
 };
-use rutide_core::{LinearConfidence, ReconstructionFilter, RobustOptions, TidalConstituent};
+use rutide_core::{
+    InferenceMode, LinearConfidence, ReconstructionFilter, RobustOptions, ScalarInferenceRelation,
+    TidalConstituent, VectorInferenceRelation,
+};
 
 // The application repeatedly allocates short-lived QR storage across worker
 // threads; this allocator keeps that full-field pattern bounded and reusable.
@@ -33,6 +37,9 @@ Options:
   --elements I,J,...  Analyze explicit zero-based element indices (vector mode)
   --constituents LIST Comma-separated names or 'auto' (default: M2,S2,N2,K1,O1)
   --rayleigh-min X    Automatic selection criterion (default with auto: 1.0)
+  --infer SPEC        Repeatable inferred relationship:
+                      scalar I:R:AMP:PHASE; vector I:R:AMP+:PHASE+:AMP-:PHASE-
+  --infer-approximate Use Python-compatible reference-only approximate inference
   --method MODE       Least squares: ols or robust (default: ols)
   --robust-tuning X   Cauchy tuning constant (default: 2.385)
   --robust-tolerance X
@@ -136,6 +143,9 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let mut selection = None;
     let mut constituents = None;
     let mut rayleigh_minimum = None;
+    let mut scalar_inference_relationships = Vec::new();
+    let mut vector_inference_relationships = Vec::new();
+    let mut inference_approximate = false;
     let mut robust_requested = None;
     let mut robust_tuning = None;
     let mut robust_tolerance = None;
@@ -205,6 +215,20 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                     &required_value(&mut arguments, option)?,
                     option,
                 )?);
+            }
+            "--infer" => {
+                let value = required_value(&mut arguments, option)?;
+                if vector {
+                    vector_inference_relationships.push(parse_vector_inference(&value)?);
+                } else {
+                    scalar_inference_relationships.push(parse_scalar_inference(&value)?);
+                }
+            }
+            "--infer-approximate" => {
+                if inference_approximate {
+                    return Err("--infer-approximate may only be supplied once".to_owned());
+                }
+                inference_approximate = true;
             }
             "--method" => {
                 if robust_requested.is_some() {
@@ -299,6 +323,17 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
         robust_max_iterations,
     )?;
     let confidence_interval = resolve_confidence_interval(confidence_requested, white_noise)?;
+    if inference_approximate
+        && scalar_inference_relationships.is_empty()
+        && vector_inference_relationships.is_empty()
+    {
+        return Err("--infer-approximate requires at least one --infer relationship".to_owned());
+    }
+    let inference_mode = if inference_approximate {
+        InferenceMode::Approximate
+    } else {
+        InferenceMode::Exact
+    };
     let reconstruction = resolve_reconstruction(
         reconstruct,
         reconstruction_constituents,
@@ -316,12 +351,21 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let output = output.ok_or_else(|| format!("{command_name} requires --output PATH"))?;
     let selection = selection.unwrap_or(NodeSelection::All);
     if vector {
+        let inference =
+            (!vector_inference_relationships.is_empty()).then_some(VectorInferenceConfig {
+                mode: inference_mode,
+                relationships: vector_inference_relationships,
+            });
+        if inference.is_some() && matches!(analysis_method, AnalysisMethod::Robust(_)) {
+            return Err("robust vector inference is not implemented; use --method ols".to_owned());
+        }
         Ok(Command::AnalyzeVector(VectorAnalyzeConfig {
             input,
             output,
             report,
             elements: selection,
             constituent_selection,
+            inference,
             confidence_interval,
             analysis_method,
             reconstruction,
@@ -329,12 +373,18 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             overwrite,
         }))
     } else {
+        let inference =
+            (!scalar_inference_relationships.is_empty()).then_some(ScalarInferenceConfig {
+                mode: inference_mode,
+                relationships: scalar_inference_relationships,
+            });
         Ok(Command::AnalyzeScalar(AnalyzeConfig {
             input,
             output,
             report,
             nodes: selection,
             constituent_selection,
+            inference,
             confidence_interval,
             analysis_method,
             reconstruction,
@@ -491,6 +541,68 @@ fn parse_nonnegative_f64(value: &OsStr, option: &str) -> Result<f64, String> {
     Ok(parsed)
 }
 
+fn parse_scalar_inference(value: &OsStr) -> Result<ScalarInferenceRelation, String> {
+    let text = value
+        .to_str()
+        .ok_or_else(|| "--infer value must be valid UTF-8".to_owned())?;
+    let fields = text.split(':').collect::<Vec<_>>();
+    if fields.len() != 4 {
+        return Err("scalar --infer requires INFERRED:REFERENCE:AMP_RATIO:PHASE_OFFSET".to_owned());
+    }
+    Ok(ScalarInferenceRelation::new(
+        parse_inference_constituent(fields[0])?,
+        parse_inference_constituent(fields[1])?,
+        parse_inference_ratio(fields[2])?,
+        parse_inference_phase(fields[3])?,
+    ))
+}
+
+fn parse_vector_inference(value: &OsStr) -> Result<VectorInferenceRelation, String> {
+    let text = value
+        .to_str()
+        .ok_or_else(|| "--infer value must be valid UTF-8".to_owned())?;
+    let fields = text.split(':').collect::<Vec<_>>();
+    if fields.len() != 6 {
+        return Err(
+            "vector --infer requires INFERRED:REFERENCE:AMP+:PHASE+:AMP-:PHASE-".to_owned(),
+        );
+    }
+    Ok(VectorInferenceRelation::new(
+        parse_inference_constituent(fields[0])?,
+        parse_inference_constituent(fields[1])?,
+        parse_inference_ratio(fields[2])?,
+        parse_inference_phase(fields[3])?,
+        parse_inference_ratio(fields[4])?,
+        parse_inference_phase(fields[5])?,
+    ))
+}
+
+fn parse_inference_constituent(value: &str) -> Result<TidalConstituent, String> {
+    value
+        .parse::<TidalConstituent>()
+        .map_err(|error| error.to_string())
+}
+
+fn parse_inference_ratio(value: &str) -> Result<f64, String> {
+    let ratio = value
+        .parse::<f64>()
+        .map_err(|_| format!("inference amplitude ratio must be numeric, received {value:?}"))?;
+    if !ratio.is_finite() || ratio < 0.0 {
+        return Err("inference amplitude ratio must be finite and non-negative".to_owned());
+    }
+    Ok(ratio)
+}
+
+fn parse_inference_phase(value: &str) -> Result<f64, String> {
+    let phase = value
+        .parse::<f64>()
+        .map_err(|_| format!("inference phase offset must be numeric, received {value:?}"))?;
+    if !phase.is_finite() {
+        return Err("inference phase offset must be finite".to_owned());
+    }
+    Ok(phase)
+}
+
 fn parse_confidence(value: &OsStr) -> Result<bool, String> {
     match value.to_str() {
         Some("none") => Ok(false),
@@ -589,9 +701,12 @@ mod tests {
     use super::{Command, parse_arguments};
     use rutide_cli::{
         AnalysisMethod, ConfidenceInterval, ConstituentSelection, DEFAULT_CONSTITUENTS,
-        NodeSelection,
+        NodeSelection, ScalarInferenceConfig, VectorInferenceConfig,
     };
-    use rutide_core::{LinearConfidence, ReconstructionFilter, RobustOptions, TidalConstituent};
+    use rutide_core::{
+        InferenceMode, LinearConfidence, ReconstructionFilter, RobustOptions,
+        ScalarInferenceRelation, TidalConstituent, VectorInferenceRelation,
+    };
 
     fn args<'a>(values: &'a [&'a str]) -> impl Iterator<Item = OsString> + 'a {
         values.iter().map(OsString::from)
@@ -704,6 +819,81 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_scalar_and_vector_inference_and_rejects_invalid_combinations() {
+        let scalar = parse_arguments(args(&[
+            "analyze-scalar",
+            "--input",
+            "input.nc",
+            "--output",
+            "output.nc",
+            "--infer",
+            "S2:M2:0.35:20",
+            "--infer-approximate",
+        ]))
+        .expect("valid scalar inference");
+        let Command::AnalyzeScalar(config) = scalar else {
+            panic!("expected scalar command");
+        };
+        assert_eq!(
+            config.inference,
+            Some(ScalarInferenceConfig {
+                mode: InferenceMode::Approximate,
+                relationships: vec![ScalarInferenceRelation::new(
+                    TidalConstituent::S2,
+                    TidalConstituent::M2,
+                    0.35,
+                    20.0,
+                )],
+            })
+        );
+
+        let vector = parse_arguments(args(&[
+            "analyze-vector",
+            "--input",
+            "input.nc",
+            "--output",
+            "output.nc",
+            "--infer",
+            "O1:K1:0.5:45:0.4:30",
+        ]))
+        .expect("valid vector inference");
+        let Command::AnalyzeVector(config) = vector else {
+            panic!("expected vector command");
+        };
+        assert_eq!(
+            config.inference,
+            Some(VectorInferenceConfig {
+                mode: InferenceMode::Exact,
+                relationships: vec![VectorInferenceRelation::new(
+                    TidalConstituent::O1,
+                    TidalConstituent::K1,
+                    0.5,
+                    45.0,
+                    0.4,
+                    30.0,
+                )],
+            })
+        );
+
+        for invalid in [
+            &["--infer-approximate"][..],
+            &["--infer", "S2:M2:-0.1:20"][..],
+            &["--infer", "S2:M2:0.3"][..],
+            &["--infer", "S2:M2:0.3:20:0.2:10", "--method", "robust"][..],
+        ] {
+            let mut values = vec![
+                "analyze-vector",
+                "--input",
+                "input.nc",
+                "--output",
+                "output.nc",
+            ];
+            values.extend_from_slice(invalid);
+            assert!(parse_arguments(args(&values)).is_err());
+        }
     }
 
     #[test]

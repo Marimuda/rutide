@@ -1421,6 +1421,23 @@ fn scalar_linear_intervals(
     (1.96 * amplitude_sigma, 1.96 * phase_sigma * 180.0 / PI)
 }
 
+fn constituents_at_reference_for_basis(
+    basis: &CorrectionBasis,
+    reference_time: f64,
+) -> Result<Vec<Constituent>, AnalysisError> {
+    if !reference_time.is_finite() {
+        return Err(AnalysisError::NonFiniteReferenceTime);
+    }
+    let constituents = scalar_constituents_at_reference(
+        &basis.tidal_constituents,
+        &basis.base_constituents,
+        &basis.recipes,
+        reference_time,
+    );
+    validate_derived_frequencies(&constituents)?;
+    Ok(constituents)
+}
+
 /// Constituent selection applied during reconstruction.
 ///
 /// Explicit names are an alternative to diagnostics, matching Python `UTide`.
@@ -1726,6 +1743,42 @@ impl ScalarInferenceBatch {
         self.mode
     }
 
+    /// Return the full-record midpoint epoch as an MJD.
+    #[must_use]
+    pub const fn reference_time_modified_julian_day(&self) -> f64 {
+        self.basis.reference_time_modified_julian_day
+    }
+
+    /// Return output frequencies at an arbitrary finite fitted epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-finite epoch or degenerate derived frequency.
+    pub fn constituents_at_reference_modified_julian_day(
+        &self,
+        reference_time: f64,
+    ) -> Result<Vec<Constituent>, AnalysisError> {
+        constituents_at_reference_for_basis(&self.basis, reference_time)
+    }
+
+    /// Prepare exact reconstruction astronomy at arbitrary target MJDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid target timestamps.
+    pub fn reconstructor_modified_julian_days(
+        &self,
+        modified_julian_days: &[f64],
+    ) -> Result<GreenwichNodalReconstructor, AnalysisError> {
+        GreenwichNodalReconstructor::from_parts(
+            modified_julian_days,
+            self.basis.reference_time_modified_julian_day,
+            self.layout.tidal_constituents.clone(),
+            &self.basis.base_constituents,
+            self.basis.recipes.clone(),
+        )
+    }
+
     /// Fit complete time-major scalar series at varying latitudes.
     ///
     /// # Errors
@@ -1976,6 +2029,42 @@ impl VectorInferenceBatch {
     #[must_use]
     pub const fn mode(&self) -> InferenceMode {
         self.mode
+    }
+
+    /// Return the full-record midpoint epoch as an MJD.
+    #[must_use]
+    pub const fn reference_time_modified_julian_day(&self) -> f64 {
+        self.basis.reference_time_modified_julian_day
+    }
+
+    /// Return output frequencies at an arbitrary finite fitted epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-finite epoch or degenerate derived frequency.
+    pub fn constituents_at_reference_modified_julian_day(
+        &self,
+        reference_time: f64,
+    ) -> Result<Vec<Constituent>, AnalysisError> {
+        constituents_at_reference_for_basis(&self.basis, reference_time)
+    }
+
+    /// Prepare exact reconstruction astronomy at arbitrary target MJDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid target timestamps.
+    pub fn reconstructor_modified_julian_days(
+        &self,
+        modified_julian_days: &[f64],
+    ) -> Result<GreenwichNodalReconstructor, AnalysisError> {
+        GreenwichNodalReconstructor::from_parts(
+            modified_julian_days,
+            self.basis.reference_time_modified_julian_day,
+            self.layout.tidal_constituents.clone(),
+            &self.basis.base_constituents,
+            self.basis.recipes.clone(),
+        )
     }
 
     /// Fit complete time-major current series at varying latitudes.

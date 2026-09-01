@@ -81,8 +81,8 @@ The completed compatibility surface and remaining scientific, interface, and
 resource tasks are tracked in [`ROADMAP.md`](ROADMAP.md). Irregular scalar and
 vector colored confidence use Lomb–Scargle residual spectra, robust fitting is
 complete. Scalar and coupled-vector inferred constituents now pass exact,
-approximate, and gappy Python oracle fixtures; application integration is the
-active scientific increment.
+approximate, and gappy Python oracle fixtures and are exposed by the FVCOM
+commands; comparative inference benchmarking is the active scientific increment.
 
 ## Development
 
@@ -144,6 +144,22 @@ squares. Defaults are tuning constant `2.385`, fractional tolerance `0.001`, and
 diagnostics and ragged `robust_weight` / `robust_leverage` arrays. For a series
 with missing values, each ragged row follows the finite observations in original
 timestamp order.
+
+Add one repeatable `--infer INFERRED:REFERENCE:AMPLITUDE_RATIO:PHASE_OFFSET`
+for each constrained scalar constituent. Exact astronomical inference is the
+default; `--infer-approximate` selects Python UTide's reference-only approximate
+basis. Inferred relationships are retained in both JSON and NetCDF metadata and
+participate in confidence intervals, PE/SNR, and reconstruction. For example:
+
+```console
+cargo run --release --bin rutide -- analyze-scalar \
+  --input /path/to/fvcom.nc \
+  --output inferred-scalar.nc \
+  --constituents M2,K1 \
+  --infer S2:M2:0.35:20 \
+  --infer O1:K1:0.50:45 \
+  --confidence linear --reconstruct
+```
 
 Add `--reconstruct` to write `reconstruction(time, series)` at every original
 FVCOM timestamp. With no filter it includes every fitted constituent. Use
@@ -216,6 +232,12 @@ rescaling: the eastward coefficient pair retains the white estimate while the
 northward pair uses its colored residual band. White and colored intervals support
 regular timestamps, gaps on an originally regular grid, and truly irregular
 timestamps; the last use a Lomb–Scargle residual spectrum.
+
+Vector inference uses separate positive- and negative-rotary constraints:
+`--infer INFERRED:REFERENCE:AMP+:PHASE+:AMP-:PHASE-`. It supports exact or
+approximate OLS, missing values, white/colored linear confidence, PE/SNR, and
+reconstruction. Robust vector inference is rejected explicitly until its coupled
+IRLS formulation has pinned-oracle coverage.
 
 ## Working principles
 

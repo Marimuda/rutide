@@ -10,7 +10,8 @@ use std::{
 use netcdf::{FileMut, Variable};
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
-    AnalysisError, Constituent, GreenwichNodalBatch, ReconstructionFilter, VectorReconstruction,
+    AnalysisError, Constituent, GreenwichNodalBatch, GreenwichNodalReconstructor,
+    ReconstructionFilter, TidalConstituent, VectorInferenceBatch, VectorReconstruction,
     VectorSolution,
 };
 use serde::Serialize;
@@ -18,16 +19,17 @@ use sha2::{Digest, Sha256};
 
 use super::{
     AnalysisMethod, AnalyzeConfig, AppError, ConfidenceInterval, ConstituentSelection,
-    ConstituentSelectionReport, MILLISECONDS_PER_DAY, NodeSelection, ReconstructionReport,
-    ResolvedConstituentSelection, RobustOptionsReport, StageTimings, encode_hex,
-    normalize_source_observation, reconstruction_report, required_dimension_length,
-    required_variable, resolve_constituent_selection, robust_termination_code, temporary_sibling,
+    ConstituentSelectionReport, InferenceReport, MILLISECONDS_PER_DAY, NodeSelection,
+    ReconstructionReport, ResolvedConstituentSelection, RobustOptionsReport, StageTimings,
+    VectorInferenceConfig, encode_hex, normalize_source_observation, reconstruction_report,
+    required_dimension_length, required_variable, resolve_constituent_selection,
+    robust_termination_code, temporary_sibling, update_inference_digest,
     update_reconstruction_filter_digest, validate_config, validate_dimensions,
-    validate_reconstruction_filter, validate_source_value, write_json_report,
-    write_robust_schema_metadata, write_variable,
+    validate_reconstruction_filter, validate_source_value, write_inference_metadata,
+    write_json_report, write_robust_schema_metadata, write_variable,
 };
 
-const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 2;
+const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 3;
 
 /// Configuration for one depth-averaged FVCOM current analysis.
 #[derive(Clone, Debug, PartialEq)]
@@ -42,6 +44,8 @@ pub struct VectorAnalyzeConfig {
     pub elements: NodeSelection,
     /// Explicit or record-length-based constituent selection.
     pub constituent_selection: ConstituentSelection,
+    /// Optional constrained positive/negative rotary inferred constituents.
+    pub inference: Option<VectorInferenceConfig>,
     /// Optional linearized ellipse intervals and their noise model.
     pub confidence_interval: ConfidenceInterval,
     /// Ordinary or Cauchy robust least squares.
@@ -135,6 +139,8 @@ pub struct VectorRunReport {
     pub robust_options: Option<RobustOptionsReport>,
     /// Auditable constituent-selection method and threshold.
     pub constituent_selection: ConstituentSelectionReport,
+    /// Inference configuration when inferred constituents are enabled.
+    pub inference: Option<InferenceReport>,
     /// Confidence method: `none` or `linear`.
     pub confidence_interval: &'static str,
     /// Residual-noise model when confidence intervals are enabled.
@@ -166,6 +172,76 @@ struct VectorInputData {
     logical_input_bytes: u64,
 }
 
+enum VectorAnalysisBatch {
+    Standard(GreenwichNodalBatch),
+    Inferred(VectorInferenceBatch),
+}
+
+impl VectorAnalysisBatch {
+    fn prepare(
+        times: &[f64],
+        constituents: &[TidalConstituent],
+        inference: Option<&VectorInferenceConfig>,
+    ) -> Result<Self, AnalysisError> {
+        match inference {
+            Some(inference) => VectorInferenceBatch::prepare_modified_julian_days(
+                times,
+                constituents,
+                &inference.relationships,
+                inference.mode,
+            )
+            .map(Self::Inferred),
+            None => GreenwichNodalBatch::prepare_modified_julian_days(times, constituents)
+                .map(Self::Standard),
+        }
+    }
+
+    fn constituents(&self) -> &[Constituent] {
+        match self {
+            Self::Standard(batch) => batch.constituents(),
+            Self::Inferred(batch) => batch.constituents(),
+        }
+    }
+
+    fn tidal_constituents(&self) -> &[TidalConstituent] {
+        match self {
+            Self::Standard(batch) => batch.tidal_constituents(),
+            Self::Inferred(batch) => batch.tidal_constituents(),
+        }
+    }
+
+    fn reference_time_modified_julian_day(&self) -> f64 {
+        match self {
+            Self::Standard(batch) => batch.reference_time_modified_julian_day(),
+            Self::Inferred(batch) => batch.reference_time_modified_julian_day(),
+        }
+    }
+
+    fn constituents_at_reference_modified_julian_day(
+        &self,
+        reference_time: f64,
+    ) -> Result<Vec<Constituent>, AnalysisError> {
+        match self {
+            Self::Standard(batch) => {
+                batch.constituents_at_reference_modified_julian_day(reference_time)
+            }
+            Self::Inferred(batch) => {
+                batch.constituents_at_reference_modified_julian_day(reference_time)
+            }
+        }
+    }
+
+    fn reconstructor_modified_julian_days(
+        &self,
+        times: &[f64],
+    ) -> Result<GreenwichNodalReconstructor, AnalysisError> {
+        match self {
+            Self::Standard(batch) => batch.reconstructor_modified_julian_days(times),
+            Self::Inferred(batch) => batch.reconstructor_modified_julian_days(times),
+        }
+    }
+}
+
 /// Analyze FVCOM `ua(time, nele)` and `va(time, nele)` currents.
 ///
 /// A time sample is omitted from both components when either source component
@@ -191,12 +267,13 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
     let preparation_start = Instant::now();
     let selection =
         resolve_constituent_selection(&config.constituent_selection, &input.modified_julian_days)?;
-    let batch = GreenwichNodalBatch::prepare_modified_julian_days(
+    let batch = VectorAnalysisBatch::prepare(
         &input.modified_julian_days,
         &selection.constituents,
+        config.inference.as_ref(),
     )?;
     if let Some(filter) = &config.reconstruction {
-        validate_reconstruction_filter(filter, &selection.constituents)?;
+        validate_reconstruction_filter(filter, batch.tidal_constituents())?;
     }
     let preparation_seconds = preparation_start.elapsed().as_secs_f64();
 
@@ -204,9 +281,9 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         .num_threads(config.workers)
         .build()?;
     let solve_start = Instant::now();
-    let solutions =
-        worker_pool.install(
-            || match (config.analysis_method, config.confidence_interval) {
+    let solutions = worker_pool.install(|| match &batch {
+        VectorAnalysisBatch::Standard(batch) => {
+            match (config.analysis_method, config.confidence_interval) {
                 (AnalysisMethod::Ols, ConfidenceInterval::None) => batch
                     .solve_vector_time_major_with_missing(
                         &input.eastward,
@@ -235,8 +312,23 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                         options,
                         noise,
                     ),
-            },
-        )?;
+            }
+        }
+        VectorAnalysisBatch::Inferred(batch) => match config.confidence_interval {
+            ConfidenceInterval::None => batch.solve_vector_time_major_with_missing(
+                &input.eastward,
+                &input.northward,
+                &input.latitudes,
+            ),
+            ConfidenceInterval::Linear(noise) => batch
+                .solve_vector_time_major_with_missing_and_linear_confidence(
+                    &input.eastward,
+                    &input.northward,
+                    &input.latitudes,
+                    noise,
+                ),
+        },
+    })?;
     let solve_seconds = solve_start.elapsed().as_secs_f64();
 
     let reconstruction_start = Instant::now();
@@ -266,6 +358,11 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         config.analysis_method,
         config.confidence_interval,
         config
+            .inference
+            .as_ref()
+            .map(VectorInferenceConfig::report)
+            .as_ref(),
+        config
             .reconstruction
             .as_ref()
             .zip(reconstruction.as_deref()),
@@ -284,6 +381,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             solutions: &solutions,
             result_sha256: &result_sha256,
             selection: &selection,
+            inference: config.inference.as_ref(),
             analysis_method: config.analysis_method,
             confidence_interval: config.confidence_interval,
             reference_time_modified_julian_day: batch.reference_time_modified_julian_day(),
@@ -304,7 +402,11 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         schema_version: VECTOR_OUTPUT_SCHEMA_VERSION,
         created_unix_seconds,
         rutide_version: rutide_core::VERSION,
-        profile: vector_profile(&selection, config.analysis_method),
+        profile: vector_profile(
+            &selection,
+            config.analysis_method,
+            config.inference.is_some(),
+        ),
         input_path: config.input.to_string_lossy().into_owned(),
         input_file_bytes: input.input_file_bytes,
         logical_input_bytes: input.logical_input_bytes,
@@ -324,6 +426,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             AnalysisMethod::Robust(options) => Some(options.into()),
         },
         constituent_selection: selection.report,
+        inference: config.inference.as_ref().map(VectorInferenceConfig::report),
         confidence_interval: config.confidence_interval.method(),
         confidence_noise: config.confidence_interval.noise(),
         reconstruction: config
@@ -368,18 +471,42 @@ fn validate_vector_config(config: &VectorAnalyzeConfig) -> Result<(), AppError> 
         report: config.report.clone(),
         nodes: config.elements.clone(),
         constituent_selection: config.constituent_selection.clone(),
+        inference: None,
         confidence_interval: config.confidence_interval,
         analysis_method: config.analysis_method,
         reconstruction: config.reconstruction.clone(),
         workers: config.workers,
         overwrite: config.overwrite,
-    })
+    })?;
+    if config.inference.is_some() && matches!(config.analysis_method, AnalysisMethod::Robust(_)) {
+        return Err(AppError::Invalid(
+            "robust vector inference is not implemented; use --method ols".to_owned(),
+        ));
+    }
+    if config
+        .inference
+        .as_ref()
+        .is_some_and(|inference| inference.relationships.is_empty())
+    {
+        return Err(AppError::Invalid(
+            "inference requires at least one relationship".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn vector_profile(
     selection: &ResolvedConstituentSelection,
     analysis_method: AnalysisMethod,
+    inferred: bool,
 ) -> &'static str {
+    if inferred {
+        return match selection.report.method {
+            "explicit" => "fixed-constituents-greenwich-nodal-vector-inference-ols",
+            "rayleigh" => "rayleigh-auto-greenwich-nodal-vector-inference-ols",
+            _ => unreachable!("selection methods are constructed internally"),
+        };
+    }
     match (selection.report.method, analysis_method) {
         ("explicit", AnalysisMethod::Ols) => "fixed-constituents-greenwich-nodal-vector-ols",
         ("rayleigh", AnalysisMethod::Ols) => "rayleigh-auto-greenwich-nodal-vector-ols",
@@ -557,7 +684,7 @@ fn logical_input_bytes(fields: &[(usize, usize)]) -> Result<u64, AppError> {
 }
 
 fn vector_solution_frequencies(
-    batch: &GreenwichNodalBatch,
+    batch: &VectorAnalysisBatch,
     solutions: &[VectorSolution],
 ) -> Result<Vec<Vec<f64>>, AnalysisError> {
     solutions
@@ -622,10 +749,11 @@ fn vector_result_digest(
     solutions: &[VectorSolution],
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
+    inference: Option<&InferenceReport>,
     reconstruction: Option<(&ReconstructionFilter, &[VectorReconstruction])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-vector-greenwich-nodal-v2\0");
+    digest.update(b"rutide-vector-greenwich-nodal-v3\0");
     digest.update(analysis_method.name().as_bytes());
     if let AnalysisMethod::Robust(options) = analysis_method {
         digest.update(options.tuning_constant.to_bits().to_le_bytes());
@@ -643,6 +771,7 @@ fn vector_result_digest(
         digest.update(noise.as_bytes());
     }
     digest.update([0]);
+    update_inference_digest(&mut digest, inference);
     for constituent in constituents {
         digest.update(constituent.name.as_bytes());
         digest.update([0]);
@@ -766,6 +895,7 @@ struct VectorOutputData<'data> {
     solutions: &'data [VectorSolution],
     result_sha256: &'data str,
     selection: &'data ResolvedConstituentSelection,
+    inference: Option<&'data VectorInferenceConfig>,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     reference_time_modified_julian_day: f64,
@@ -810,7 +940,11 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
     output.add_attribute("rutide_version", rutide_core::VERSION)?;
     output.add_attribute(
         "profile",
-        vector_profile(data.selection, data.analysis_method),
+        vector_profile(
+            data.selection,
+            data.analysis_method,
+            data.inference.is_some(),
+        ),
     )?;
     output.add_attribute("analysis_method", data.analysis_method.name())?;
     if let AnalysisMethod::Robust(options) = data.analysis_method {
@@ -838,6 +972,10 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
     if let Some(value) = data.selection.report.record_span_days {
         output.add_attribute("record_span_days", value)?;
     }
+    write_inference_metadata(
+        &mut output,
+        data.inference.map(VectorInferenceConfig::report).as_ref(),
+    )?;
     output.add_attribute(
         "constituent_names",
         data.constituents
@@ -1183,11 +1321,15 @@ fn write_vector_reconstruction_variables(
 mod tests {
     use std::fs;
 
-    use rutide_core::{LinearConfidence, ReconstructionFilter, RobustOptions, TidalConstituent};
+    use rutide_core::{
+        InferenceMode, LinearConfidence, ReconstructionFilter, RobustOptions, TidalConstituent,
+        VectorInferenceRelation,
+    };
 
     use super::{
         AnalysisMethod, ConfidenceInterval, ConstituentSelection, NodeSelection,
-        VectorAnalyzeConfig, analyze_vector, read_fvcom_vector, temporary_sibling,
+        VectorAnalyzeConfig, VectorInferenceConfig, analyze_vector, read_fvcom_vector,
+        temporary_sibling,
     };
 
     #[test]
@@ -1201,6 +1343,10 @@ mod tests {
         let input_path = temporary_sibling(&input_destination).expect("valid input path");
         let output_destination = std::env::temp_dir().join("rutide-vector-output-test.nc");
         let output_path = temporary_sibling(&output_destination).expect("valid output path");
+        let inference_output_destination =
+            std::env::temp_dir().join("rutide-vector-inference-output-test.nc");
+        let inference_output_path =
+            temporary_sibling(&inference_output_destination).expect("valid inference output path");
         let time_count = 49_usize;
         let fill = -999.0_f32;
         let mut dataset = netcdf::create(&input_path).expect("create vector fixture");
@@ -1275,6 +1421,7 @@ mod tests {
                 TidalConstituent::M2,
                 TidalConstituent::K1,
             ]),
+            inference: None,
             confidence_interval: ConfidenceInterval::Linear(LinearConfidence::White),
             analysis_method: AnalysisMethod::Robust(RobustOptions {
                 tolerance: 0.01,
@@ -1331,7 +1478,81 @@ mod tests {
             time_count * 2
         );
         drop(output);
+
+        let inference_report = analyze_vector(&VectorAnalyzeConfig {
+            input: input_path.clone(),
+            output: inference_output_path.clone(),
+            report: None,
+            elements: NodeSelection::Indices(vec![1, 0]),
+            constituent_selection: ConstituentSelection::Explicit(vec![
+                TidalConstituent::M2,
+                TidalConstituent::K1,
+            ]),
+            inference: Some(VectorInferenceConfig {
+                mode: InferenceMode::Exact,
+                relationships: vec![
+                    VectorInferenceRelation::new(
+                        TidalConstituent::S2,
+                        TidalConstituent::M2,
+                        0.35,
+                        20.0,
+                        0.25,
+                        -10.0,
+                    ),
+                    VectorInferenceRelation::new(
+                        TidalConstituent::O1,
+                        TidalConstituent::K1,
+                        0.5,
+                        45.0,
+                        0.4,
+                        30.0,
+                    ),
+                ],
+            }),
+            confidence_interval: ConfidenceInterval::Linear(LinearConfidence::Colored),
+            analysis_method: AnalysisMethod::Ols,
+            reconstruction: Some(ReconstructionFilter::All),
+            workers: 2,
+            overwrite: false,
+        })
+        .expect("analyze inferred vector fixture");
+        assert_eq!(inference_report.constituents, ["M2", "K1", "S2", "O1"]);
+        assert_eq!(
+            inference_report
+                .inference
+                .as_ref()
+                .expect("inference report")
+                .mode,
+            "exact"
+        );
+        let inference_output =
+            netcdf::open(&inference_output_path).expect("open inferred vector output");
+        assert_eq!(
+            inference_output
+                .attribute("inference_convention")
+                .expect("inference convention")
+                .value()
+                .expect("read inference convention"),
+            netcdf::AttributeValue::Str("vector_rotary".to_owned())
+        );
+        assert_eq!(
+            inference_output
+                .attribute("inferred_constituent_names")
+                .expect("inferred constituent names")
+                .value()
+                .expect("read inferred constituent names"),
+            netcdf::AttributeValue::Str("S2,O1".to_owned())
+        );
+        assert_eq!(
+            inference_output
+                .variable("semi_major")
+                .expect("inferred semi-major")
+                .len(),
+            8
+        );
+        drop(inference_output);
         fs::remove_file(input_path).expect("remove vector fixture");
         fs::remove_file(output_path).expect("remove vector output");
+        fs::remove_file(inference_output_path).expect("remove inferred vector output");
     }
 }

@@ -126,8 +126,14 @@ resolved and unresolved pinned-oracle fixtures. Inference confidence preserves a
 pinned Python column-order/indexing quirk inside these models only. Scalar and
 joint-mask vector batches now support varying latitudes, complete or missing
 records, and white/colored confidence while retaining bounded shared Lomb plans.
-Robust vector inference and the CLI/NetCDF schema remain before this item can be
-marked complete.
+The scalar and vector FVCOM commands now accept repeatable relationships and an
+exact/approximate switch; JSON reports and versioned NetCDF schemas retain every
+ratio, phase offset, convention, and mode, while the canonical digest includes
+the complete inference configuration. End-to-end vector coverage combines
+inference with joint missing-value masks, Lomb–Scargle colored confidence, and
+reconstruction. Comparative performance measurements and robust vector inference
+remain before this item can be marked complete; the latter is rejected explicitly
+at both configuration and CLI boundaries.
 
 ## 4. Monte Carlo confidence intervals — planned
 

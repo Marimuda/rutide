@@ -13,9 +13,10 @@ use std::{
 use netcdf::{FileMut, Variable, VariableMut};
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
-    AnalysisError, Constituent, GreenwichNodalBatch, LinearConfidence, RayleighSelection,
-    ReconstructionFilter, RobustOptions, RobustTermination, ScalarSolution, TidalConstituent,
-    select_constituents_by_rayleigh,
+    AnalysisError, Constituent, GreenwichNodalBatch, GreenwichNodalReconstructor, InferenceMode,
+    LinearConfidence, RayleighSelection, ReconstructionFilter, RobustOptions, RobustTermination,
+    ScalarInferenceBatch, ScalarInferenceRelation, ScalarSolution, TidalConstituent,
+    VectorInferenceRelation, select_constituents_by_rayleigh,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -25,7 +26,7 @@ mod vector;
 pub use vector::{VectorAnalyzeConfig, VectorRunReport, VectorSampleResult, analyze_vector};
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
-const OUTPUT_SCHEMA_VERSION: u32 = 6;
+const OUTPUT_SCHEMA_VERSION: u32 = 7;
 /// Backward-compatible benchmark constituent set used when none is specified.
 pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -56,6 +57,24 @@ pub enum ConstituentSelection {
         /// Dimensionless minimum Rayleigh criterion.
         minimum: f64,
     },
+}
+
+/// Scalar inferred-constituent relationships for one application run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScalarInferenceConfig {
+    /// Exact composite basis or Python-compatible approximate inference.
+    pub mode: InferenceMode,
+    /// Inferred/reference relationships in caller-supplied order.
+    pub relationships: Vec<ScalarInferenceRelation>,
+}
+
+/// Vector positive/negative rotary inference relationships.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorInferenceConfig {
+    /// Exact composite basis or Python-compatible approximate inference.
+    pub mode: InferenceMode,
+    /// Inferred/reference rotary relationships in caller-supplied order.
+    pub relationships: Vec<VectorInferenceRelation>,
 }
 
 /// Confidence-interval calculation requested for an analysis run.
@@ -115,6 +134,8 @@ pub struct AnalyzeConfig {
     pub nodes: NodeSelection,
     /// Explicit or record-length-based constituent selection.
     pub constituent_selection: ConstituentSelection,
+    /// Optional constrained inferred constituents.
+    pub inference: Option<ScalarInferenceConfig>,
     /// Optional linearized confidence intervals and their noise model.
     pub confidence_interval: ConfidenceInterval,
     /// Ordinary or Cauchy robust least squares.
@@ -191,6 +212,85 @@ pub struct ConstituentSelectionReport {
     pub record_span_days: Option<f64>,
 }
 
+/// Machine-readable inferred-constituent configuration.
+#[derive(Clone, Debug, Serialize)]
+pub struct InferenceReport {
+    /// Basis treatment: `exact` or `approximate`.
+    pub mode: &'static str,
+    /// Scalar or vector relationship convention.
+    pub convention: &'static str,
+    /// Relationships in caller-supplied order.
+    pub relationships: Vec<InferenceRelationReport>,
+}
+
+/// One serialized inferred/reference relationship.
+#[derive(Clone, Debug, Serialize)]
+pub struct InferenceRelationReport {
+    /// Inferred constituent name.
+    pub inferred: &'static str,
+    /// Reference constituent name.
+    pub reference: &'static str,
+    /// Scalar or positive-rotary amplitude ratio.
+    pub positive_amplitude_ratio: f64,
+    /// Scalar or positive-rotary phase offset.
+    pub positive_phase_offset_degrees: f64,
+    /// Negative-rotary amplitude ratio for vectors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub negative_amplitude_ratio: Option<f64>,
+    /// Negative-rotary phase offset for vectors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub negative_phase_offset_degrees: Option<f64>,
+}
+
+impl ScalarInferenceConfig {
+    fn report(&self) -> InferenceReport {
+        InferenceReport {
+            mode: inference_mode_name(self.mode),
+            convention: "scalar",
+            relationships: self
+                .relationships
+                .iter()
+                .map(|relationship| InferenceRelationReport {
+                    inferred: relationship.inferred.name(),
+                    reference: relationship.reference.name(),
+                    positive_amplitude_ratio: relationship.amplitude_ratio,
+                    positive_phase_offset_degrees: relationship.phase_offset_degrees,
+                    negative_amplitude_ratio: None,
+                    negative_phase_offset_degrees: None,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl VectorInferenceConfig {
+    pub(crate) fn report(&self) -> InferenceReport {
+        InferenceReport {
+            mode: inference_mode_name(self.mode),
+            convention: "vector_rotary",
+            relationships: self
+                .relationships
+                .iter()
+                .map(|relationship| InferenceRelationReport {
+                    inferred: relationship.inferred.name(),
+                    reference: relationship.reference.name(),
+                    positive_amplitude_ratio: relationship.positive_amplitude_ratio,
+                    positive_phase_offset_degrees: relationship.positive_phase_offset_degrees,
+                    negative_amplitude_ratio: Some(relationship.negative_amplitude_ratio),
+                    negative_phase_offset_degrees: Some(relationship.negative_phase_offset_degrees),
+                })
+                .collect(),
+        }
+    }
+}
+
+const fn inference_mode_name(mode: InferenceMode) -> &'static str {
+    match mode {
+        InferenceMode::Exact => "exact",
+        InferenceMode::Approximate => "approximate",
+    }
+}
+
 /// Reconstruction selection retained in a completed run report.
 #[derive(Clone, Debug, Serialize)]
 pub struct ReconstructionReport {
@@ -241,6 +341,8 @@ pub struct RunReport {
     pub robust_options: Option<RobustOptionsReport>,
     /// Auditable constituent-selection method and threshold.
     pub constituent_selection: ConstituentSelectionReport,
+    /// Inference configuration when inferred constituents are enabled.
+    pub inference: Option<InferenceReport>,
     /// Confidence method: `none` or `linear`.
     pub confidence_interval: &'static str,
     /// Residual-noise model when confidence intervals are enabled.
@@ -372,13 +474,101 @@ struct InputData {
     logical_input_bytes: u64,
 }
 
+enum ScalarAnalysisBatch {
+    Standard(GreenwichNodalBatch),
+    Inferred(ScalarInferenceBatch),
+}
+
+impl ScalarAnalysisBatch {
+    fn prepare(
+        modified_julian_days: &[f64],
+        constituents: &[TidalConstituent],
+        inference: Option<&ScalarInferenceConfig>,
+    ) -> Result<Self, AnalysisError> {
+        match inference {
+            Some(inference) => ScalarInferenceBatch::prepare_modified_julian_days(
+                modified_julian_days,
+                constituents,
+                &inference.relationships,
+                inference.mode,
+            )
+            .map(Self::Inferred),
+            None => GreenwichNodalBatch::prepare_modified_julian_days(
+                modified_julian_days,
+                constituents,
+            )
+            .map(Self::Standard),
+        }
+    }
+
+    fn constituents(&self) -> &[Constituent] {
+        match self {
+            Self::Standard(batch) => batch.constituents(),
+            Self::Inferred(batch) => batch.constituents(),
+        }
+    }
+
+    fn tidal_constituents(&self) -> &[TidalConstituent] {
+        match self {
+            Self::Standard(batch) => batch.tidal_constituents(),
+            Self::Inferred(batch) => batch.tidal_constituents(),
+        }
+    }
+
+    fn reference_time_modified_julian_day(&self) -> f64 {
+        match self {
+            Self::Standard(batch) => batch.reference_time_modified_julian_day(),
+            Self::Inferred(batch) => batch.reference_time_modified_julian_day(),
+        }
+    }
+
+    fn constituents_at_reference_modified_julian_day(
+        &self,
+        reference_time: f64,
+    ) -> Result<Vec<Constituent>, AnalysisError> {
+        match self {
+            Self::Standard(batch) => {
+                batch.constituents_at_reference_modified_julian_day(reference_time)
+            }
+            Self::Inferred(batch) => {
+                batch.constituents_at_reference_modified_julian_day(reference_time)
+            }
+        }
+    }
+
+    fn reconstructor_modified_julian_days(
+        &self,
+        times: &[f64],
+    ) -> Result<GreenwichNodalReconstructor, AnalysisError> {
+        match self {
+            Self::Standard(batch) => batch.reconstructor_modified_julian_days(times),
+            Self::Inferred(batch) => batch.reconstructor_modified_julian_days(times),
+        }
+    }
+}
+
 struct ResolvedConstituentSelection {
     constituents: Vec<TidalConstituent>,
     report: ConstituentSelectionReport,
 }
 
 impl ResolvedConstituentSelection {
-    fn profile(&self, analysis_method: AnalysisMethod) -> &'static str {
+    fn profile(&self, analysis_method: AnalysisMethod, inferred: bool) -> &'static str {
+        if inferred {
+            return match (self.report.method, analysis_method) {
+                ("explicit", AnalysisMethod::Ols) => {
+                    "fixed-constituents-greenwich-nodal-inference-ols"
+                }
+                ("rayleigh", AnalysisMethod::Ols) => "rayleigh-auto-greenwich-nodal-inference-ols",
+                ("explicit", AnalysisMethod::Robust(_)) => {
+                    "fixed-constituents-greenwich-nodal-inference-robust"
+                }
+                ("rayleigh", AnalysisMethod::Robust(_)) => {
+                    "rayleigh-auto-greenwich-nodal-inference-robust"
+                }
+                _ => unreachable!("selection methods are constructed internally"),
+            };
+        }
         match (self.report.method, analysis_method) {
             ("explicit", AnalysisMethod::Ols) => "fixed-constituents-greenwich-nodal-ols",
             ("rayleigh", AnalysisMethod::Ols) => "rayleigh-auto-greenwich-nodal-ols",
@@ -411,12 +601,13 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
     let preparation_start = Instant::now();
     let selection =
         resolve_constituent_selection(&config.constituent_selection, &input.modified_julian_days)?;
-    let batch = GreenwichNodalBatch::prepare_modified_julian_days(
+    let batch = ScalarAnalysisBatch::prepare(
         &input.modified_julian_days,
         &selection.constituents,
+        config.inference.as_ref(),
     )?;
     if let Some(filter) = &config.reconstruction {
-        validate_reconstruction_filter(filter, &selection.constituents)?;
+        validate_reconstruction_filter(filter, batch.tidal_constituents())?;
     }
     let preparation_seconds = preparation_start.elapsed().as_secs_f64();
 
@@ -454,6 +645,11 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         config.analysis_method,
         config.confidence_interval,
         config
+            .inference
+            .as_ref()
+            .map(ScalarInferenceConfig::report)
+            .as_ref(),
+        config
             .reconstruction
             .as_ref()
             .zip(reconstruction.as_deref()),
@@ -479,6 +675,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             solutions: &solutions,
             result_sha256: &result_sha256,
             selection: &selection,
+            inference: config.inference.as_ref(),
             analysis_method: config.analysis_method,
             confidence_interval: config.confidence_interval,
             modified_julian_days: &input.modified_julian_days,
@@ -501,7 +698,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         schema_version: OUTPUT_SCHEMA_VERSION,
         created_unix_seconds,
         rutide_version: rutide_core::VERSION,
-        profile: selection.profile(config.analysis_method),
+        profile: selection.profile(config.analysis_method, config.inference.is_some()),
         input_path: config.input.to_string_lossy().into_owned(),
         input_file_bytes: input.input_file_bytes,
         logical_input_bytes: input.logical_input_bytes,
@@ -521,6 +718,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             AnalysisMethod::Robust(options) => Some(options.into()),
         },
         constituent_selection: selection.report,
+        inference: config.inference.as_ref().map(ScalarInferenceConfig::report),
         confidence_interval: config.confidence_interval.method(),
         confidence_noise: config.confidence_interval.noise(),
         reconstruction: config
@@ -561,35 +759,65 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
 
 fn solve_input(
     worker_pool: &rayon::ThreadPool,
-    batch: &GreenwichNodalBatch,
+    batch: &ScalarAnalysisBatch,
     input: &InputData,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
 ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-    worker_pool.install(|| match (analysis_method, confidence_interval) {
-        (AnalysisMethod::Ols, ConfidenceInterval::None) => {
-            batch.solve_time_major_with_missing(&input.observations, &input.latitudes)
-        }
-        (AnalysisMethod::Ols, ConfidenceInterval::Linear(noise)) => batch
-            .solve_time_major_with_missing_and_linear_confidence(
-                &input.observations,
-                &input.latitudes,
-                noise,
-            ),
-        (AnalysisMethod::Robust(options), ConfidenceInterval::None) => batch
-            .solve_time_major_with_missing_robust(&input.observations, &input.latitudes, options),
-        (AnalysisMethod::Robust(options), ConfidenceInterval::Linear(noise)) => batch
-            .solve_time_major_with_missing_robust_and_linear_confidence(
-                &input.observations,
-                &input.latitudes,
-                options,
-                noise,
-            ),
+    worker_pool.install(|| match batch {
+        ScalarAnalysisBatch::Standard(batch) => match (analysis_method, confidence_interval) {
+            (AnalysisMethod::Ols, ConfidenceInterval::None) => {
+                batch.solve_time_major_with_missing(&input.observations, &input.latitudes)
+            }
+            (AnalysisMethod::Ols, ConfidenceInterval::Linear(noise)) => batch
+                .solve_time_major_with_missing_and_linear_confidence(
+                    &input.observations,
+                    &input.latitudes,
+                    noise,
+                ),
+            (AnalysisMethod::Robust(options), ConfidenceInterval::None) => batch
+                .solve_time_major_with_missing_robust(
+                    &input.observations,
+                    &input.latitudes,
+                    options,
+                ),
+            (AnalysisMethod::Robust(options), ConfidenceInterval::Linear(noise)) => batch
+                .solve_time_major_with_missing_robust_and_linear_confidence(
+                    &input.observations,
+                    &input.latitudes,
+                    options,
+                    noise,
+                ),
+        },
+        ScalarAnalysisBatch::Inferred(batch) => match (analysis_method, confidence_interval) {
+            (AnalysisMethod::Ols, ConfidenceInterval::None) => {
+                batch.solve_time_major_with_missing(&input.observations, &input.latitudes)
+            }
+            (AnalysisMethod::Ols, ConfidenceInterval::Linear(noise)) => batch
+                .solve_time_major_with_missing_and_linear_confidence(
+                    &input.observations,
+                    &input.latitudes,
+                    noise,
+                ),
+            (AnalysisMethod::Robust(options), ConfidenceInterval::None) => batch
+                .solve_time_major_with_missing_robust(
+                    &input.observations,
+                    &input.latitudes,
+                    options,
+                ),
+            (AnalysisMethod::Robust(options), ConfidenceInterval::Linear(noise)) => batch
+                .solve_time_major_with_missing_robust_and_linear_confidence(
+                    &input.observations,
+                    &input.latitudes,
+                    options,
+                    noise,
+                ),
+        },
     })
 }
 
 fn solution_frequencies(
-    batch: &GreenwichNodalBatch,
+    batch: &ScalarAnalysisBatch,
     solutions: &[ScalarSolution],
 ) -> Result<Vec<Vec<f64>>, AnalysisError> {
     solutions
@@ -609,7 +837,7 @@ fn solution_frequencies(
 
 fn reconstruct_input(
     worker_pool: &rayon::ThreadPool,
-    batch: &GreenwichNodalBatch,
+    batch: &ScalarAnalysisBatch,
     input: &InputData,
     solutions: &[ScalarSolution],
     filter: Option<&ReconstructionFilter>,
@@ -667,6 +895,15 @@ fn validate_config(config: &AnalyzeConfig) -> Result<(), AppError> {
                 )));
             }
         }
+    }
+    if config
+        .inference
+        .as_ref()
+        .is_some_and(|inference| inference.relationships.is_empty())
+    {
+        return Err(AppError::Invalid(
+            "inference requires at least one relationship".to_owned(),
+        ));
     }
     if let Some(filter) = &config.reconstruction {
         validate_reconstruction_filter_thresholds(filter)?;
@@ -770,6 +1007,91 @@ fn reconstruction_report(filter: &ReconstructionFilter, time_count: usize) -> Re
             time_count,
         },
     }
+}
+
+fn write_inference_metadata(
+    output: &mut FileMut,
+    inference: Option<&InferenceReport>,
+) -> Result<(), AppError> {
+    let Some(inference) = inference else {
+        output.add_attribute("inference_mode", "none")?;
+        return Ok(());
+    };
+    output.add_attribute("inference_mode", inference.mode)?;
+    output.add_attribute("inference_convention", inference.convention)?;
+    output.add_attribute(
+        "inference_relationship_count",
+        i64::try_from(inference.relationships.len()).map_err(|_| {
+            AppError::Invalid("inference relationship count exceeds i64".to_owned())
+        })?,
+    )?;
+    output.add_attribute(
+        "inferred_constituent_names",
+        inference
+            .relationships
+            .iter()
+            .map(|relationship| relationship.inferred)
+            .collect::<Vec<_>>()
+            .join(","),
+    )?;
+    output.add_attribute(
+        "reference_constituent_names",
+        inference
+            .relationships
+            .iter()
+            .map(|relationship| relationship.reference)
+            .collect::<Vec<_>>()
+            .join(","),
+    )?;
+    output.add_attribute(
+        "inference_positive_amplitude_ratios",
+        inference
+            .relationships
+            .iter()
+            .map(|relationship| relationship.positive_amplitude_ratio.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+    )?;
+    output.add_attribute(
+        "inference_positive_phase_offsets_degrees",
+        inference
+            .relationships
+            .iter()
+            .map(|relationship| relationship.positive_phase_offset_degrees.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+    )?;
+    if inference.convention == "vector_rotary" {
+        output.add_attribute(
+            "inference_negative_amplitude_ratios",
+            inference
+                .relationships
+                .iter()
+                .map(|relationship| {
+                    relationship
+                        .negative_amplitude_ratio
+                        .expect("vector report contains negative amplitude ratios")
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+        )?;
+        output.add_attribute(
+            "inference_negative_phase_offsets_degrees",
+            inference
+                .relationships
+                .iter()
+                .map(|relationship| {
+                    relationship
+                        .negative_phase_offset_degrees
+                        .expect("vector report contains negative phase offsets")
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+        )?;
+    }
+    Ok(())
 }
 
 fn resolve_constituent_selection(
@@ -1042,10 +1364,11 @@ fn result_digest(
     solutions: &[ScalarSolution],
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
+    inference: Option<&InferenceReport>,
     reconstruction: Option<(&ReconstructionFilter, &[Vec<f64>])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-scalar-greenwich-nodal-v6\0");
+    digest.update(b"rutide-scalar-greenwich-nodal-v7\0");
     digest.update(analysis_method.name().as_bytes());
     if let AnalysisMethod::Robust(options) = analysis_method {
         digest.update(options.tuning_constant.to_bits().to_le_bytes());
@@ -1063,6 +1386,7 @@ fn result_digest(
         digest.update(noise.as_bytes());
     }
     digest.update([0]);
+    update_inference_digest(&mut digest, inference);
     for constituent in constituents {
         digest.update(constituent.name.as_bytes());
         digest.update([0]);
@@ -1131,6 +1455,47 @@ fn result_digest(
         None => digest.update(b"no-reconstruction\0"),
     }
     Ok(encode_hex(&digest.finalize()))
+}
+
+fn update_inference_digest(digest: &mut Sha256, inference: Option<&InferenceReport>) {
+    let Some(inference) = inference else {
+        digest.update(b"no-inference\0");
+        return;
+    };
+    digest.update(inference.mode.as_bytes());
+    digest.update([0]);
+    digest.update(inference.convention.as_bytes());
+    digest.update([0]);
+    for relationship in &inference.relationships {
+        digest.update(relationship.inferred.as_bytes());
+        digest.update([0]);
+        digest.update(relationship.reference.as_bytes());
+        digest.update([0]);
+        digest.update(
+            relationship
+                .positive_amplitude_ratio
+                .to_bits()
+                .to_le_bytes(),
+        );
+        digest.update(
+            relationship
+                .positive_phase_offset_degrees
+                .to_bits()
+                .to_le_bytes(),
+        );
+        match (
+            relationship.negative_amplitude_ratio,
+            relationship.negative_phase_offset_degrees,
+        ) {
+            (Some(amplitude), Some(phase)) => {
+                digest.update([1]);
+                digest.update(amplitude.to_bits().to_le_bytes());
+                digest.update(phase.to_bits().to_le_bytes());
+            }
+            (None, None) => digest.update([0]),
+            _ => unreachable!("inference reports are constructed internally"),
+        }
+    }
 }
 
 fn update_reconstruction_filter_digest(digest: &mut Sha256, filter: &ReconstructionFilter) {
@@ -1230,6 +1595,7 @@ struct OutputData<'data> {
     solutions: &'data [ScalarSolution],
     result_sha256: &'data str,
     selection: &'data ResolvedConstituentSelection,
+    inference: Option<&'data ScalarInferenceConfig>,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     modified_julian_days: &'data [f64],
@@ -1266,6 +1632,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         solutions,
         result_sha256,
         selection,
+        inference,
         analysis_method,
         confidence_interval,
         modified_julian_days,
@@ -1281,7 +1648,10 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
     output.add_attribute("title", "RUTide scalar harmonic coefficients")?;
     output.add_attribute("rutide_schema_version", i64::from(OUTPUT_SCHEMA_VERSION))?;
     output.add_attribute("rutide_version", rutide_core::VERSION)?;
-    output.add_attribute("profile", selection.profile(analysis_method))?;
+    output.add_attribute(
+        "profile",
+        selection.profile(analysis_method, inference.is_some()),
+    )?;
     output.add_attribute("analysis_method", analysis_method.name())?;
     if let AnalysisMethod::Robust(options) = analysis_method {
         output.add_attribute("robust_tuning_constant", options.tuning_constant)?;
@@ -1306,6 +1676,10 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
     if let Some(record_span_days) = selection.report.record_span_days {
         output.add_attribute("record_span_days", record_span_days)?;
     }
+    write_inference_metadata(
+        &mut output,
+        inference.map(ScalarInferenceConfig::report).as_ref(),
+    )?;
     let constituent_names = constituents
         .iter()
         .map(|constituent| constituent.name.as_str())
@@ -1696,10 +2070,13 @@ mod tests {
     use std::fs;
 
     use super::{
-        NodeSelection, encode_hex, normalize_source_observation, read_fvcom_scalar,
-        resolve_node_selection, temporary_sibling, write_reconstruction_variables,
+        NodeSelection, ScalarInferenceConfig, encode_hex, normalize_source_observation,
+        read_fvcom_scalar, resolve_node_selection, temporary_sibling, write_inference_metadata,
+        write_reconstruction_variables,
     };
-    use rutide_core::{ReconstructionFilter, TidalConstituent};
+    use rutide_core::{
+        InferenceMode, ReconstructionFilter, ScalarInferenceRelation, TidalConstituent,
+    };
 
     #[test]
     fn selection_preserves_explicit_order() {
@@ -1828,6 +2205,46 @@ mod tests {
                 .expect("read constituent metadata"),
             netcdf::AttributeValue::Str("K1,M2".to_owned())
         );
+        drop(dataset);
+        fs::remove_file(path).expect("remove test NetCDF");
+    }
+
+    #[test]
+    fn scalar_inference_metadata_round_trips_through_netcdf() {
+        let destination = std::env::temp_dir().join("rutide-inference-metadata-test.nc");
+        let path = temporary_sibling(&destination).expect("valid temporary path");
+        let inference = ScalarInferenceConfig {
+            mode: InferenceMode::Approximate,
+            relationships: vec![ScalarInferenceRelation::new(
+                TidalConstituent::S2,
+                TidalConstituent::M2,
+                0.35,
+                20.0,
+            )],
+        };
+        let mut dataset = netcdf::create(&path).expect("create test NetCDF");
+        write_inference_metadata(&mut dataset, Some(&inference.report()))
+            .expect("write inference metadata");
+        dataset.close().expect("close test NetCDF");
+
+        let dataset = netcdf::open(&path).expect("open test NetCDF");
+        for (name, expected) in [
+            ("inference_mode", "approximate"),
+            ("inference_convention", "scalar"),
+            ("inferred_constituent_names", "S2"),
+            ("reference_constituent_names", "M2"),
+            ("inference_positive_amplitude_ratios", "0.35"),
+            ("inference_positive_phase_offsets_degrees", "20"),
+        ] {
+            assert_eq!(
+                dataset
+                    .attribute(name)
+                    .unwrap_or_else(|| panic!("missing attribute {name}"))
+                    .value()
+                    .unwrap_or_else(|error| panic!("cannot read attribute {name}: {error}")),
+                netcdf::AttributeValue::Str(expected.to_owned())
+            );
+        }
         drop(dataset);
         fs::remove_file(path).expect("remove test NetCDF");
     }
