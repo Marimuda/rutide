@@ -80,19 +80,29 @@ comparison of all four ellipse confidence intervals plus SNR.
 - Report record span, retained observation count, largest gap, and spectral-band
   coverage so Lomb–Scargle is not presented as a cure for inadequate sampling.
 
-## 2. Robust fitting — planned
+## 2. Robust fitting — complete
 
-- Implement iteratively reweighted least squares with the pinned Python default
-  Cauchy weight function.
-- Define convergence tolerance, iteration limit, scale estimate, zero-weight
-  behavior, and non-convergence errors explicitly.
-- Return final weights and robust diagnostics.
-- Support scalar and complex vector fits, missing observations, exact corrections,
-  confidence intervals, and reconstruction from the robust solution.
+- Cauchy IRLS reproduces the pinned Python default (`tune=2.385`,
+  `tol=0.001`, `maxit=50`) and permits explicit validated overrides.
+- Convergence, objective-increase rollback, exact fits, degenerate MAD scale,
+  leverage validation, and iteration exhaustion have defined outcomes.
+- Scalar fits and complex vector fits return the final shared per-time weights,
+  leverage, iteration count, stopping reason, scale, and OLS/final RMS residuals.
+- Complete, missing, and irregular records support exact corrections, white or
+  colored linear confidence intervals, SNR, PE, and reconstruction from the
+  robust coefficients.
+- Scalar and vector FVCOM commands expose `--method robust` plus tuning,
+  tolerance, and iteration-limit options. NetCDF outputs retain robust settings
+  and ragged per-observation diagnostics for gappy series.
 
-Acceptance requires clean-data convergence to OLS, injected spikes, sustained
-outliers, near-zero residual scale, non-convergence, and Python weight/coefficient
-comparisons. Performance results must state iteration counts.
+The acceptance suite covers exact clean data, injected spikes, a sustained
+outlier block, non-convergence, near-zero non-exact scale, missing irregular
+scalar/vector records, and pinned Python comparisons of coefficients, ellipses,
+weights, confidence intervals, and SNR. The dedicated performance snapshot
+records all iteration counts in
+`benchmarks/results/robust-fitting-2026-09-01.md`; RUTide is 7.66–19.46x faster
+on the 100-series worker matrix and 13.39–17.66x faster on 1,000 series at 16/32
+workers.
 
 ## 3. Inferred constituents — planned
 

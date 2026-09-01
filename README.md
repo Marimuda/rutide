@@ -28,8 +28,14 @@ UTide baseline across all 144,860 current elements, a 23.6x process-boundary
 speedup with Python-compatible ellipse and colored-CI correctness.
 
 The focused [irregular-confidence snapshot](benchmarks/results/irregular-confidence-2026-09-01.md)
-records Lomb–Scargle scalar and vector parity and a 3.29x/6.24x advantage over a
-prewarmed 32-process Python baseline on its 100-series observational workload.
+records Lomb–Scargle scalar and vector parity and a 20.05–70.06x advantage over
+pinned Python UTide on its 100-series observational workload, depending on field
+and worker count.
+
+The [robust-fitting snapshot](benchmarks/results/robust-fitting-2026-09-01.md)
+records exact Cauchy-IRLS parity, including identical iteration counts, and a
+7.66–19.46x advantage on 100 series. On the more sustained 1,000-series workload,
+RUTide is 13.39–17.66x faster at 16 and 32 workers.
 
 The implemented scalar kernels now cover fixed-constituent OLS with mean and
 trend in both raw-phase mode and exact Greenwich/nodal mode. The exact-correction
@@ -52,6 +58,12 @@ FVCOM `zeta(time, node)` or `ua(time, nele)` plus `va(time, nele)` and serialize
 the corresponding analysis, diagnostics, observation counts, per-series
 reference epochs, and optional reconstruction to NetCDF.
 
+Cauchy robust fitting is available for scalar and vector analyses, including
+missing and irregular records, colored confidence intervals, and reconstruction.
+It returns auditable weights, leverage, iteration/stopping diagnostics, robust
+scale, and OLS/final RMS residuals. Pinned-Python oracle tests cover coefficients,
+ellipses, weights, confidence intervals, and SNR.
+
 ## Repository layout
 
 ```text
@@ -67,8 +79,8 @@ Large FVCOM data and generated benchmark results also remain outside Git.
 
 The completed compatibility surface and remaining scientific, interface, and
 resource tasks are tracked in [`ROADMAP.md`](ROADMAP.md). Irregular scalar and
-vector colored confidence now use Lomb–Scargle residual spectra; robust fitting is
-the next scientific increment.
+vector colored confidence use Lomb–Scargle residual spectra, robust fitting is
+complete, and inferred constituents are the next scientific increment.
 
 ## Development
 
@@ -122,6 +134,14 @@ Colored and white scalar confidence support regular and irregular timestamps.
 Missing observations on an originally equidistant grid use Python-compatible
 linear interpolation of fitted residuals onto the full grid before the FFT;
 truly irregular timestamps use a Lomb–Scargle residual spectrum.
+
+Add `--method robust` for Python-compatible Cauchy iteratively reweighted least
+squares. Defaults are tuning constant `2.385`, fractional tolerance `0.001`, and
+50 iterations; override them with `--robust-tuning`, `--robust-tolerance`, and
+`--robust-max-iterations`. Robust NetCDF outputs include per-series convergence
+diagnostics and ragged `robust_weight` / `robust_leverage` arrays. For a series
+with missing values, each ragged row follows the finite observations in original
+timestamp order.
 
 Add `--reconstruct` to write `reconstruction(time, series)` at every original
 FVCOM timestamp. With no filter it includes every fitted constituent. Use

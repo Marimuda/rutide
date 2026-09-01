@@ -80,6 +80,22 @@ Python probe is canonical single-process UTide with BLAS limited to one thread.
 Larger worker counts retain a Linux `fork` pool and still call the existing
 one-series API once per series, matching the Rust batch worker-count comparison.
 
+Benchmark robust Cauchy IRLS plus regular colored confidence on the matched
+outlier fixtures with:
+
+```console
+RUTIDE_BENCH_FIELD=scalar RUTIDE_BENCH_SERIES=100 \
+  cargo bench -p rutide-core --bench robust_throughput
+uv run --project benchmarks/python --locked \
+  python -m rutide_baseline.robust_benchmark \
+  --field scalar --series-count 100 --workers 1
+```
+
+Both probes print the CI checksum and IRLS iteration sum, minimum, mean, and
+maximum. Use the same field, series count, warm-up count, repetitions, and worker
+count in comparisons. The Python probe exposes `coef.rf.iterations` from the
+pinned solver rather than inferring work from elapsed time.
+
 The `fixed-raw` solver profile is the first Rust parity target. It fits M2, S2,
 N2, K1, and O1 with ordinary least squares, a mean and trend, raw phase, no nodal
 corrections, and no confidence intervals. This deliberately isolates harmonic
