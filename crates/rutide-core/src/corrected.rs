@@ -187,6 +187,24 @@ pub struct VectorInferenceOls {
     decomposition: ColPivQr<c64>,
 }
 
+/// Shared astronomy for scalar inference across varying-latitude series.
+#[derive(Debug)]
+pub struct ScalarInferenceBatch {
+    basis: CorrectionBasis,
+    layout: ScalarInferenceLayout,
+    relationships: Vec<ScalarInferenceRelation>,
+    mode: InferenceMode,
+}
+
+/// Shared astronomy for coupled vector inference across varying-latitude series.
+#[derive(Debug)]
+pub struct VectorInferenceBatch {
+    basis: CorrectionBasis,
+    layout: VectorInferenceLayout,
+    relationships: Vec<VectorInferenceRelation>,
+    mode: InferenceMode,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct VectorInferenceOutput {
     source_fit_index: usize,
@@ -538,19 +556,41 @@ impl ScalarInferenceOls {
             &layout.tidal_constituents,
             layout.fit_count,
         )?;
-        let model =
-            basis.scalar_inference_model_at_latitude(latitude_degrees_north, &layout, mode)?;
+        let record = basis.record_subset((0..basis.time_terms.len()).collect(), true)?;
+        Self::from_basis_record(
+            &basis,
+            &record,
+            latitude_degrees_north,
+            &layout,
+            relationships,
+            mode,
+        )
+    }
 
+    fn from_basis_record(
+        basis: &CorrectionBasis,
+        record: &RecordSubset,
+        latitude_degrees_north: f64,
+        layout: &ScalarInferenceLayout,
+        relationships: &[ScalarInferenceRelation],
+        mode: InferenceMode,
+    ) -> Result<Self, AnalysisError> {
+        let model = basis.scalar_inference_model_at_latitude_for_record(
+            latitude_degrees_north,
+            layout,
+            mode,
+            record,
+        )?;
         Ok(Self {
-            tidal_constituents: layout.tidal_constituents,
-            constituents: basis.scalar_constituents,
+            tidal_constituents: layout.tidal_constituents.clone(),
+            constituents: record.scalar_constituents.clone(),
             relationships: relationships.to_vec(),
             mode,
-            output_mappings: layout.output_mappings,
+            output_mappings: layout.output_mappings.clone(),
             latitude_degrees_north,
-            reference_time_modified_julian_day: basis.reference_time_modified_julian_day,
-            base_constituents: basis.base_constituents,
-            recipes: basis.recipes,
+            reference_time_modified_julian_day: record.reference_time,
+            base_constituents: basis.base_constituents.clone(),
+            recipes: basis.recipes.clone(),
             model,
         })
     }
@@ -864,23 +904,46 @@ impl VectorInferenceOls {
             &layout.tidal_constituents,
             layout.fit_count,
         )?;
-        let (design, confidence_sampling) =
-            basis.vector_inference_design_at_latitude(latitude_degrees_north, &layout, mode)?;
+        let record = basis.record_subset((0..basis.time_terms.len()).collect(), true)?;
+        Self::from_basis_record(
+            &basis,
+            &record,
+            latitude_degrees_north,
+            &layout,
+            relationships,
+            mode,
+        )
+    }
+
+    fn from_basis_record(
+        basis: &CorrectionBasis,
+        record: &RecordSubset,
+        latitude_degrees_north: f64,
+        layout: &VectorInferenceLayout,
+        relationships: &[VectorInferenceRelation],
+        mode: InferenceMode,
+    ) -> Result<Self, AnalysisError> {
+        let design = basis.vector_inference_design_at_latitude_for_record(
+            latitude_degrees_north,
+            layout,
+            mode,
+            record,
+        )?;
         let decomposition = design.col_piv_qr();
         Ok(Self {
-            tidal_constituents: layout.tidal_constituents,
-            constituents: basis.scalar_constituents,
+            tidal_constituents: layout.tidal_constituents.clone(),
+            constituents: record.scalar_constituents.clone(),
             relationships: relationships.to_vec(),
             mode,
-            output_mappings: layout.output_mappings,
+            output_mappings: layout.output_mappings.clone(),
             non_reference_count: layout.non_reference_count,
             latitude_degrees_north,
-            reference_time_modified_julian_day: basis.reference_time_modified_julian_day,
-            time_span_days: basis.time_span_days,
-            time_count: basis.time_terms.len(),
-            base_constituents: basis.base_constituents,
-            recipes: basis.recipes,
-            confidence_sampling,
+            reference_time_modified_julian_day: record.reference_time,
+            time_span_days: record.time_span_days,
+            time_count: record.positions.len(),
+            base_constituents: basis.base_constituents.clone(),
+            recipes: basis.recipes.clone(),
+            confidence_sampling: record.confidence_sampling.clone(),
             design,
             decomposition,
         })
@@ -1606,6 +1669,472 @@ impl GreenwichNodalReconstructor {
     }
 }
 
+impl ScalarInferenceBatch {
+    /// Prepare shared astronomical terms for scalar inference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid timestamps, constituents, relationships, or
+    /// an underdetermined model.
+    pub fn prepare_modified_julian_days(
+        modified_julian_days: &[f64],
+        constituents: &[TidalConstituent],
+        relationships: &[ScalarInferenceRelation],
+        mode: InferenceMode,
+    ) -> Result<Self, AnalysisError> {
+        let layout = scalar_inference_layout(constituents, relationships)?;
+        let basis = CorrectionBasis::prepare_with_model_count(
+            modified_julian_days,
+            &layout.tidal_constituents,
+            layout.fit_count,
+        )?;
+        Ok(Self {
+            basis,
+            layout,
+            relationships: relationships.to_vec(),
+            mode,
+        })
+    }
+
+    /// Return the source timestamp count.
+    #[must_use]
+    pub const fn time_count(&self) -> usize {
+        self.basis.time_terms.len()
+    }
+
+    /// Return every reported constituent in coefficient order.
+    #[must_use]
+    pub fn tidal_constituents(&self) -> &[TidalConstituent] {
+        &self.layout.tidal_constituents
+    }
+
+    /// Return reported names and reference-time frequencies.
+    #[must_use]
+    pub fn constituents(&self) -> &[Constituent] {
+        &self.basis.scalar_constituents
+    }
+
+    /// Return scalar relationships in caller-supplied order.
+    #[must_use]
+    pub fn relationships(&self) -> &[ScalarInferenceRelation] {
+        &self.relationships
+    }
+
+    /// Return the configured inference mode.
+    #[must_use]
+    pub const fn mode(&self) -> InferenceMode {
+        self.mode
+    }
+
+    /// Fit complete time-major scalar series at varying latitudes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid shapes, latitudes, or observations.
+    pub fn solve_time_major(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_impl(observations, latitudes, None, None, false)
+    }
+
+    /// Fit complete scalar series with linear confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid shapes, latitudes, or observations.
+    pub fn solve_time_major_with_linear_confidence(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_impl(observations, latitudes, Some(noise), None, false)
+    }
+
+    /// Robustly fit complete scalar series.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or a robust fitting failure.
+    pub fn solve_time_major_robust(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        options: RobustOptions,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_impl(observations, latitudes, None, Some(options), false)
+    }
+
+    /// Robustly fit complete scalar series with linear confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or a robust fitting failure.
+    pub fn solve_time_major_robust_with_linear_confidence(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        options: RobustOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_impl(observations, latitudes, Some(noise), Some(options), false)
+    }
+
+    /// Fit scalar series while treating `NaN` observations as missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid shapes, latitudes, infinities, or
+    /// underdetermined retained records.
+    pub fn solve_time_major_with_missing(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_impl(observations, latitudes, None, None, true)
+    }
+
+    /// Fit gappy scalar series with linear confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or underdetermined retained records.
+    pub fn solve_time_major_with_missing_and_linear_confidence(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_impl(observations, latitudes, Some(noise), None, true)
+    }
+
+    /// Robustly fit scalar series while treating `NaN` as missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or a robust fitting failure.
+    pub fn solve_time_major_with_missing_robust(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        options: RobustOptions,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_impl(observations, latitudes, None, Some(options), true)
+    }
+
+    /// Robustly fit gappy scalar series with linear confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or a robust fitting failure.
+    pub fn solve_time_major_with_missing_robust_and_linear_confidence(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        options: RobustOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_impl(observations, latitudes, Some(noise), Some(options), true)
+    }
+
+    fn solve_time_major_impl(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        confidence: Option<LinearConfidence>,
+        robust: Option<RobustOptions>,
+        allow_missing: bool,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        validate_batch_shape_and_latitudes(self.time_count(), observations, latitudes)?;
+        let series_count = latitudes.len();
+        for (index, value) in observations.iter().copied().enumerate() {
+            if value.is_infinite() || (!allow_missing && value.is_nan()) {
+                return Err(AnalysisError::NonFiniteObservation {
+                    series: index % series_count,
+                    time: index / series_count,
+                });
+            }
+        }
+        let mut unique_positions = Vec::<Vec<usize>>::new();
+        let mut record_use_count = Vec::<usize>::new();
+        let mut record_by_positions = HashMap::<Vec<usize>, usize>::new();
+        let mut record_for_series = Vec::with_capacity(series_count);
+        for series in 0..series_count {
+            let positions = (0..self.time_count())
+                .filter(|time| observations[time * series_count + series].is_finite())
+                .collect::<Vec<_>>();
+            let record_index = if let Some(index) = record_by_positions.get(&positions) {
+                record_use_count[*index] += 1;
+                *index
+            } else {
+                let index = unique_positions.len();
+                record_by_positions.insert(positions.clone(), index);
+                unique_positions.push(positions);
+                record_use_count.push(1);
+                index
+            };
+            record_for_series.push(record_index);
+        }
+        let records = unique_positions
+            .into_iter()
+            .zip(shared_lomb_plan_groups(&record_use_count))
+            .map(|(positions, share_plan)| self.basis.record_subset(positions, share_plan))
+            .collect::<Result<Vec<_>, _>>()?;
+        if confidence == Some(LinearConfidence::Colored) {
+            for record in &records {
+                record
+                    .confidence_sampling
+                    .precompute_shared_irregular_plan();
+            }
+        }
+
+        (0..series_count)
+            .into_par_iter()
+            .map(|series| {
+                let record = &records[record_for_series[series]];
+                let model = ScalarInferenceOls::from_basis_record(
+                    &self.basis,
+                    record,
+                    latitudes[series],
+                    &self.layout,
+                    &self.relationships,
+                    self.mode,
+                )?;
+                let values = record
+                    .positions
+                    .iter()
+                    .copied()
+                    .map(|time| observations[time * series_count + series])
+                    .collect::<Vec<_>>();
+                match (robust, confidence) {
+                    (Some(options), Some(noise)) => {
+                        model.solve_robust_with_linear_confidence(&values, options, noise)
+                    }
+                    (Some(options), None) => model.solve_robust(&values, options),
+                    (None, Some(noise)) => model.solve_with_linear_confidence(&values, noise),
+                    (None, None) => model.solve(&values),
+                }
+            })
+            .collect()
+    }
+}
+
+impl VectorInferenceBatch {
+    /// Prepare shared astronomical terms for coupled vector inference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid timestamps, constituents, relationships, or
+    /// an underdetermined model.
+    pub fn prepare_modified_julian_days(
+        modified_julian_days: &[f64],
+        constituents: &[TidalConstituent],
+        relationships: &[VectorInferenceRelation],
+        mode: InferenceMode,
+    ) -> Result<Self, AnalysisError> {
+        let layout = vector_inference_layout(constituents, relationships)?;
+        let basis = CorrectionBasis::prepare_with_model_count(
+            modified_julian_days,
+            &layout.tidal_constituents,
+            layout.fit_count,
+        )?;
+        Ok(Self {
+            basis,
+            layout,
+            relationships: relationships.to_vec(),
+            mode,
+        })
+    }
+
+    /// Return the source timestamp count.
+    #[must_use]
+    pub const fn time_count(&self) -> usize {
+        self.basis.time_terms.len()
+    }
+
+    /// Return every reported constituent in coefficient order.
+    #[must_use]
+    pub fn tidal_constituents(&self) -> &[TidalConstituent] {
+        &self.layout.tidal_constituents
+    }
+
+    /// Return reported names and reference-time frequencies.
+    #[must_use]
+    pub fn constituents(&self) -> &[Constituent] {
+        &self.basis.scalar_constituents
+    }
+
+    /// Return vector relationships in caller-supplied order.
+    #[must_use]
+    pub fn relationships(&self) -> &[VectorInferenceRelation] {
+        &self.relationships
+    }
+
+    /// Return the configured inference mode.
+    #[must_use]
+    pub const fn mode(&self) -> InferenceMode {
+        self.mode
+    }
+
+    /// Fit complete time-major current series at varying latitudes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid shapes, latitudes, or observations.
+    pub fn solve_vector_time_major(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_impl(eastward, northward, latitudes, None, false)
+    }
+
+    /// Fit complete current series with linear ellipse confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid shapes, latitudes, or observations.
+    pub fn solve_vector_time_major_with_linear_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        noise: LinearConfidence,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_impl(eastward, northward, latitudes, Some(noise), false)
+    }
+
+    /// Fit currents while omitting a time from both components when either is
+    /// `NaN`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid shapes, latitudes, infinities, or
+    /// underdetermined joint records.
+    pub fn solve_vector_time_major_with_missing(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_impl(eastward, northward, latitudes, None, true)
+    }
+
+    /// Fit gappy currents with linear ellipse confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or underdetermined joint records.
+    pub fn solve_vector_time_major_with_missing_and_linear_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        noise: LinearConfidence,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_impl(eastward, northward, latitudes, Some(noise), true)
+    }
+
+    fn solve_vector_time_major_impl(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        confidence: Option<LinearConfidence>,
+        allow_missing: bool,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        validate_batch_shape_and_latitudes(self.time_count(), eastward, latitudes)?;
+        if northward.len() != eastward.len() {
+            return Err(AnalysisError::ObservationShape {
+                actual: northward.len(),
+                expected: eastward.len(),
+            });
+        }
+        let series_count = latitudes.len();
+        for (index, value) in eastward.iter().chain(northward).copied().enumerate() {
+            if value.is_infinite() || (!allow_missing && value.is_nan()) {
+                return Err(AnalysisError::NonFiniteObservation {
+                    series: index % series_count,
+                    time: (index % eastward.len()) / series_count,
+                });
+            }
+        }
+        let mut unique_positions = Vec::<Vec<usize>>::new();
+        let mut record_use_count = Vec::<usize>::new();
+        let mut record_by_positions = HashMap::<Vec<usize>, usize>::new();
+        let mut record_for_series = Vec::with_capacity(series_count);
+        for series in 0..series_count {
+            let positions = (0..self.time_count())
+                .filter(|time| {
+                    eastward[time * series_count + series].is_finite()
+                        && northward[time * series_count + series].is_finite()
+                })
+                .collect::<Vec<_>>();
+            let record_index = if let Some(index) = record_by_positions.get(&positions) {
+                record_use_count[*index] += 1;
+                *index
+            } else {
+                let index = unique_positions.len();
+                record_by_positions.insert(positions.clone(), index);
+                unique_positions.push(positions);
+                record_use_count.push(1);
+                index
+            };
+            record_for_series.push(record_index);
+        }
+        let records = unique_positions
+            .into_iter()
+            .zip(shared_lomb_plan_groups(&record_use_count))
+            .map(|(positions, share_plan)| self.basis.record_subset(positions, share_plan))
+            .collect::<Result<Vec<_>, _>>()?;
+        if confidence == Some(LinearConfidence::Colored) {
+            for record in &records {
+                record
+                    .confidence_sampling
+                    .precompute_shared_irregular_plan();
+            }
+        }
+
+        (0..series_count)
+            .into_par_iter()
+            .map(|series| {
+                let record = &records[record_for_series[series]];
+                let model = VectorInferenceOls::from_basis_record(
+                    &self.basis,
+                    record,
+                    latitudes[series],
+                    &self.layout,
+                    &self.relationships,
+                    self.mode,
+                )?;
+                let eastward_values = record
+                    .positions
+                    .iter()
+                    .copied()
+                    .map(|time| eastward[time * series_count + series])
+                    .collect::<Vec<_>>();
+                let northward_values = record
+                    .positions
+                    .iter()
+                    .copied()
+                    .map(|time| northward[time * series_count + series])
+                    .collect::<Vec<_>>();
+                match confidence {
+                    Some(noise) => model.solve_vector_with_linear_confidence(
+                        &eastward_values,
+                        &northward_values,
+                        noise,
+                    ),
+                    None => model.solve_vector(&eastward_values, &northward_values),
+                }
+            })
+            .collect()
+    }
+}
+
 /// Shared exact astronomy for fitting many series at different latitudes.
 ///
 /// Preparation evaluates the latitude-independent astronomical arguments once.
@@ -2161,6 +2690,7 @@ impl GreenwichNodalBatch {
 #[derive(Debug)]
 struct CorrectionBasis {
     tidal_constituents: Vec<TidalConstituent>,
+    model_constituent_count: usize,
     scalar_constituents: Vec<Constituent>,
     base_constituents: Vec<TidalConstituent>,
     recipes: Vec<CorrectionRecipe>,
@@ -2170,7 +2700,7 @@ struct CorrectionBasis {
     sample_interval_hours: Option<f64>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ScalarInferenceLayout {
     tidal_constituents: Vec<TidalConstituent>,
     output_mappings: Vec<ScalarInferenceOutput>,
@@ -2178,13 +2708,13 @@ struct ScalarInferenceLayout {
     fit_count: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ScalarInferenceReferenceGroup {
     fit_index: usize,
     inferred_outputs: Vec<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct VectorInferenceLayout {
     tidal_constituents: Vec<TidalConstituent>,
     output_mappings: Vec<VectorInferenceOutput>,
@@ -2193,7 +2723,7 @@ struct VectorInferenceLayout {
     non_reference_count: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct VectorInferenceReferenceGroup {
     fit_index: usize,
     inferred_outputs: Vec<usize>,
@@ -2465,6 +2995,7 @@ impl CorrectionBasis {
             .collect();
         Ok(Self {
             tidal_constituents: constituents.to_vec(),
+            model_constituent_count,
             scalar_constituents,
             base_constituents,
             recipes,
@@ -2481,14 +3012,13 @@ impl CorrectionBasis {
         self.model_at_latitude_for_record(latitude, &record)
     }
 
-    fn scalar_inference_model_at_latitude(
+    fn scalar_inference_model_at_latitude_for_record(
         &self,
         latitude: f64,
         layout: &ScalarInferenceLayout,
         mode: InferenceMode,
+        record: &RecordSubset,
     ) -> Result<FixedRawOls, AnalysisError> {
-        let positions = (0..self.time_terms.len()).collect::<Vec<_>>();
-        let record = self.record_subset(positions, true)?;
         validate_latitude(latitude)?;
         let harmonic_columns = layout.fit_count * 2;
         let mut design = Mat::zeros(record.positions.len(), harmonic_columns + 2);
@@ -2532,25 +3062,24 @@ impl CorrectionBasis {
         }
         Ok(FixedRawOls::from_design_with_confidence_constituents(
             record.scalar_constituents[..layout.fit_count].to_vec(),
-            record.scalar_constituents,
+            record.scalar_constituents.clone(),
             Some(layout.fit_count - layout.reference_groups.len()),
             record.positions.len(),
             record.time_span_days,
             record.reference_time,
-            record.confidence_sampling,
+            record.confidence_sampling.clone(),
             design,
         ))
     }
 
-    fn vector_inference_design_at_latitude(
+    fn vector_inference_design_at_latitude_for_record(
         &self,
         latitude: f64,
         layout: &VectorInferenceLayout,
         mode: InferenceMode,
-    ) -> Result<(Mat<c64>, ConfidenceSampling), AnalysisError> {
+        record: &RecordSubset,
+    ) -> Result<Mat<c64>, AnalysisError> {
         validate_latitude(latitude)?;
-        let positions = (0..self.time_terms.len()).collect::<Vec<_>>();
-        let record = self.record_subset(positions, true)?;
         let column_count = layout.fit_count * 2 + 2;
         let mut design = Mat::zeros(record.positions.len(), column_count);
         let latitude_factors = latitude_factors(latitude);
@@ -2597,7 +3126,7 @@ impl CorrectionBasis {
                 0.0,
             );
         }
-        Ok((design, record.confidence_sampling))
+        Ok(design)
     }
 
     fn record_subset(
@@ -2611,7 +3140,7 @@ impl CorrectionBasis {
             .map(|position| self.time_terms[position].modified_julian_day)
             .collect::<Vec<_>>();
         let (subset_reference, subset_span) =
-            validate_time(&modified_julian_days, self.tidal_constituents.len())?;
+            validate_time(&modified_julian_days, self.model_constituent_count)?;
         let original_is_equidistant = self.sample_interval_hours.is_some();
         let (reference_time, time_span_days, scalar_constituents, confidence_sampling) =
             if original_is_equidistant {

@@ -1,8 +1,9 @@
 //! Scalar inferred-constituent parity against the pinned Python `UTide` oracle.
 
 use rutide_core::{
-    AnalysisError, InferenceMode, LinearConfidence, ReconstructionFilter, ScalarInferenceOls,
-    ScalarInferenceRelation, TidalConstituent, VectorInferenceOls, VectorInferenceRelation,
+    AnalysisError, InferenceMode, LinearConfidence, ReconstructionFilter, ScalarInferenceBatch,
+    ScalarInferenceOls, ScalarInferenceRelation, TidalConstituent, VectorInferenceBatch,
+    VectorInferenceOls, VectorInferenceRelation,
 };
 
 const LATITUDE: f64 = 60.957_717_895_507_81;
@@ -929,6 +930,183 @@ fn matches_resolved_exact_vector_colored_confidence_oracle() {
                 0.580_015_146_258_317_4,
             ],
             5e-7,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{field}[{index}]"), *actual, *expected, tolerance);
+        }
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "covers scalar and joint-vector missing inference through the same pinned fixture"
+)]
+fn matches_gappy_scalar_and_vector_colored_inference_oracles() {
+    let time = oracle_times(745);
+    let observations = oracle_observations(745);
+    let mut scalar_time_major = Vec::with_capacity(time.len() * 2);
+    for (index, observation) in observations.iter().copied().enumerate() {
+        let missing = index % 17 == 3 || (300..320).contains(&index);
+        scalar_time_major.extend([observation, if missing { f64::NAN } else { observation }]);
+    }
+    let scalar_batch = ScalarInferenceBatch::prepare_modified_julian_days(
+        &time,
+        &requested(),
+        &RELATIONSHIPS,
+        InferenceMode::Exact,
+    )
+    .expect("valid scalar inference batch");
+    let scalar = scalar_batch
+        .solve_time_major_with_missing_and_linear_confidence(
+            &scalar_time_major,
+            &[LATITUDE, LATITUDE],
+            LinearConfidence::Colored,
+        )
+        .expect("valid gappy scalar inference solutions")
+        .pop()
+        .expect("two scalar solutions");
+    for (field, actual, expected, tolerance) in [
+        (
+            "scalar_amplitude",
+            &scalar.amplitude,
+            &[
+                0.005_864_340_119_835_285,
+                0.609_947_129_142_678_2,
+                0.097_191_005_929_159_73,
+                0.213_481_495_199_937_3,
+                0.048_595_502_964_579_866,
+            ],
+            5e-10,
+        ),
+        (
+            "scalar_phase",
+            &scalar.phase_degrees,
+            &[
+                58.437_121_026_985_04,
+                192.535_377_639_505_67,
+                144.362_980_846_243_46,
+                172.535_377_639_505_67,
+                99.362_980_846_243_45,
+            ],
+            5e-7,
+        ),
+        (
+            "scalar_amplitude_ci",
+            scalar
+                .amplitude_ci
+                .as_ref()
+                .expect("gappy scalar solution contains intervals"),
+            &[
+                0.001_300_628_633_285_616_7,
+                0.049_291_115_609_988_466,
+                0.015_988_184_407_163_975,
+                0.012_195_481_630_753_093,
+                0.005_651_202_975_666_341,
+            ],
+            5e-8,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(&format!("{field}[{index}]"), *actual, *expected, tolerance);
+        }
+    }
+
+    let (eastward, northward) = synthetic_vector_observations(&time);
+    let mut eastward_time_major = Vec::with_capacity(time.len() * 2);
+    let mut northward_time_major = Vec::with_capacity(time.len() * 2);
+    for index in 0..time.len() {
+        let eastward_missing = index % 19 == 2 || (400..412).contains(&index);
+        let northward_missing = index % 23 == 5;
+        eastward_time_major.extend([
+            eastward[index],
+            if eastward_missing {
+                f64::NAN
+            } else {
+                eastward[index]
+            },
+        ]);
+        northward_time_major.extend([
+            northward[index],
+            if northward_missing {
+                f64::NAN
+            } else {
+                northward[index]
+            },
+        ]);
+    }
+    let vector_batch = VectorInferenceBatch::prepare_modified_julian_days(
+        &time,
+        &requested(),
+        &VECTOR_RELATIONSHIPS,
+        InferenceMode::Exact,
+    )
+    .expect("valid vector inference batch");
+    let vector = vector_batch
+        .solve_vector_time_major_with_missing_and_linear_confidence(
+            &eastward_time_major,
+            &northward_time_major,
+            &[LATITUDE, LATITUDE],
+            LinearConfidence::Colored,
+        )
+        .expect("valid gappy vector inference solutions")
+        .pop()
+        .expect("two vector solutions");
+    for (field, actual, expected, tolerance) in [
+        (
+            "vector_major",
+            &vector.semi_major,
+            &[
+                0.010_919_083_847_383_654,
+                0.003_623_338_328_987_682,
+                0.016_346_488_230_777_525,
+                0.001_115_459_964_675_995,
+                0.007_376_100_345_387_472,
+            ],
+            5e-10,
+        ),
+        (
+            "vector_minor",
+            &vector.semi_minor,
+            &[
+                -0.002_550_902_796_222_810_6,
+                0.000_569_169_319_593_808_2,
+                0.000_403_612_830_751_697_7,
+                0.000_351_917_712_327_526_7,
+                0.000_998_950_185_377_141,
+            ],
+            5e-10,
+        ),
+        (
+            "vector_major_ci",
+            vector
+                .semi_major_ci
+                .as_ref()
+                .expect("gappy vector solution contains major intervals"),
+            &[
+                0.011_330_009_891_136_366,
+                0.029_140_192_288_313_56,
+                0.012_467_124_019_200_916,
+                0.006_316_103_179_087_014,
+                0.010_046_050_239_825_665,
+            ],
+            5e-8,
+        ),
+        (
+            "vector_minor_ci",
+            vector
+                .semi_minor_ci
+                .as_ref()
+                .expect("gappy vector solution contains minor intervals"),
+            &[
+                0.028_253_270_002_152_067,
+                0.003_658_545_908_396_234_6,
+                0.028_796_653_472_701_474,
+                0.006_316_103_179_087_014,
+                0.010_046_050_239_825_665,
+            ],
+            5e-8,
         ),
     ] {
         for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {

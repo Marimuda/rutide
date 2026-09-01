@@ -123,9 +123,11 @@ for the independent positive/negative rotary ratios. Exact and
 Python-compatible approximate bases, grouped references, white and colored
 linear confidence, PE/SNR, reconstruction, and invalid graph/value handling pass
 resolved and unresolved pinned-oracle fixtures. Inference confidence preserves a
-pinned Python column-order/indexing quirk inside these models only. Missing-value
-batch integration, robust vector inference, and the CLI/NetCDF schema remain
-before this item can be marked complete.
+pinned Python column-order/indexing quirk inside these models only. Scalar and
+joint-mask vector batches now support varying latitudes, complete or missing
+records, and white/colored confidence while retaining bounded shared Lomb plans.
+Robust vector inference and the CLI/NetCDF schema remain before this item can be
+marked complete.
 
 ## 4. Monte Carlo confidence intervals — planned
 
