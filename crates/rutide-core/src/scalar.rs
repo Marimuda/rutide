@@ -1445,31 +1445,7 @@ impl ConfidenceSampling {
         constituents: &[Constituent],
     ) -> Vec<f64> {
         if let Some(sample_interval_hours) = self.sample_interval_hours {
-            let interpolated = match &self.observation_positions {
-                Some(positions) => {
-                    debug_assert_eq!(positions.len(), residual.len());
-                    let mut interpolated = vec![residual[0]; self.spectrum_time_count];
-                    let mut valid = 0;
-                    for (grid_index, value) in interpolated.iter_mut().enumerate() {
-                        while valid + 1 < positions.len() && positions[valid + 1] <= grid_index {
-                            valid += 1;
-                        }
-                        *value = if positions[valid] == grid_index || valid + 1 == positions.len() {
-                            residual[valid]
-                        } else if grid_index < positions[0] {
-                            residual[0]
-                        } else {
-                            let left = positions[valid];
-                            let right = positions[valid + 1];
-                            let fraction =
-                                usize_to_f64(grid_index - left) / usize_to_f64(right - left);
-                            residual[valid] + fraction * (residual[valid + 1] - residual[valid])
-                        };
-                    }
-                    Cow::Owned(interpolated)
-                }
-                None => Cow::Borrowed(residual),
-            };
+            let interpolated = self.residual_on_spectrum_grid(residual);
             band_averaged_fft_residual_power(
                 &interpolated,
                 sample_interval_hours,
@@ -1486,6 +1462,63 @@ impl ConfidenceSampling {
                     constituents,
                 )
         }
+    }
+
+    pub(crate) fn band_averaged_vector_residual_power(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        constituents: &[Constituent],
+    ) -> VectorResidualPower {
+        if let Some(sample_interval_hours) = self.sample_interval_hours {
+            let eastward = self.residual_on_spectrum_grid(eastward);
+            let northward = self.residual_on_spectrum_grid(northward);
+            band_averaged_fft_vector_residual_power(
+                &eastward,
+                &northward,
+                sample_interval_hours,
+                self.effective_record_length_days,
+                constituents,
+            )
+        } else {
+            self.irregular_spectrum
+                .as_ref()
+                .expect("irregular confidence sampling retains timestamps")
+                .band_averaged_vector_residual_power(
+                    eastward,
+                    northward,
+                    self.effective_record_length_days,
+                    constituents,
+                )
+        }
+    }
+
+    fn residual_on_spectrum_grid<'residual>(
+        &self,
+        residual: &'residual [f64],
+    ) -> Cow<'residual, [f64]> {
+        let Some(positions) = &self.observation_positions else {
+            return Cow::Borrowed(residual);
+        };
+        debug_assert_eq!(positions.len(), residual.len());
+        let mut interpolated = vec![residual[0]; self.spectrum_time_count];
+        let mut valid = 0;
+        for (grid_index, value) in interpolated.iter_mut().enumerate() {
+            while valid + 1 < positions.len() && positions[valid + 1] <= grid_index {
+                valid += 1;
+            }
+            *value = if positions[valid] == grid_index || valid + 1 == positions.len() {
+                residual[valid]
+            } else if grid_index < positions[0] {
+                residual[0]
+            } else {
+                let left = positions[valid];
+                let right = positions[valid + 1];
+                let fraction = usize_to_f64(grid_index - left) / usize_to_f64(right - left);
+                residual[valid] + fraction * (residual[valid + 1] - residual[valid])
+            };
+        }
+        Cow::Owned(interpolated)
     }
 }
 
@@ -1581,10 +1614,10 @@ struct LinearIntervals {
     sine_variance: Vec<f64>,
 }
 
-struct VectorResidualPower {
-    eastward: Vec<f64>,
-    northward: Vec<f64>,
-    cross: Vec<f64>,
+pub(crate) struct VectorResidualPower {
+    pub(crate) eastward: Vec<f64>,
+    pub(crate) northward: Vec<f64>,
+    pub(crate) cross: Vec<f64>,
 }
 
 fn matrix_trace(matrix: &[[f64; 2]; 2]) -> f64 {

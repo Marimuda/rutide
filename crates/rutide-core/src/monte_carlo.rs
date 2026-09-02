@@ -42,6 +42,7 @@ pub(crate) struct ScalarMonteCarloIntervals {
     pub(crate) phase_degrees: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct VectorMonteCarloIntervals {
     pub(crate) semi_major: f64,
     pub(crate) semi_minor: f64,
@@ -161,6 +162,96 @@ pub(crate) fn vector_intervals(
         inclination_degrees: confidence_mad(&inclination),
         phase_degrees: confidence_mad(&phase),
     })
+}
+
+/// Sample one fitted current coefficient vector and propagate all positive- and
+/// negative-rotary inference ratios through the same realizations.
+pub(crate) fn vector_transformed_intervals(
+    coefficients: [f64; 4],
+    covariance: [[f64; 4]; 4],
+    ratios: &[[f64; 4]],
+    options: MonteCarloOptions,
+    stream: u64,
+) -> Option<Vec<VectorMonteCarloIntervals>> {
+    let samples = multivariate_samples(coefficients, covariance, options, stream)?;
+    Some(
+        ratios
+            .iter()
+            .copied()
+            .map(|ratio| {
+                let fitted = transform_vector_coefficients(coefficients, ratio);
+                let mut semi_major = Vec::with_capacity(options.realizations);
+                let mut semi_minor = Vec::with_capacity(options.realizations);
+                let mut inclination = Vec::with_capacity(options.realizations);
+                let mut phase = Vec::with_capacity(options.realizations);
+                for transformed in samples
+                    .iter()
+                    .copied()
+                    .map(|sample| transform_vector_coefficients(sample, ratio))
+                {
+                    let ellipse = ellipse_parameters(
+                        transformed[0],
+                        transformed[1],
+                        transformed[2],
+                        transformed[3],
+                    );
+                    semi_major.push(ellipse.0);
+                    semi_minor.push(ellipse.1);
+                    inclination.push(ellipse.2);
+                    phase.push(ellipse.3);
+                }
+                let fitted = ellipse_parameters(fitted[0], fitted[1], fitted[2], fitted[3]);
+                inclination[0] = fitted.2;
+                phase[0] = fitted.3;
+                cluster_degrees(&mut inclination, 360.0);
+                cluster_degrees(&mut phase, 360.0);
+                VectorMonteCarloIntervals {
+                    semi_major: confidence_mad(&semi_major),
+                    semi_minor: confidence_mad(&semi_minor),
+                    inclination_degrees: confidence_mad(&inclination),
+                    phase_degrees: confidence_mad(&phase),
+                }
+            })
+            .collect(),
+    )
+}
+
+pub(crate) fn transform_vector_coefficients(
+    [
+        eastward_cosine,
+        eastward_sine,
+        northward_cosine,
+        northward_sine,
+    ]: [f64; 4],
+    [
+        positive_real,
+        positive_imaginary,
+        negative_real,
+        negative_imaginary,
+    ]: [f64; 4],
+) -> [f64; 4] {
+    let positive = [
+        eastward_cosine.midpoint(northward_sine),
+        northward_cosine.midpoint(-eastward_sine),
+    ];
+    let negative = [
+        eastward_cosine.midpoint(-northward_sine),
+        northward_cosine.midpoint(eastward_sine),
+    ];
+    let transformed_positive = [
+        positive_real * positive[0] - positive_imaginary * positive[1],
+        positive_real * positive[1] + positive_imaginary * positive[0],
+    ];
+    let transformed_negative = [
+        negative_real * negative[0] - negative_imaginary * negative[1],
+        negative_real * negative[1] + negative_imaginary * negative[0],
+    ];
+    [
+        transformed_positive[0] + transformed_negative[0],
+        -(transformed_positive[1] - transformed_negative[1]),
+        transformed_positive[1] + transformed_negative[1],
+        transformed_positive[0] - transformed_negative[0],
+    ]
 }
 
 fn multivariate_samples<const DIMENSION: usize>(
@@ -345,6 +436,7 @@ mod tests {
     use super::{
         MonteCarloOptions, cholesky, multivariate_samples, nearest_positive_definite,
         scalar_intervals, scalar_transformed_intervals, vector_intervals,
+        vector_transformed_intervals,
     };
 
     #[test]
@@ -392,6 +484,33 @@ mod tests {
         assert!((intervals[2].amplitude - 0.35 * intervals[0].amplitude).abs() < 1e-14);
         assert!((intervals[1].phase_degrees - intervals[0].phase_degrees).abs() < 1e-12);
         assert!((intervals[2].phase_degrees - intervals[0].phase_degrees).abs() < 1e-12);
+    }
+
+    #[test]
+    fn transformed_vector_samples_preserve_uniform_rotary_scaling() {
+        let options = MonteCarloOptions {
+            realizations: 2_000,
+            seed: 456,
+        };
+        let intervals = vector_transformed_intervals(
+            [1.0, 0.5, -0.2, 0.3],
+            [
+                [0.04, 0.01, 0.002, -0.001],
+                [0.01, 0.09, 0.003, 0.002],
+                [0.002, 0.003, 0.03, 0.004],
+                [-0.001, 0.002, 0.004, 0.05],
+            ],
+            &[[1.0, 0.0, 1.0, 0.0], [0.35, 0.0, 0.35, 0.0]],
+            options,
+            11,
+        )
+        .expect("valid covariance");
+        assert!((intervals[1].semi_major - 0.35 * intervals[0].semi_major).abs() < 1e-14);
+        assert!((intervals[1].semi_minor - 0.35 * intervals[0].semi_minor).abs() < 1e-14);
+        assert!(
+            (intervals[1].inclination_degrees - intervals[0].inclination_degrees).abs() < 1e-12
+        );
+        assert!((intervals[1].phase_degrees - intervals[0].phase_degrees).abs() < 1e-12);
     }
 
     #[test]

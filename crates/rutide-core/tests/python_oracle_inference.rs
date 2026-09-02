@@ -1,9 +1,10 @@
 //! Scalar inferred-constituent parity against the pinned Python `UTide` oracle.
 
 use rutide_core::{
-    AnalysisError, InferenceMode, LinearConfidence, MonteCarloOptions, ReconstructionFilter,
-    RobustOptions, ScalarInferenceBatch, ScalarInferenceOls, ScalarInferenceRelation,
-    TidalConstituent, VectorInferenceBatch, VectorInferenceOls, VectorInferenceRelation,
+    AnalysisError, GreenwichNodalOls, InferenceMode, LinearConfidence, MonteCarloOptions,
+    ReconstructionFilter, RobustOptions, ScalarInferenceBatch, ScalarInferenceOls,
+    ScalarInferenceRelation, TidalConstituent, VectorInferenceBatch, VectorInferenceOls,
+    VectorInferenceRelation,
 };
 
 const LATITUDE: f64 = 60.957_717_895_507_81;
@@ -491,6 +492,195 @@ fn scalar_monte_carlo_propagates_shared_reference_draws() {
         phase_ci[3],
         phase_ci[1],
         2e-12,
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps shared-draw invariants, independent covariance parity, and robust coverage on one fixture"
+)]
+fn vector_monte_carlo_propagates_shared_rotary_reference_draws() {
+    let time = oracle_times(745);
+    let (eastward, northward) = synthetic_vector_observations(&time);
+    let relationship = [VectorInferenceRelation::new(
+        TidalConstituent::S2,
+        TidalConstituent::M2,
+        0.35,
+        0.0,
+        0.35,
+        0.0,
+    )];
+    let options = MonteCarloOptions {
+        realizations: 257,
+        seed: 20_260_903,
+    };
+    for mode in [InferenceMode::Exact, InferenceMode::Approximate] {
+        let model = VectorInferenceOls::prepare_modified_julian_days(
+            &time,
+            LATITUDE,
+            &requested(),
+            &relationship,
+            mode,
+        )
+        .expect("valid vector inference model");
+        assert_eq!(
+            model
+                .tidal_constituents()
+                .iter()
+                .map(|constituent| constituent.name())
+                .collect::<Vec<_>>(),
+            ["M4", "K1", "O1", "M2", "S2"]
+        );
+        for noise in [LinearConfidence::White, LinearConfidence::Colored] {
+            let solution = model
+                .solve_vector_with_monte_carlo_confidence(&eastward, &northward, options, noise)
+                .expect("valid vector inferred Monte Carlo solution");
+            let repeated = model
+                .solve_vector_with_monte_carlo_confidence(&eastward, &northward, options, noise)
+                .expect("repeated vector inferred Monte Carlo solution");
+            assert_eq!(solution, repeated);
+            let major_ci = solution.semi_major_ci.as_ref().expect("major CI");
+            let minor_ci = solution.semi_minor_ci.as_ref().expect("minor CI");
+            let inclination_ci = solution
+                .inclination_ci_degrees
+                .as_ref()
+                .expect("inclination CI");
+            let phase_ci = solution.phase_ci_degrees.as_ref().expect("phase CI");
+            assert_close("S2 major CI ratio", major_ci[4], 0.35 * major_ci[3], 2e-14);
+            assert_close("S2 minor CI ratio", minor_ci[4], 0.35 * minor_ci[3], 2e-14);
+            assert_close(
+                "S2 inclination CI scaling invariance",
+                inclination_ci[4],
+                inclination_ci[3],
+                2e-12,
+            );
+            assert_close(
+                "S2 phase CI scaling invariance",
+                phase_ci[4],
+                phase_ci[3],
+                2e-12,
+            );
+        }
+    }
+
+    let approximate = VectorInferenceOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE,
+        &requested(),
+        &relationship,
+        InferenceMode::Approximate,
+    )
+    .expect("valid approximate vector inference model");
+    let independent = GreenwichNodalOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE,
+        &[
+            TidalConstituent::from_name("M4").expect("catalog contains M4"),
+            TidalConstituent::K1,
+            TidalConstituent::O1,
+            TidalConstituent::M2,
+        ],
+    )
+    .expect("valid independent comparison model");
+    for noise in [LinearConfidence::White, LinearConfidence::Colored] {
+        let inferred = approximate
+            .solve_vector_with_monte_carlo_confidence(&eastward, &northward, options, noise)
+            .expect("valid approximate inference solution");
+        let independent = independent
+            .solve_vector_with_monte_carlo_confidence(&eastward, &northward, options, noise)
+            .expect("valid independent solution");
+        for (label, inferred, independent) in [
+            (
+                "major CI",
+                inferred.semi_major_ci.as_ref().expect("inferred major CI"),
+                independent
+                    .semi_major_ci
+                    .as_ref()
+                    .expect("independent major CI"),
+            ),
+            (
+                "minor CI",
+                inferred.semi_minor_ci.as_ref().expect("inferred minor CI"),
+                independent
+                    .semi_minor_ci
+                    .as_ref()
+                    .expect("independent minor CI"),
+            ),
+            (
+                "inclination CI",
+                inferred
+                    .inclination_ci_degrees
+                    .as_ref()
+                    .expect("inferred inclination CI"),
+                independent
+                    .inclination_ci_degrees
+                    .as_ref()
+                    .expect("independent inclination CI"),
+            ),
+            (
+                "phase CI",
+                inferred
+                    .phase_ci_degrees
+                    .as_ref()
+                    .expect("inferred phase CI"),
+                independent
+                    .phase_ci_degrees
+                    .as_ref()
+                    .expect("independent phase CI"),
+            ),
+        ] {
+            // Colored inference also excludes the inferred S2 frequency from
+            // its residual band. The independent four-constituent model does
+            // not, so only its ordinary M4/K1/O1 bands are equivalent. White
+            // covariance is equivalent for all four independently fitted
+            // constituents, including the M2 reference.
+            let equivalent_count = if noise == LinearConfidence::White {
+                4
+            } else {
+                3
+            };
+            for constituent in 0..equivalent_count {
+                assert_close(
+                    &format!("approximate {label}[{constituent}]"),
+                    inferred[constituent],
+                    independent[constituent],
+                    2e-9,
+                );
+            }
+        }
+    }
+
+    let model = VectorInferenceOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE,
+        &requested(),
+        &relationship,
+        InferenceMode::Exact,
+    )
+    .expect("valid robust vector inference model");
+    let mut contaminated_eastward = eastward;
+    let mut contaminated_northward = northward;
+    contaminated_eastward[71] += 5.0;
+    contaminated_northward[218] -= 4.0;
+    contaminated_eastward[503] += 4.0;
+    contaminated_northward[503] += 3.0;
+    let solution = model
+        .solve_vector_robust_with_monte_carlo_confidence(
+            &contaminated_eastward,
+            &contaminated_northward,
+            RobustOptions::default(),
+            options,
+            LinearConfidence::Colored,
+        )
+        .expect("valid robust vector inferred Monte Carlo solution");
+    assert!(solution.robust.is_some());
+    let major_ci = solution.semi_major_ci.as_ref().expect("robust major CI");
+    assert_close(
+        "robust S2 major CI ratio",
+        major_ci[4],
+        0.35 * major_ci[3],
+        2e-14,
     );
 }
 

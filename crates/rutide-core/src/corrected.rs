@@ -18,7 +18,7 @@ use crate::{
     VectorSolution,
     astronomy::at_modified_julian_day,
     catalog::{CONSTITUENT_COUNT, Metadata},
-    monte_carlo::scalar_transformed_intervals,
+    monte_carlo::{scalar_transformed_intervals, vector_transformed_intervals},
     robust::fit_complex_with_initial as robust_complex_fit_with_initial,
     scalar::{
         ConfidenceSampling, constituent_stream, equidistant_sample_interval_hours, validate_time,
@@ -332,6 +332,12 @@ struct VectorInferenceIntervals {
     northward_cosine_variance: Vec<f64>,
     northward_sine_variance: Vec<f64>,
     inferred_linearization: Vec<Option<(usize, f64, f64)>>,
+}
+
+struct VectorInferenceCovarianceBasis {
+    fitted: Mat<c64>,
+    gall: Mat<c64>,
+    hall: Mat<c64>,
 }
 
 impl GreenwichNodalOls {
@@ -1388,7 +1394,7 @@ impl VectorInferenceOls {
         eastward: &[f64],
         northward: &[f64],
     ) -> Result<VectorSolution, AnalysisError> {
-        self.solve_vector_impl(eastward, northward, None, None)
+        self.solve_vector_impl(eastward, northward, None, None, 0)
     }
 
     /// Fit one current series with linear ellipse confidence intervals and SNR.
@@ -1402,7 +1408,48 @@ impl VectorInferenceOls {
         northward: &[f64],
         noise: LinearConfidence,
     ) -> Result<VectorSolution, AnalysisError> {
-        self.solve_vector_impl(eastward, northward, Some(noise), None)
+        self.solve_vector_impl(
+            eastward,
+            northward,
+            Some(BatchConfidence::Linear(noise)),
+            None,
+            0,
+        )
+    }
+
+    /// Fit one inferred current series with nonlinear Monte Carlo ellipse
+    /// confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid observations, options, or covariance.
+    pub fn solve_vector_with_monte_carlo_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<VectorSolution, AnalysisError> {
+        self.solve_vector_with_monte_carlo_confidence_from_stream(
+            eastward, northward, options, noise, 0,
+        )
+    }
+
+    fn solve_vector_with_monte_carlo_confidence_from_stream(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+        stream: u64,
+    ) -> Result<VectorSolution, AnalysisError> {
+        self.solve_vector_impl(
+            eastward,
+            northward,
+            Some(BatchConfidence::MonteCarlo { options, noise }),
+            None,
+            stream,
+        )
     }
 
     /// Robustly fit one inferred current series with shared Cauchy weights.
@@ -1416,7 +1463,7 @@ impl VectorInferenceOls {
         northward: &[f64],
         options: RobustOptions,
     ) -> Result<VectorSolution, AnalysisError> {
-        self.solve_vector_impl(eastward, northward, None, Some(options))
+        self.solve_vector_impl(eastward, northward, None, Some(options), 0)
     }
 
     /// Robustly fit inferred currents with linear ellipse intervals and SNR.
@@ -1431,7 +1478,59 @@ impl VectorInferenceOls {
         options: RobustOptions,
         noise: LinearConfidence,
     ) -> Result<VectorSolution, AnalysisError> {
-        self.solve_vector_impl(eastward, northward, Some(noise), Some(options))
+        self.solve_vector_impl(
+            eastward,
+            northward,
+            Some(BatchConfidence::Linear(noise)),
+            Some(options),
+            0,
+        )
+    }
+
+    /// Robustly fit inferred currents with nonlinear Monte Carlo ellipse
+    /// confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid observations or options, robust fitting
+    /// failure, or an unsampleable covariance.
+    pub fn solve_vector_robust_with_monte_carlo_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<VectorSolution, AnalysisError> {
+        self.solve_vector_robust_with_monte_carlo_confidence_from_stream(
+            eastward,
+            northward,
+            robust_options,
+            monte_carlo_options,
+            noise,
+            0,
+        )
+    }
+
+    fn solve_vector_robust_with_monte_carlo_confidence_from_stream(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+        stream: u64,
+    ) -> Result<VectorSolution, AnalysisError> {
+        self.solve_vector_impl(
+            eastward,
+            northward,
+            Some(BatchConfidence::MonteCarlo {
+                options: monte_carlo_options,
+                noise,
+            }),
+            Some(robust_options),
+            stream,
+        )
     }
 
     /// Reconstruct one inferred vector solution with exact astronomical terms.
@@ -1459,9 +1558,13 @@ impl VectorInferenceOls {
         &self,
         eastward: &[f64],
         northward: &[f64],
-        confidence: Option<LinearConfidence>,
+        confidence: Option<BatchConfidence>,
         robust: Option<RobustOptions>,
+        stream: u64,
     ) -> Result<VectorSolution, AnalysisError> {
+        if let Some(BatchConfidence::MonteCarlo { options, .. }) = confidence {
+            options.validate()?;
+        }
         if eastward.len() != northward.len() {
             return Err(AnalysisError::ObservationShape {
                 actual: northward.len(),
@@ -1503,6 +1606,7 @@ impl VectorInferenceOls {
                 fit.coefficients.as_ref(),
                 confidence,
                 Some(fit.diagnostics),
+                stream,
             )
         } else {
             self.solution_from_coefficients(
@@ -1510,6 +1614,7 @@ impl VectorInferenceOls {
                 coefficients.as_ref(),
                 confidence,
                 None,
+                stream,
             )
         }
     }
@@ -1522,8 +1627,9 @@ impl VectorInferenceOls {
         &self,
         observations: faer::MatRef<'_, c64>,
         coefficients: faer::MatRef<'_, c64>,
-        confidence: Option<LinearConfidence>,
+        confidence: Option<BatchConfidence>,
         robust: Option<RobustDiagnostics>,
+        stream: u64,
     ) -> Result<VectorSolution, AnalysisError> {
         let fit_count = self.output_mappings[..]
             .iter()
@@ -1588,15 +1694,18 @@ impl VectorInferenceOls {
             .map(|(positive, negative)| (*positive - *negative).re)
             .collect::<Vec<_>>();
 
-        let intervals = confidence.map(|noise| {
-            self.vector_inference_intervals(
-                observations,
-                coefficients,
-                noise,
-                robust
-                    .as_ref()
-                    .map(|diagnostics| diagnostics.weights.as_slice()),
-            )
+        let intervals = confidence.and_then(|confidence| match confidence {
+            BatchConfidence::Linear(noise) => Some(
+                self.vector_inference_intervals(
+                    observations,
+                    coefficients,
+                    noise,
+                    robust
+                        .as_ref()
+                        .map(|diagnostics| diagnostics.weights.as_slice()),
+                ),
+            ),
+            BatchConfidence::MonteCarlo { .. } => None,
         });
         let trailing = self.design.ncols() - 2;
         let mean = coefficients[(trailing, 0)];
@@ -1678,6 +1787,28 @@ impl VectorInferenceOls {
                     .collect(),
             );
         }
+        if let Some(BatchConfidence::MonteCarlo { options, noise }) = confidence {
+            let covariances = self.vector_inference_monte_carlo_covariances(
+                observations,
+                coefficients,
+                noise,
+                robust
+                    .as_ref()
+                    .map(|diagnostics| diagnostics.weights.as_slice()),
+            );
+            self.apply_vector_monte_carlo_intervals(
+                &mut solution,
+                [
+                    &eastward_cosine,
+                    &eastward_sine,
+                    &northward_cosine,
+                    &northward_sine,
+                ],
+                &covariances,
+                options,
+                stream,
+            )?;
+        }
         solution.robust = robust;
         Ok(solution)
     }
@@ -1694,68 +1825,17 @@ impl VectorInferenceOls {
         noise: LinearConfidence,
         weights: Option<&[f64]>,
     ) -> VectorInferenceIntervals {
-        let fitted = Mat::from_fn(self.time_count, 1, |time, _| {
-            (0..self.design.ncols())
-                .map(|column| self.design[(time, column)] * coefficients[(column, 0)])
-                .sum::<c64>()
-        });
-        let degrees_of_freedom = usize_to_f64(self.time_count - self.design.ncols());
-        let covariance_misfit = (0..self.time_count)
-            .map(|time| {
-                let weighted_observation =
-                    weights.map_or(1.0, |weights| weights[time]) * observations[(time, 0)];
-                observations[(time, 0)].conj() * weighted_observation
-                    - fitted[(time, 0)].conj() * weighted_observation
-            })
-            .sum::<c64>()
-            .re
-            / degrees_of_freedom;
-        let pseudo_misfit = (0..self.time_count)
-            .map(|time| {
-                let weighted_observation =
-                    weights.map_or(1.0, |weights| weights[time]) * observations[(time, 0)];
-                observations[(time, 0)] * weighted_observation
-                    - fitted[(time, 0)] * weighted_observation
-            })
-            .sum::<c64>()
-            / degrees_of_freedom;
-        let column_count = self.design.ncols();
-        let covariance_normal = Mat::from_fn(column_count, column_count, |row, column| {
-            (0..self.time_count)
-                .map(|time| {
-                    self.design[(time, row)].conj()
-                        * weights.map_or(1.0, |weights| weights[time])
-                        * self.design[(time, column)]
-                })
-                .sum::<c64>()
-        });
-        let pseudo_normal = Mat::from_fn(column_count, column_count, |row, column| {
-            (0..self.time_count)
-                .map(|time| {
-                    self.design[(time, row)]
-                        * weights.map_or(1.0, |weights| weights[time])
-                        * self.design[(time, column)]
-                })
-                .sum::<c64>()
-        });
-        let covariance_inverse = covariance_normal.partial_piv_lu().inverse();
-        let pseudo_inverse = pseudo_normal.partial_piv_lu().inverse();
-        let fit_count = (column_count - 2) / 2;
+        let basis = self.vector_inference_covariance_basis(observations, coefficients, weights);
+        let fit_count = (self.design.ncols() - 2) / 2;
         let mut base_variances = Vec::with_capacity(fit_count);
         for constituent in 0..fit_count {
             let negative = constituent + fit_count;
-            let gall_00 = covariance_inverse[(constituent, constituent)] * covariance_misfit
-                + pseudo_inverse[(constituent, constituent)] * pseudo_misfit;
-            let gall_11 = covariance_inverse[(negative, negative)] * covariance_misfit
-                + pseudo_inverse[(negative, negative)] * pseudo_misfit;
-            let gall_01 = covariance_inverse[(constituent, negative)] * covariance_misfit
-                + pseudo_inverse[(constituent, negative)] * pseudo_misfit;
-            let hall_00 = covariance_inverse[(constituent, constituent)] * covariance_misfit
-                - pseudo_inverse[(constituent, constituent)] * pseudo_misfit;
-            let hall_11 = covariance_inverse[(negative, negative)] * covariance_misfit
-                - pseudo_inverse[(negative, negative)] * pseudo_misfit;
-            let hall_01 = covariance_inverse[(constituent, negative)] * covariance_misfit
-                - pseudo_inverse[(constituent, negative)] * pseudo_misfit;
+            let gall_00 = basis.gall[(constituent, constituent)];
+            let gall_11 = basis.gall[(negative, negative)];
+            let gall_01 = basis.gall[(constituent, negative)];
+            let hall_00 = basis.hall[(constituent, constituent)];
+            let hall_11 = basis.hall[(negative, negative)];
+            let hall_01 = basis.hall[(constituent, negative)];
             base_variances.push((
                 (gall_00 + gall_11 + gall_01 * 2.0).re / 2.0,
                 (hall_00 + hall_11 - hall_01 * 2.0).re / 2.0,
@@ -1767,7 +1847,7 @@ impl VectorInferenceOls {
             let northward_residual = (0..self.time_count)
                 .map(|time| {
                     weights.map_or(1.0, |weights| weights[time])
-                        * (observations[(time, 0)].im - fitted[(time, 0)].im)
+                        * (observations[(time, 0)].im - basis.fitted[(time, 0)].im)
                 })
                 .collect::<Vec<_>>();
             let power = self
@@ -1817,6 +1897,286 @@ impl VectorInferenceOls {
             }
         }
         output
+    }
+
+    fn vector_inference_covariance_basis(
+        &self,
+        observations: faer::MatRef<'_, c64>,
+        coefficients: faer::MatRef<'_, c64>,
+        weights: Option<&[f64]>,
+    ) -> VectorInferenceCovarianceBasis {
+        let fitted = Mat::from_fn(self.time_count, 1, |time, _| {
+            (0..self.design.ncols())
+                .map(|column| self.design[(time, column)] * coefficients[(column, 0)])
+                .sum::<c64>()
+        });
+        let degrees_of_freedom = usize_to_f64(self.time_count - self.design.ncols());
+        let covariance_misfit = (0..self.time_count)
+            .map(|time| {
+                let weighted_observation =
+                    weights.map_or(1.0, |weights| weights[time]) * observations[(time, 0)];
+                observations[(time, 0)].conj() * weighted_observation
+                    - fitted[(time, 0)].conj() * weighted_observation
+            })
+            .sum::<c64>()
+            .re
+            / degrees_of_freedom;
+        let pseudo_misfit = (0..self.time_count)
+            .map(|time| {
+                let weighted_observation =
+                    weights.map_or(1.0, |weights| weights[time]) * observations[(time, 0)];
+                observations[(time, 0)] * weighted_observation
+                    - fitted[(time, 0)] * weighted_observation
+            })
+            .sum::<c64>()
+            / degrees_of_freedom;
+        let column_count = self.design.ncols();
+        let covariance_normal = Mat::from_fn(column_count, column_count, |row, column| {
+            (0..self.time_count)
+                .map(|time| {
+                    self.design[(time, row)].conj()
+                        * weights.map_or(1.0, |weights| weights[time])
+                        * self.design[(time, column)]
+                })
+                .sum::<c64>()
+        });
+        let pseudo_normal = Mat::from_fn(column_count, column_count, |row, column| {
+            (0..self.time_count)
+                .map(|time| {
+                    self.design[(time, row)]
+                        * weights.map_or(1.0, |weights| weights[time])
+                        * self.design[(time, column)]
+                })
+                .sum::<c64>()
+        });
+        let covariance_inverse = covariance_normal.partial_piv_lu().inverse();
+        let pseudo_inverse = pseudo_normal.partial_piv_lu().inverse();
+        let gall = Mat::from_fn(column_count, column_count, |row, column| {
+            covariance_inverse[(row, column)] * covariance_misfit
+                + pseudo_inverse[(row, column)] * pseudo_misfit
+        });
+        let hall = Mat::from_fn(column_count, column_count, |row, column| {
+            covariance_inverse[(row, column)] * covariance_misfit
+                - pseudo_inverse[(row, column)] * pseudo_misfit
+        });
+        VectorInferenceCovarianceBasis { fitted, gall, hall }
+    }
+
+    #[allow(
+        clippy::similar_names,
+        clippy::too_many_lines,
+        reason = "the audited UTide covariance equations use the Xu/Yu/Xv/Yv coefficient names"
+    )]
+    fn vector_inference_monte_carlo_covariances(
+        &self,
+        observations: faer::MatRef<'_, c64>,
+        coefficients: faer::MatRef<'_, c64>,
+        noise: LinearConfidence,
+        weights: Option<&[f64]>,
+    ) -> Vec<[[f64; 4]; 4]> {
+        let basis = self.vector_inference_covariance_basis(observations, coefficients, weights);
+        let fit_count = (self.design.ncols() - 2) / 2;
+        let reference_count = fit_count - self.non_reference_count;
+        let mut covariances = Vec::with_capacity(fit_count);
+        for constituent in 0..fit_count {
+            let (positive, negative) = if constituent < self.non_reference_count {
+                (constituent, self.non_reference_count + constituent)
+            } else {
+                let reference = constituent - self.non_reference_count;
+                (
+                    self.non_reference_count * 2 + reference,
+                    self.non_reference_count * 2 + reference_count + reference,
+                )
+            };
+            let g00 = basis.gall[(positive, positive)];
+            let g01 = basis.gall[(positive, negative)];
+            let g10 = basis.gall[(negative, positive)];
+            let g11 = basis.gall[(negative, negative)];
+            let h00 = basis.hall[(positive, positive)];
+            let h01 = basis.hall[(positive, negative)];
+            let h10 = basis.hall[(negative, positive)];
+            let h11 = basis.hall[(negative, negative)];
+            let var_xu = (g00 + g11 + g01 * 2.0).re / 2.0;
+            let var_yu = (h00 + h11 - h01 * 2.0).re / 2.0;
+            let var_xv = (h00 + h11 + h01 * 2.0).re / 2.0;
+            let var_yv = (g00 + g11 - g01 * 2.0).re / 2.0;
+            let cov_xu_yu = (h00 - h01 + h10 - h11).im / 2.0;
+            let cov_xv_yv = (g00 - g01 + g10 - g11).im / 2.0;
+            let cov_xu_xv = (-h00 - h01 - h10 - h11).im / 2.0;
+            let cov_xu_yv = (g00 - g11).re / 2.0;
+            let cov_yu_xv = (-h00 + h11).re / 2.0;
+            let cov_yu_yv = (-g00 + g01 + g10 - g11).im / 2.0;
+            covariances.push([
+                [var_xu, cov_xu_yu, cov_xu_xv, cov_xu_yv],
+                [cov_xu_yu, var_yu, cov_yu_xv, cov_yu_yv],
+                [cov_xu_xv, cov_yu_xv, var_xv, cov_xv_yv],
+                [cov_xu_yv, cov_yu_yv, cov_xv_yv, var_yv],
+            ]);
+        }
+        if noise == LinearConfidence::Colored {
+            let mut eastward_residual = Vec::with_capacity(self.time_count);
+            let mut northward_residual = Vec::with_capacity(self.time_count);
+            for time in 0..self.time_count {
+                let weight = weights.map_or(1.0, |weights| weights[time]);
+                eastward_residual
+                    .push(weight * (observations[(time, 0)].re - basis.fitted[(time, 0)].re));
+                northward_residual
+                    .push(weight * (observations[(time, 0)].im - basis.fitted[(time, 0)].im));
+            }
+            let power = self
+                .confidence_sampling
+                .band_averaged_vector_residual_power(
+                    &eastward_residual,
+                    &northward_residual,
+                    &self.constituents,
+                );
+            for (constituent, covariance) in covariances.iter_mut().enumerate() {
+                scale_covariance_block(
+                    covariance,
+                    [0, 1],
+                    power.eastward[constituent],
+                    covariance[0][0] + covariance[1][1],
+                );
+                scale_covariance_block(
+                    covariance,
+                    [2, 3],
+                    power.northward[constituent],
+                    covariance[2][2] + covariance[3][3],
+                );
+                let mut cross_denominator = 0.0;
+                for row in [0, 1] {
+                    for column in [2, 3] {
+                        cross_denominator += covariance[row][column].abs();
+                    }
+                }
+                let cross_scale = if cross_denominator == 0.0 {
+                    0.0
+                } else {
+                    power.cross[constituent] / cross_denominator
+                };
+                for row in [0, 1] {
+                    for column in [2, 3] {
+                        covariance[row][column] *= cross_scale;
+                        covariance[column][row] = covariance[row][column];
+                    }
+                }
+            }
+        }
+        covariances
+    }
+
+    fn apply_vector_monte_carlo_intervals(
+        &self,
+        solution: &mut VectorSolution,
+        coefficients: [&[f64]; 4],
+        covariances: &[[[f64; 4]; 4]],
+        options: MonteCarloOptions,
+        stream: u64,
+    ) -> Result<(), AnalysisError> {
+        let mut output_intervals = vec![None; self.output_mappings.len()];
+        for (source, covariance) in covariances.iter().copied().enumerate() {
+            let mappings = self
+                .output_mappings
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, mapping)| mapping.source_fit_index == source)
+                .collect::<Vec<_>>();
+            let ratios = mappings
+                .iter()
+                .map(|(_, mapping)| {
+                    [
+                        mapping.positive_ratio.re,
+                        mapping.positive_ratio.im,
+                        mapping.negative_ratio.re,
+                        mapping.negative_ratio.im,
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let source_output = mappings
+                .iter()
+                .find_map(|(output, mapping)| (!mapping.inferred).then_some(*output))
+                .expect("every fitted source retains its reported reference output");
+            let intervals = vector_transformed_intervals(
+                [
+                    coefficients[0][source_output],
+                    coefficients[1][source_output],
+                    coefficients[2][source_output],
+                    coefficients[3][source_output],
+                ],
+                covariance,
+                &ratios,
+                options,
+                constituent_stream(stream, source),
+            )
+            .ok_or(AnalysisError::InvalidConfidenceCovariance {
+                constituent: source,
+            })?;
+            for ((output, _), interval) in mappings.into_iter().zip(intervals) {
+                output_intervals[output] = Some(interval);
+            }
+        }
+        let intervals = output_intervals
+            .into_iter()
+            .enumerate()
+            .map(|(constituent, interval)| {
+                interval.ok_or(AnalysisError::InvalidConfidenceCovariance { constituent })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let semi_major = intervals
+            .iter()
+            .map(|interval| interval.semi_major)
+            .collect::<Vec<_>>();
+        let semi_minor = intervals
+            .iter()
+            .map(|interval| interval.semi_minor)
+            .collect::<Vec<_>>();
+        solution.inclination_ci_degrees = Some(
+            intervals
+                .iter()
+                .map(|interval| interval.inclination_degrees)
+                .collect(),
+        );
+        solution.phase_ci_degrees = Some(
+            intervals
+                .iter()
+                .map(|interval| interval.phase_degrees)
+                .collect(),
+        );
+        solution.signal_to_noise = Some(
+            solution
+                .semi_major
+                .iter()
+                .zip(&solution.semi_minor)
+                .zip(&semi_major)
+                .zip(&semi_minor)
+                .map(|(((major, minor), major_ci), minor_ci)| {
+                    (major.powi(2) + minor.powi(2))
+                        / ((major_ci / 1.96).powi(2) + (minor_ci / 1.96).powi(2))
+                })
+                .collect(),
+        );
+        solution.semi_major_ci = Some(semi_major);
+        solution.semi_minor_ci = Some(semi_minor);
+        Ok(())
+    }
+}
+
+fn scale_covariance_block(
+    covariance: &mut [[f64; 4]; 4],
+    indices: [usize; 2],
+    numerator: f64,
+    denominator: f64,
+) {
+    let scale = if denominator == 0.0 {
+        0.0
+    } else {
+        numerator / denominator
+    };
+    for row in indices {
+        for column in indices {
+            covariance[row][column] *= scale;
+        }
     }
 }
 
