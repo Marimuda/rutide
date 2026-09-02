@@ -19,6 +19,10 @@ use crate::{
     AnalysisError, MonteCarloOptions, RobustDiagnostics, RobustOptions, VectorSolution,
     monte_carlo::{scalar_intervals as scalar_monte_carlo_intervals, vector_intervals},
     robust::{RobustFit, fit_with_initial as robust_fit_with_initial},
+    sampling::{
+        COLORED_NOISE_FREQUENCY_BANDS_CPH as FREQUENCY_BANDS_CPH,
+        equidistant_sample_interval_hours, lomb_frequencies,
+    },
     vector::from_component_solutions,
 };
 
@@ -1698,17 +1702,6 @@ pub(crate) fn constituent_stream(series_stream: u64, constituent: usize) -> u64 
         )
 }
 
-const FREQUENCY_BANDS_CPH: [[f64; 2]; 9] = [
-    [0.000_10, 0.004_17],
-    [0.031_92, 0.048_59],
-    [0.072_18, 0.088_84],
-    [0.112_43, 0.129_10],
-    [0.152_69, 0.169_36],
-    [0.192_95, 0.209_61],
-    [0.233_20, 0.251_00],
-    [0.260_00, 0.290_00],
-    [0.300_00, 0.500_00],
-];
 // Each plan stores both phase-shifted bases. Long records fall back to the
 // direct kernel instead of silently allocating hundreds of megabytes per mask.
 const MAX_CACHED_LOMB_BASIS_BYTES: usize = 16 * 1024 * 1024;
@@ -2233,39 +2226,6 @@ fn periodic_hann(index: usize, length: usize) -> f64 {
     0.5 - 0.5 * (TAU * usize_to_f64(index) / usize_to_f64(length)).cos()
 }
 
-fn lomb_frequencies(time_hours: &[f64]) -> Vec<f64> {
-    const MAX_PER_BAND: usize = 500;
-
-    let sample_count = time_hours.len();
-    let delta_time =
-        (time_hours[sample_count - 1] - time_hours[0]) / usize_to_f64(sample_count - 1);
-    let record_length = usize_to_f64(sample_count) * delta_time;
-    let base_count = sample_count / 2 - 1;
-    let base = (1..=base_count)
-        .map(|index| usize_to_f64(index) / record_length)
-        .collect::<Vec<_>>();
-    let mut frequencies = Vec::new();
-    for [lower, upper] in FREQUENCY_BANDS_CPH {
-        let start = base.partition_point(|frequency| *frequency < lower);
-        let upper_insertion = base.partition_point(|frequency| *frequency < upper);
-        let stop = (upper_insertion + 1).min(base.len());
-        if stop <= start {
-            continue;
-        }
-        let count = stop - start;
-        if count > MAX_PER_BAND {
-            let first = base[start];
-            let last = base[stop - 1];
-            frequencies.extend((0..MAX_PER_BAND).map(|index| {
-                first + (last - first) * usize_to_f64(index) / usize_to_f64(MAX_PER_BAND - 1)
-            }));
-        } else {
-            frequencies.extend_from_slice(&base[start..stop]);
-        }
-    }
-    frequencies
-}
-
 fn estimated_lomb_basis_bytes(time_hours: &[f64]) -> usize {
     let sample_count = time_hours.len() - time_hours.len() % 2;
     let frequency_count = lomb_frequencies(&time_hours[..sample_count]).len();
@@ -2406,22 +2366,6 @@ fn cached_forward_fft(length: usize) -> FftPlan {
 )]
 fn bounded_frequency_index(value: f64) -> usize {
     value as usize
-}
-
-pub(crate) fn equidistant_sample_interval_hours(time_days: &[f64]) -> Option<f64> {
-    let mut unique_deltas = time_days
-        .windows(2)
-        .map(|pair| pair[1] - pair[0])
-        .collect::<Vec<_>>();
-    unique_deltas.sort_by(f64::total_cmp);
-    unique_deltas.dedup_by(|left, right| left.to_bits() == right.to_bits());
-    let mean = unique_deltas.iter().sum::<f64>() / usize_to_f64(unique_deltas.len());
-    let variance = unique_deltas
-        .iter()
-        .map(|delta| (delta - mean).powi(2))
-        .sum::<f64>()
-        / usize_to_f64(unique_deltas.len());
-    (variance < f64::EPSILON).then(|| 24.0 * (time_days[1] - time_days[0]))
 }
 
 #[allow(

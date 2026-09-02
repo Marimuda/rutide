@@ -12,12 +12,15 @@ use std::{
 
 use netcdf::{FileMut, Variable, VariableMut};
 use rayon::ThreadPoolBuilder;
+use rayon::prelude::*;
 use rutide_core::{
-    AnalysisError, Constituent, FitOptions, GreenwichNodalBatch, GreenwichNodalReconstructor,
-    InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections, NormalizedTimeAxis,
-    PhaseReference, RayleighSelection, ReconstructionFilter, RobustOptions, RobustTermination,
-    ScalarInferenceBatch, ScalarInferenceRelation, ScalarSolution, SolverOptions, TidalConstituent,
-    TimeEpoch, VectorInferenceRelation, VectorSolution, normalize_numeric_time,
+    AnalysisError, COLORED_NOISE_FREQUENCY_BANDS_CPH, Constituent, FitOptions, GreenwichNodalBatch,
+    GreenwichNodalReconstructor, InferenceMode, LinearConfidence, MonteCarloOptions,
+    NodalCorrections, NormalizedTimeAxis, PhaseReference, RayleighSelection, ReconstructionFilter,
+    ResidualSpectrumMethod, RobustOptions, RobustTermination,
+    SamplingDiagnostics as CoreSamplingDiagnostics, SamplingDiagnosticsPlan, ScalarInferenceBatch,
+    ScalarInferenceRelation, ScalarSolution, SolverOptions, TidalConstituent, TimeEpoch,
+    VectorInferenceRelation, VectorSolution, normalize_numeric_time,
     select_constituents_by_rayleigh,
 };
 use serde::Serialize;
@@ -28,7 +31,7 @@ mod vector;
 pub use vector::{VectorAnalyzeConfig, VectorRunReport, VectorSampleResult, analyze_vector};
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
-const OUTPUT_SCHEMA_VERSION: u32 = 13;
+const OUTPUT_SCHEMA_VERSION: u32 = 14;
 /// Backward-compatible benchmark constituent set used when none is specified.
 pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -487,6 +490,78 @@ pub struct StageTimings {
     pub total_seconds: f64,
 }
 
+/// Sampling quality for one fitted scalar or vector series.
+#[derive(Clone, Debug, Serialize)]
+pub struct SeriesSamplingDiagnostics {
+    /// Number of finite scalar or joint-vector observations.
+    pub observation_count: usize,
+    /// Difference between final and first retained observations, in days.
+    pub record_span_days: f64,
+    /// Mean retained sample interval derived from span/count, in hours.
+    pub mean_sample_interval_hours: f64,
+    /// Largest gap between adjacent retained observations, in hours.
+    pub largest_gap_hours: f64,
+    /// Residual-spectrum route: `fft` or `lomb-scargle`.
+    pub residual_spectrum_method: &'static str,
+    /// Even sample count used by the residual spectrum.
+    pub residual_spectrum_time_count: usize,
+    /// Frequency bins present in each of the nine colored-noise bands.
+    pub spectral_band_bin_count: [usize; 9],
+    /// Band bins left after fitted-constituent exclusions.
+    pub spectral_band_usable_bin_count: [usize; 9],
+}
+
+impl From<&CoreSamplingDiagnostics> for SeriesSamplingDiagnostics {
+    fn from(diagnostics: &CoreSamplingDiagnostics) -> Self {
+        Self {
+            observation_count: diagnostics.observation_count,
+            record_span_days: diagnostics.record_span_days,
+            mean_sample_interval_hours: diagnostics.mean_sample_interval_hours,
+            largest_gap_hours: diagnostics.largest_gap_hours,
+            residual_spectrum_method: diagnostics.residual_spectrum_method.name(),
+            residual_spectrum_time_count: diagnostics.residual_spectrum_time_count,
+            spectral_band_bin_count: diagnostics.spectral_band_bin_count,
+            spectral_band_usable_bin_count: diagnostics.spectral_band_usable_bin_count,
+        }
+    }
+}
+
+/// Worst-case coverage of one colored-noise frequency band across all series.
+#[derive(Clone, Debug, Serialize)]
+pub struct SpectralBandSummary {
+    /// Inclusive lower band edge in cycles/hour.
+    pub lower_frequency_cph: f64,
+    /// Inclusive upper band edge in cycles/hour.
+    pub upper_frequency_cph: f64,
+    /// Minimum total frequency-bin count across fitted series.
+    pub minimum_bin_count: usize,
+    /// Minimum bin count after fitted-constituent exclusions.
+    pub minimum_usable_bin_count: usize,
+    /// Number of series with no usable estimate in this band.
+    pub series_without_usable_bins: usize,
+}
+
+/// Whole-run summary of per-series sampling quality.
+#[derive(Clone, Debug, Serialize)]
+pub struct SamplingSummary {
+    /// Minimum finite observation count across fitted series.
+    pub minimum_observation_count: usize,
+    /// Maximum finite observation count across fitted series.
+    pub maximum_observation_count: usize,
+    /// Minimum retained record span in days.
+    pub minimum_record_span_days: f64,
+    /// Maximum retained record span in days.
+    pub maximum_record_span_days: f64,
+    /// Largest per-series gap in hours.
+    pub maximum_gap_hours: f64,
+    /// Number of series whose colored spectrum uses FFT interpolation.
+    pub fft_series_count: usize,
+    /// Number of series whose colored spectrum uses Lomb–Scargle.
+    pub lomb_scargle_series_count: usize,
+    /// Worst-case coverage for the nine colored-noise bands.
+    pub spectral_bands: Vec<SpectralBandSummary>,
+}
+
 /// A small retained coefficient sample in the JSON run report.
 #[derive(Clone, Debug, Serialize)]
 pub struct SampleResult {
@@ -517,6 +592,8 @@ pub struct SampleResult {
     pub slope_per_day: f64,
     /// Number of finite observations used by this fit.
     pub observation_count: usize,
+    /// Temporal and colored-spectrum coverage for this series.
+    pub sampling: SeriesSamplingDiagnostics,
     /// Epoch at which the fitted mean is defined, as an MJD.
     pub reference_time_modified_julian_day: f64,
 }
@@ -659,6 +736,8 @@ pub struct RunReport {
     pub series_count: usize,
     /// Number of series containing at least one missing observation.
     pub series_with_missing_observations: usize,
+    /// Aggregate temporal and spectral coverage across fitted nodes.
+    pub sampling: SamplingSummary,
     /// Number of outer spatial workers.
     pub workers: usize,
     /// Least-squares method: `ols` or `robust`.
@@ -1014,6 +1093,22 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
 
     let result_start = Instant::now();
     let series_frequency_cph = solution_frequencies(&batch, &solutions)?;
+    let sampling_diagnostics = diagnose_sampling(
+        &worker_pool,
+        &input.modified_julian_days,
+        &series_frequency_cph,
+        |time, series| input.observations[time * input.node_indices.len() + series].is_finite(),
+    )?;
+    if sampling_diagnostics
+        .iter()
+        .zip(&input.observation_counts)
+        .any(|(diagnostics, count)| diagnostics.observation_count != *count)
+    {
+        return Err(AppError::Invalid(
+            "sampling diagnostic observation counts differ from fitted inputs".to_owned(),
+        ));
+    }
+    let sampling_summary = summarize_sampling(&sampling_diagnostics)?;
     let constituent_index_by_rank = constituent_order_indices(
         &config.constituent_order,
         batch.constituents(),
@@ -1031,6 +1126,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         config.nodal_corrections,
         &config.constituent_order,
         &constituent_index_by_rank,
+        &sampling_diagnostics,
         config.analysis_method,
         config.confidence_interval,
         config
@@ -1049,6 +1145,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         &input.observation_counts,
         &solutions,
         &constituent_index_by_rank,
+        &sampling_diagnostics,
     );
     let result_processing_seconds = result_start.elapsed().as_secs_f64();
 
@@ -1067,6 +1164,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             solutions: &solutions,
             constituent_order: &config.constituent_order,
             constituent_index_by_rank: &constituent_index_by_rank,
+            sampling_diagnostics: &sampling_diagnostics,
             result_sha256: &result_sha256,
             selection: &selection,
             inference: config.inference.as_ref(),
@@ -1117,6 +1215,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             .iter()
             .filter(|count| **count != input.modified_julian_days.len())
             .count(),
+        sampling: sampling_summary,
         workers: config.workers,
         analysis_method: config.analysis_method.name(),
         trend_enabled: config.fit_options.trend,
@@ -1293,6 +1392,91 @@ fn solution_frequencies(
                 })
         })
         .collect()
+}
+
+fn diagnose_sampling<F>(
+    worker_pool: &rayon::ThreadPool,
+    modified_julian_days: &[f64],
+    series_frequency_cph: &[Vec<f64>],
+    observation_is_finite: F,
+) -> Result<Vec<CoreSamplingDiagnostics>, AnalysisError>
+where
+    F: Fn(usize, usize) -> bool + Sync,
+{
+    let plan = SamplingDiagnosticsPlan::prepare(modified_julian_days)?;
+    worker_pool.install(|| {
+        (0..series_frequency_cph.len())
+            .into_par_iter()
+            .map(|series| {
+                plan.diagnose_with(&series_frequency_cph[series], |time| {
+                    observation_is_finite(time, series)
+                })
+            })
+            .collect()
+    })
+}
+
+fn summarize_sampling(
+    diagnostics: &[CoreSamplingDiagnostics],
+) -> Result<SamplingSummary, AppError> {
+    let Some(first) = diagnostics.first() else {
+        return Err(AppError::Invalid(
+            "sampling diagnostics require at least one spatial series".to_owned(),
+        ));
+    };
+    let mut minimum_observation_count = first.observation_count;
+    let mut maximum_observation_count = first.observation_count;
+    let mut minimum_record_span_days = first.record_span_days;
+    let mut maximum_record_span_days = first.record_span_days;
+    let mut maximum_gap_hours = first.largest_gap_hours;
+    let mut fft_series_count = 0;
+    let mut lomb_scargle_series_count = 0;
+    for series in diagnostics {
+        minimum_observation_count = minimum_observation_count.min(series.observation_count);
+        maximum_observation_count = maximum_observation_count.max(series.observation_count);
+        minimum_record_span_days = minimum_record_span_days.min(series.record_span_days);
+        maximum_record_span_days = maximum_record_span_days.max(series.record_span_days);
+        maximum_gap_hours = maximum_gap_hours.max(series.largest_gap_hours);
+        match series.residual_spectrum_method {
+            ResidualSpectrumMethod::Fft => fft_series_count += 1,
+            ResidualSpectrumMethod::LombScargle => lomb_scargle_series_count += 1,
+        }
+    }
+    let spectral_bands = COLORED_NOISE_FREQUENCY_BANDS_CPH
+        .iter()
+        .copied()
+        .enumerate()
+        .map(
+            |(band, [lower_frequency_cph, upper_frequency_cph])| SpectralBandSummary {
+                lower_frequency_cph,
+                upper_frequency_cph,
+                minimum_bin_count: diagnostics
+                    .iter()
+                    .map(|series| series.spectral_band_bin_count[band])
+                    .min()
+                    .unwrap_or(0),
+                minimum_usable_bin_count: diagnostics
+                    .iter()
+                    .map(|series| series.spectral_band_usable_bin_count[band])
+                    .min()
+                    .unwrap_or(0),
+                series_without_usable_bins: diagnostics
+                    .iter()
+                    .filter(|series| series.spectral_band_usable_bin_count[band] == 0)
+                    .count(),
+            },
+        )
+        .collect();
+    Ok(SamplingSummary {
+        minimum_observation_count,
+        maximum_observation_count,
+        minimum_record_span_days,
+        maximum_record_span_days,
+        maximum_gap_hours,
+        fft_series_count,
+        lomb_scargle_series_count,
+        spectral_bands,
+    })
 }
 
 fn reconstruct_input(
@@ -1934,19 +2118,21 @@ fn result_digest(
     nodal_corrections: NodalCorrections,
     constituent_order: &ConstituentOrder,
     constituent_index_by_rank: &ConstituentOrderMap,
+    sampling_diagnostics: &[CoreSamplingDiagnostics],
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     inference: Option<&InferenceReport>,
     reconstruction: Option<(&ReconstructionFilter, &[Vec<f64>])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-scalar-nodal-v12\0");
+    digest.update(b"rutide-scalar-sampling-v14\0");
     digest.update([u8::from(fit_options.trend)]);
     digest.update(phase_reference.name().as_bytes());
     digest.update([0]);
     digest.update(nodal_corrections.name().as_bytes());
     digest.update([0]);
     update_constituent_order_digest(&mut digest, constituent_order, constituent_index_by_rank);
+    update_sampling_digest(&mut digest, sampling_diagnostics)?;
     digest.update(analysis_method.name().as_bytes());
     if let AnalysisMethod::Robust(options) = analysis_method {
         digest.update(options.tuning_constant.to_bits().to_le_bytes());
@@ -2066,6 +2252,45 @@ fn update_constituent_order_digest(
     }
 }
 
+fn update_sampling_digest(
+    digest: &mut Sha256,
+    diagnostics: &[CoreSamplingDiagnostics],
+) -> Result<(), AppError> {
+    for series in diagnostics {
+        digest.update(
+            u64::try_from(series.observation_count)
+                .map_err(|_| AppError::Invalid("observation count exceeds u64".to_owned()))?
+                .to_le_bytes(),
+        );
+        digest.update(series.record_span_days.to_bits().to_le_bytes());
+        digest.update(series.mean_sample_interval_hours.to_bits().to_le_bytes());
+        digest.update(series.largest_gap_hours.to_bits().to_le_bytes());
+        digest.update([match series.residual_spectrum_method {
+            ResidualSpectrumMethod::Fft => 0,
+            ResidualSpectrumMethod::LombScargle => 1,
+        }]);
+        digest.update(
+            u64::try_from(series.residual_spectrum_time_count)
+                .map_err(|_| {
+                    AppError::Invalid("residual spectrum time count exceeds u64".to_owned())
+                })?
+                .to_le_bytes(),
+        );
+        for count in series
+            .spectral_band_bin_count
+            .iter()
+            .chain(&series.spectral_band_usable_bin_count)
+        {
+            digest.update(
+                u64::try_from(*count)
+                    .map_err(|_| AppError::Invalid("spectral bin count exceeds u64".to_owned()))?
+                    .to_le_bytes(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn update_inference_digest(digest: &mut Sha256, inference: Option<&InferenceReport>) {
     let Some(inference) = inference else {
         digest.update(b"no-inference\0");
@@ -2172,6 +2397,7 @@ fn retained_samples(
     observation_counts: &[usize],
     solutions: &[ScalarSolution],
     constituent_index_by_rank: &ConstituentOrderMap,
+    sampling_diagnostics: &[CoreSamplingDiagnostics],
 ) -> Vec<SampleResult> {
     node_indices
         .iter()
@@ -2201,6 +2427,7 @@ fn retained_samples(
                     mean: solution.mean,
                     slope_per_day: solution.slope_per_day,
                     observation_count,
+                    sampling: SeriesSamplingDiagnostics::from(&sampling_diagnostics[series]),
                     reference_time_modified_julian_day: solution.reference_time_days,
                 }
             },
@@ -2219,6 +2446,7 @@ struct OutputData<'data> {
     solutions: &'data [ScalarSolution],
     constituent_order: &'data ConstituentOrder,
     constituent_index_by_rank: &'data ConstituentOrderMap,
+    sampling_diagnostics: &'data [CoreSamplingDiagnostics],
     result_sha256: &'data str,
     selection: &'data ResolvedConstituentSelection,
     inference: Option<&'data ScalarInferenceConfig>,
@@ -2263,6 +2491,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         solutions,
         constituent_order,
         constituent_index_by_rank,
+        sampling_diagnostics,
         result_sha256,
         selection,
         inference,
@@ -2279,6 +2508,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
     output.add_dimension("series", node_indices.len())?;
     output.add_dimension("constituent", constituents.len())?;
     output.add_dimension("presentation_rank", constituents.len())?;
+    output.add_dimension("spectral_band", COLORED_NOISE_FREQUENCY_BANDS_CPH.len())?;
     if reconstruction.is_some() {
         output.add_dimension("time", modified_julian_days.len())?;
     }
@@ -2426,6 +2656,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         constituents.len(),
         constituent_index_by_rank,
     )?;
+    write_sampling_diagnostics(&mut output, solutions.len(), sampling_diagnostics)?;
 
     write_solution_variables(
         &mut output,
@@ -2480,6 +2711,113 @@ fn write_constituent_order_indices(
             }
         }
         variable.put_values(&indices, (first_series..end_series, ..))?;
+    }
+    Ok(())
+}
+
+fn write_sampling_diagnostics(
+    output: &mut FileMut,
+    series_count: usize,
+    diagnostics: &[CoreSamplingDiagnostics],
+) -> Result<(), AppError> {
+    if diagnostics.len() != series_count {
+        return Err(AppError::Invalid(format!(
+            "sampling diagnostics contain {} series; expected {series_count}",
+            diagnostics.len()
+        )));
+    }
+    let lower = COLORED_NOISE_FREQUENCY_BANDS_CPH.map(|band| band[0]);
+    let upper = COLORED_NOISE_FREQUENCY_BANDS_CPH.map(|band| band[1]);
+    write_variable(
+        &mut output.add_variable::<f64>("spectral_band_lower_frequency", &["spectral_band"])?,
+        &lower,
+        "cycles per hour",
+    )?;
+    write_variable(
+        &mut output.add_variable::<f64>("spectral_band_upper_frequency", &["spectral_band"])?,
+        &upper,
+        "cycles per hour",
+    )?;
+    let record_span_days = diagnostics
+        .iter()
+        .map(|series| series.record_span_days)
+        .collect::<Vec<_>>();
+    write_variable(
+        &mut output.add_variable::<f64>("sampling_record_span", &["series"])?,
+        &record_span_days,
+        "days",
+    )?;
+    let mean_interval_hours = diagnostics
+        .iter()
+        .map(|series| series.mean_sample_interval_hours)
+        .collect::<Vec<_>>();
+    write_variable(
+        &mut output.add_variable::<f64>("sampling_mean_interval", &["series"])?,
+        &mean_interval_hours,
+        "hours",
+    )?;
+    let largest_gap_hours = diagnostics
+        .iter()
+        .map(|series| series.largest_gap_hours)
+        .collect::<Vec<_>>();
+    write_variable(
+        &mut output.add_variable::<f64>("sampling_largest_gap", &["series"])?,
+        &largest_gap_hours,
+        "hours",
+    )?;
+    let methods = diagnostics
+        .iter()
+        .map(|series| match series.residual_spectrum_method {
+            ResidualSpectrumMethod::Fft => 0_i64,
+            ResidualSpectrumMethod::LombScargle => 1_i64,
+        })
+        .collect::<Vec<_>>();
+    let mut method_variable =
+        output.add_variable::<i64>("residual_spectrum_method", &["series"])?;
+    method_variable.put_attribute("flag_values", vec![0_i64, 1])?;
+    method_variable.put_attribute("flag_meanings", "fft lomb_scargle")?;
+    method_variable.put_values(&methods, ..)?;
+    let spectrum_time_count = diagnostics
+        .iter()
+        .map(|series| {
+            i64::try_from(series.residual_spectrum_time_count).map_err(|_| {
+                AppError::Invalid("residual spectrum time count exceeds i64".to_owned())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    write_variable(
+        &mut output.add_variable::<i64>("residual_spectrum_time_count", &["series"])?,
+        &spectrum_time_count,
+        "1",
+    )?;
+    for (name, values) in [
+        (
+            "spectral_band_frequency_bin_count",
+            diagnostics
+                .iter()
+                .flat_map(|series| series.spectral_band_bin_count)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "spectral_band_usable_bin_count",
+            diagnostics
+                .iter()
+                .flat_map(|series| series.spectral_band_usable_bin_count)
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let values = values
+            .into_iter()
+            .map(|value| {
+                i64::try_from(value)
+                    .map_err(|_| AppError::Invalid("spectral bin count exceeds i64".to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        write_variable(
+            &mut output.add_variable::<i64>(name, &["series", "spectral_band"])?,
+            &values,
+            "1",
+        )?;
     }
     Ok(())
 }
@@ -2785,11 +3123,12 @@ mod tests {
     use super::{
         ConstituentOrder, NodeSelection, ScalarInferenceConfig, constituent_order_indices,
         encode_hex, normalize_source_observation, read_fvcom_scalar, resolve_node_selection,
-        temporary_sibling, write_inference_metadata, write_reconstruction_variables,
+        summarize_sampling, temporary_sibling, write_inference_metadata,
+        write_reconstruction_variables, write_sampling_diagnostics,
     };
     use rutide_core::{
         Constituent, GreenwichNodalOls, InferenceMode, LinearConfidence, ReconstructionFilter,
-        ScalarInferenceRelation, ScalarSolution, TidalConstituent,
+        SamplingDiagnosticsPlan, ScalarInferenceRelation, ScalarSolution, TidalConstituent,
     };
 
     #[test]
@@ -3048,6 +3387,58 @@ mod tests {
             );
         }
         assert!(normalize_source_observation("zeta", f64::INFINITY, Some(fill), 2, 3).is_err());
+    }
+
+    #[test]
+    fn sampling_diagnostics_are_summarized_and_written() {
+        let time = (0_u32..48)
+            .map(|index| 58_113.0 + f64::from(index) / 24.0)
+            .collect::<Vec<_>>();
+        let plan = SamplingDiagnosticsPlan::prepare(&time).expect("valid sampling grid");
+        let complete = plan
+            .diagnose(&vec![true; time.len()], &[0.080_511_4, 1.0 / 24.0])
+            .expect("valid complete sampling");
+        let mut gappy_mask = vec![true; time.len()];
+        gappy_mask[10] = false;
+        let gappy = plan
+            .diagnose(&gappy_mask, &[0.080_511_4, 1.0 / 24.0])
+            .expect("valid gappy sampling");
+        let diagnostics = [complete, gappy];
+        let summary = summarize_sampling(&diagnostics).expect("valid sampling summary");
+        assert_eq!(summary.minimum_observation_count, 47);
+        assert_eq!(summary.maximum_observation_count, 48);
+        assert_eq!(summary.fft_series_count, 2);
+        assert_eq!(summary.lomb_scargle_series_count, 0);
+        assert!((summary.maximum_gap_hours - 2.0).abs() < 1e-9);
+
+        let destination = std::env::temp_dir().join("rutide-sampling-output-test.nc");
+        let path = temporary_sibling(&destination).expect("valid temporary path");
+        let mut dataset = netcdf::create(&path).expect("create sampling output");
+        dataset.add_dimension("series", 2).expect("add series");
+        dataset
+            .add_dimension("spectral_band", 9)
+            .expect("add spectral bands");
+        write_sampling_diagnostics(&mut dataset, 2, &diagnostics)
+            .expect("write sampling diagnostics");
+        dataset.close().expect("close sampling output");
+        let dataset = netcdf::open(&path).expect("open sampling output");
+        assert_eq!(
+            dataset
+                .variable("residual_spectrum_method")
+                .expect("spectrum method")
+                .get_values::<i64, _>(..)
+                .expect("read spectrum method"),
+            [0, 0]
+        );
+        assert_eq!(
+            dataset
+                .variable("spectral_band_frequency_bin_count")
+                .expect("band bin counts")
+                .len(),
+            18
+        );
+        drop(dataset);
+        fs::remove_file(path).expect("remove sampling output");
     }
 
     #[test]

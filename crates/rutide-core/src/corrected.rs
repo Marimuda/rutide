@@ -20,10 +20,8 @@ use crate::{
     catalog::{CONSTITUENT_COUNT, Metadata},
     monte_carlo::{scalar_transformed_intervals, vector_transformed_intervals},
     robust::fit_complex_with_initial as robust_complex_fit_with_initial,
-    scalar::{
-        ConfidenceSampling, constituent_stream, equidistant_sample_interval_hours,
-        validate_time_with_options,
-    },
+    sampling::equidistant_sample_interval_hours,
+    scalar::{ConfidenceSampling, constituent_stream, validate_time_with_options},
     vector::{from_component_solutions, linearized_ellipse_sigmas},
 };
 

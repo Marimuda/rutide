@@ -10,6 +10,7 @@ mod corrected;
 mod error;
 mod monte_carlo;
 mod robust;
+mod sampling;
 mod scalar;
 mod selection;
 mod time;
@@ -28,6 +29,10 @@ pub use corrected::{
 pub use error::AnalysisError;
 pub use monte_carlo::MonteCarloOptions;
 pub use robust::{RobustDiagnostics, RobustOptions, RobustTermination};
+pub use sampling::{
+    COLORED_NOISE_FREQUENCY_BANDS_CPH, ResidualSpectrumMethod, SamplingDiagnostics,
+    SamplingDiagnosticsPlan,
+};
 pub use scalar::{Constituent, FitOptions, FixedRawOls, LinearConfidence, ScalarSolution};
 pub use selection::{RayleighSelection, select_constituents_by_rayleigh};
 pub use time::{

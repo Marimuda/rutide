@@ -19,19 +19,21 @@ use sha2::{Digest, Sha256};
 
 use super::{
     AnalysisMethod, AnalyzeConfig, AppError, ConfidenceInterval, ConstituentOrder,
-    ConstituentOrderMap, ConstituentSelection, ConstituentSelectionReport, InferenceReport,
-    NodeSelection, ReconstructionReport, ResolvedConstituentSelection, RobustOptionsReport,
-    StageTimings, VectorInferenceConfig, constituent_order_indices, encode_hex,
+    ConstituentOrderMap, ConstituentSelection, ConstituentSelectionReport, CoreSamplingDiagnostics,
+    InferenceReport, NodeSelection, ReconstructionReport, ResolvedConstituentSelection,
+    RobustOptionsReport, SamplingSummary, SeriesSamplingDiagnostics, StageTimings,
+    VectorInferenceConfig, constituent_order_indices, diagnose_sampling, encode_hex,
     nodal_profile_component, normalize_source_observation, order_profile_suffix,
     read_fvcom_time_axis, reconstruction_report, required_dimension_length, required_variable,
     resolve_constituent_selection, retain_time_major_rows, robust_termination_code,
-    temporary_sibling, update_constituent_order_digest, update_inference_digest,
-    update_reconstruction_filter_digest, validate_config, validate_dimensions,
-    validate_reconstruction_filter, validate_source_value, write_constituent_order_indices,
-    write_inference_metadata, write_json_report, write_robust_schema_metadata, write_variable,
+    summarize_sampling, temporary_sibling, update_constituent_order_digest,
+    update_inference_digest, update_reconstruction_filter_digest, update_sampling_digest,
+    validate_config, validate_dimensions, validate_reconstruction_filter, validate_source_value,
+    write_constituent_order_indices, write_inference_metadata, write_json_report,
+    write_robust_schema_metadata, write_sampling_diagnostics, write_variable,
 };
 
-const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 9;
+const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 10;
 
 /// Configuration for one depth-averaged FVCOM current analysis.
 #[derive(Clone, Debug, PartialEq)]
@@ -112,6 +114,8 @@ pub struct VectorSampleResult {
     pub northward_slope_per_day: f64,
     /// Number of joint finite component samples used by the fit.
     pub observation_count: usize,
+    /// Temporal and colored-spectrum coverage for this series.
+    pub sampling: SeriesSamplingDiagnostics,
     /// Epoch at which fitted means are defined, as an MJD.
     pub reference_time_modified_julian_day: f64,
 }
@@ -147,6 +151,8 @@ pub struct VectorRunReport {
     pub series_count: usize,
     /// Number of elements with at least one missing component sample.
     pub series_with_missing_observations: usize,
+    /// Aggregate temporal and spectral coverage across fitted elements.
+    pub sampling: SamplingSummary,
     /// Number of outer spatial workers.
     pub workers: usize,
     /// Least-squares method: `ols` or `robust`.
@@ -464,6 +470,25 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
 
     let result_start = Instant::now();
     let series_frequency_cph = vector_solution_frequencies(&batch, &solutions)?;
+    let sampling_diagnostics = diagnose_sampling(
+        &worker_pool,
+        &input.modified_julian_days,
+        &series_frequency_cph,
+        |time, series| {
+            let index = time * input.element_indices.len() + series;
+            input.eastward[index].is_finite() && input.northward[index].is_finite()
+        },
+    )?;
+    if sampling_diagnostics
+        .iter()
+        .zip(&input.observation_counts)
+        .any(|(diagnostics, count)| diagnostics.observation_count != *count)
+    {
+        return Err(AppError::Invalid(
+            "sampling diagnostic observation counts differ from fitted vector inputs".to_owned(),
+        ));
+    }
+    let sampling_summary = summarize_sampling(&sampling_diagnostics)?;
     let constituent_index_by_rank = constituent_order_indices(
         &config.constituent_order,
         batch.constituents(),
@@ -481,6 +506,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         config.nodal_corrections,
         &config.constituent_order,
         &constituent_index_by_rank,
+        &sampling_diagnostics,
         config.analysis_method,
         config.confidence_interval,
         config
@@ -493,7 +519,12 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             .as_ref()
             .zip(reconstruction.as_deref()),
     )?;
-    let sample_results = retained_vector_samples(&input, &solutions, &constituent_index_by_rank);
+    let sample_results = retained_vector_samples(
+        &input,
+        &solutions,
+        &constituent_index_by_rank,
+        &sampling_diagnostics,
+    );
     let result_processing_seconds = result_start.elapsed().as_secs_f64();
 
     let output_start = Instant::now();
@@ -507,6 +538,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             solutions: &solutions,
             constituent_order: &config.constituent_order,
             constituent_index_by_rank: &constituent_index_by_rank,
+            sampling_diagnostics: &sampling_diagnostics,
             result_sha256: &result_sha256,
             selection: &selection,
             inference: config.inference.as_ref(),
@@ -556,6 +588,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             .iter()
             .filter(|count| **count != input.modified_julian_days.len())
             .count(),
+        sampling: sampling_summary,
         workers: config.workers,
         analysis_method: config.analysis_method.name(),
         trend_enabled: config.fit_options.trend,
@@ -912,19 +945,21 @@ fn vector_result_digest(
     nodal_corrections: NodalCorrections,
     constituent_order: &ConstituentOrder,
     constituent_index_by_rank: &ConstituentOrderMap,
+    sampling_diagnostics: &[CoreSamplingDiagnostics],
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     inference: Option<&InferenceReport>,
     reconstruction: Option<(&ReconstructionFilter, &[VectorReconstruction])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-vector-nodal-v8\0");
+    digest.update(b"rutide-vector-sampling-v10\0");
     digest.update([u8::from(fit_options.trend)]);
     digest.update(phase_reference.name().as_bytes());
     digest.update([0]);
     digest.update(nodal_corrections.name().as_bytes());
     digest.update([0]);
     update_constituent_order_digest(&mut digest, constituent_order, constituent_index_by_rank);
+    update_sampling_digest(&mut digest, sampling_diagnostics)?;
     digest.update(analysis_method.name().as_bytes());
     if let AnalysisMethod::Robust(options) = analysis_method {
         digest.update(options.tuning_constant.to_bits().to_le_bytes());
@@ -1034,6 +1069,7 @@ fn retained_vector_samples(
     input: &VectorInputData,
     solutions: &[VectorSolution],
     constituent_index_by_rank: &ConstituentOrderMap,
+    sampling_diagnostics: &[CoreSamplingDiagnostics],
 ) -> Vec<VectorSampleResult> {
     input
         .element_indices
@@ -1070,6 +1106,7 @@ fn retained_vector_samples(
                     eastward_slope_per_day: solution.eastward_slope_per_day,
                     northward_slope_per_day: solution.northward_slope_per_day,
                     observation_count,
+                    sampling: SeriesSamplingDiagnostics::from(&sampling_diagnostics[series]),
                     reference_time_modified_julian_day: solution.reference_time_days,
                 }
             },
@@ -1084,6 +1121,7 @@ struct VectorOutputData<'data> {
     solutions: &'data [VectorSolution],
     constituent_order: &'data ConstituentOrder,
     constituent_index_by_rank: &'data ConstituentOrderMap,
+    sampling_diagnostics: &'data [CoreSamplingDiagnostics],
     result_sha256: &'data str,
     selection: &'data ResolvedConstituentSelection,
     inference: Option<&'data VectorInferenceConfig>,
@@ -1124,6 +1162,10 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
     output.add_dimension("series", input.element_indices.len())?;
     output.add_dimension("constituent", data.constituents.len())?;
     output.add_dimension("presentation_rank", data.constituents.len())?;
+    output.add_dimension(
+        "spectral_band",
+        rutide_core::COLORED_NOISE_FREQUENCY_BANDS_CPH.len(),
+    )?;
     if data.reconstruction.is_some() {
         output.add_dimension("time", input.modified_julian_days.len())?;
     }
@@ -1284,6 +1326,7 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
         data.constituents.len(),
         data.constituent_index_by_rank,
     )?;
+    write_sampling_diagnostics(&mut output, data.solutions.len(), data.sampling_diagnostics)?;
     write_vector_solution_variables(
         &mut output,
         data.constituents.len(),
@@ -1687,6 +1730,14 @@ mod tests {
         assert_eq!(report.discarded_timestamp_count, 1);
         assert_eq!(report.time_count, 48);
         assert_eq!(report.series_with_missing_observations, 2);
+        assert_eq!(report.sampling.fft_series_count, 0);
+        assert_eq!(report.sampling.lomb_scargle_series_count, 2);
+        assert_eq!(report.sampling.minimum_observation_count, 47);
+        assert!((report.sampling.maximum_gap_hours - 2.0).abs() < 1e-9);
+        assert_eq!(
+            report.sample_results[0].sampling.residual_spectrum_method,
+            "lomb-scargle"
+        );
         assert_eq!(report.analysis_method, "robust");
         assert_eq!(report.constituent_order, "frequency");
         assert!(!report.constituent_order_varies_by_series);
@@ -1734,6 +1785,21 @@ mod tests {
                 .get_values::<i64, _>(..)
                 .expect("read observation count"),
             [47, 47]
+        );
+        assert_eq!(
+            output
+                .variable("residual_spectrum_method")
+                .expect("spectrum method")
+                .get_values::<i64, _>(..)
+                .expect("read spectrum method"),
+            [1, 1]
+        );
+        assert_eq!(
+            output
+                .variable("spectral_band_usable_bin_count")
+                .expect("spectral band coverage")
+                .len(),
+            18
         );
         assert_eq!(output.variable("semi_major").expect("semi-major").len(), 4);
         assert_eq!(

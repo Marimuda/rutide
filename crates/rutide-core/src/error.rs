@@ -31,6 +31,23 @@ pub enum AnalysisError {
         /// Name of the invalid component.
         component: &'static str,
     },
+    /// A finite-observation mask does not match its source time axis.
+    SamplingMaskShape {
+        /// Number of mask values received.
+        actual: usize,
+        /// Number required by the source time axis.
+        expected: usize,
+    },
+    /// Fewer than two observations remain for sampling diagnostics.
+    InsufficientSamplingObservations {
+        /// Number of finite observations retained.
+        actual: usize,
+    },
+    /// A fitted frequency supplied to sampling diagnostics is invalid.
+    InvalidSamplingFrequency {
+        /// Position of the invalid frequency.
+        index: usize,
+    },
     /// Latitude is non-finite or outside the physical range.
     InvalidLatitude,
     /// Python `UTide`'s exact nodal formula is singular at precisely zero latitude.
@@ -175,6 +192,18 @@ impl fmt::Display for AnalysisError {
             Self::InvalidGregorianDateTime { component } => {
                 write!(formatter, "Gregorian datetime has an invalid {component}")
             }
+            Self::SamplingMaskShape { actual, expected } => write!(
+                formatter,
+                "sampling mask contains {actual} values; expected {expected}"
+            ),
+            Self::InsufficientSamplingObservations { actual } => write!(
+                formatter,
+                "sampling diagnostics require at least two finite observations; received {actual}"
+            ),
+            Self::InvalidSamplingFrequency { index } => write!(
+                formatter,
+                "sampling diagnostic frequency at index {index} must be finite and non-negative"
+            ),
             Self::InvalidLatitude => formatter
                 .write_str("latitude must be finite and between -90 and 90 degrees inclusive"),
             Self::EquatorialLatitude => formatter.write_str(

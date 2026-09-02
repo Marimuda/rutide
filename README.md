@@ -316,6 +316,25 @@ written only at retained finite timestamps. RUTide deliberately rejects duplicat
 or decreasing retained timestamps instead of accepting the ambiguous ordering as
 Python currently does, and it never sorts observations implicitly.
 
+Every scalar and vector run also records sampling-quality diagnostics rather
+than treating a successful Lomb–Scargle calculation as proof of adequate data.
+Per series these include retained count, record span, mean interval, largest gap,
+the actual FFT or Lomb–Scargle residual-spectrum route, its even sample count,
+and coverage of all nine Python UTide colored-noise bands. Both the total
+frequency-bin count and the usable count after excluding fitted-constituent bins
+are retained. A zero usable count means that band cannot supply a background
+noise estimate for that series.
+
+NetCDF stores the complete per-series fields as `sampling_record_span`,
+`sampling_mean_interval`, `sampling_largest_gap`, `residual_spectrum_method`,
+`residual_spectrum_time_count`, `spectral_band_frequency_bin_count`, and
+`spectral_band_usable_bin_count`, with explicit band-edge coordinate variables.
+JSON reports provide worst-case band coverage, FFT/Lomb series counts, extrema,
+and full details for retained sample results. These diagnostics are always
+produced, including white-noise or no-confidence runs, so data adequacy can be
+reviewed before enabling colored confidence; they inform judgment but do not
+silently reject a fit.
+
 ## FVCOM vector-current analysis
 
 Use `analyze-vector` for FVCOM depth-averaged eastward/northward currents. The

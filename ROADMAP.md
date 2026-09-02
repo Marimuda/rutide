@@ -76,10 +76,22 @@ comparison of all four ellipse confidence intervals plus SNR.
 - Batched matrix projection remains a possible optimization for larger shared-mask
   workloads, but is no longer a viability blocker.
 
-### 1d. Sampling diagnostics — planned
+### 1d. Sampling diagnostics — complete
 
-- Report record span, retained observation count, largest gap, and spectral-band
-  coverage so Lomb–Scargle is not presented as a cure for inadequate sampling.
+- Report per-series retained observation count, span, mean interval, largest gap,
+  and the actual FFT or Lomb–Scargle colored-spectrum route.
+- Retain total and post-constituent-exclusion usable frequency-bin counts for all
+  nine Python UTide bands, with explicit band edges and zero-coverage reporting.
+- Serialize complete scalar/vector diagnostics in versioned NetCDF schemas and
+  aggregate worst-case coverage plus retained samples in JSON reports.
+- Reuse the regular FFT frequency grid across spatial series, construct irregular
+  grids from each joint finite mask, and parallelize whole-field diagnostics.
+
+Pinned-Python fixtures freeze regular and irregular frequency grids, band counts,
+and constituent exclusions. Complete, gappy, invalid-mask, NetCDF, summary, and
+joint-vector paths are covered. Diagnostics are advisory rather than an implicit
+fit rejection: Lomb–Scargle handles irregularity, but cannot manufacture missing
+record length or spectral information.
 
 ## 2. Robust fitting — complete
 
