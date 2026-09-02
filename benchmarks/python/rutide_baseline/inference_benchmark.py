@@ -76,6 +76,13 @@ def _vector_observations(times: np.ndarray, sampling: str) -> tuple[np.ndarray, 
     return eastward, northward
 
 
+def _add_robust_outliers(scalar: np.ndarray, eastward: np.ndarray, northward: np.ndarray) -> None:
+    """Add the matched isolated anomalies used only by the robust profile."""
+    scalar[225] += 5.0
+    eastward[225] += 5.0
+    northward[513] -= 4.0
+
+
 def _inference(field: str, mode: str) -> dict[str, Any]:
     amplitude_ratios = [0.35, 0.5]
     phase_offsets = [20.0, 45.0]
@@ -94,6 +101,7 @@ def _inference(field: str, mode: str) -> dict[str, Any]:
 def _set_worker_state(
     oracle: Any,
     field: str,
+    method: str,
     inference: Any,
     times: np.ndarray,
     scalar: np.ndarray,
@@ -112,7 +120,7 @@ def _set_worker_state(
             "constit": _CONSTITUENTS,
             "order_constit": _CONSTITUENTS,
             "conf_int": "linear",
-            "method": "ols",
+            "method": method,
             "trend": True,
             "phase": "Greenwich",
             "nodal": True,
@@ -167,6 +175,7 @@ def main() -> None:
     parser.add_argument("--field", choices=("scalar", "vector"), default="scalar")
     parser.add_argument("--sampling", choices=("regular", "irregular"), default="irregular")
     parser.add_argument("--inference-mode", choices=("exact", "approximate"), default="exact")
+    parser.add_argument("--method", choices=("ols", "robust"), default="ols")
     parser.add_argument("--series-count", type=int, default=100)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repetitions", type=int, default=5)
@@ -191,9 +200,12 @@ def main() -> None:
     times = _times(args.sampling)
     scalar = _scalar_observations(args.sampling)
     eastward, northward = _vector_observations(times, args.sampling)
+    if args.method == "robust":
+        _add_robust_outliers(scalar, eastward, northward)
     _set_worker_state(
         oracle,
         args.field,
+        args.method,
         bunch(_inference(args.field, args.inference_mode)),
         times,
         scalar,
@@ -236,6 +248,7 @@ def main() -> None:
                 "field": args.field,
                 "sampling": args.sampling,
                 "inference_mode": args.inference_mode,
+                "method": args.method,
                 "series_count": args.series_count,
                 "workers": args.workers,
                 "chunk_size": args.chunk_size,

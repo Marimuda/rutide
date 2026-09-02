@@ -40,6 +40,30 @@ The fixture inspector and runner reconstruct FVCOM time as
 exact hourly intervals at its Modified Julian Date magnitude and must not be used
 as the analysis time vector.
 
+## Installed-package real-data acceptance
+
+After building and installing a release wheel, exercise its public batch,
+reconstruction, and persistence endpoints on both a genuine ADCP observation and
+the largest FVCOM fixture:
+
+```console
+python -m rutide_baseline.real_data_acceptance \
+  --adcp /path/to/OS_CCE1_11_D_ADCP.nc \
+  --fvcom ../projects/fvcom/claude_scratchpad/baroclinic_vikc1701/run/frs2f_0001.nc \
+  --fvcom-series 4096 --workers 16 --expected-version 0.2.0 \
+  --output benchmark-results/real-data-acceptance.json
+```
+
+The ADCP file is the freely available NOAA/NDBC OceanSITES CCE1 record. The
+harness analyzes all sufficiently populated depth cells, while the FVCOM
+selection deterministically spans the complete element axis without loading its
+three-dimensional native-layer currents. Classic-NetCDF current variables are
+read as bounded contiguous time slabs before sparse columns are retained; this
+avoids millions of scalar-shaped reads across record storage. Raw external data
+remain outside Git; the report retains provenance, source identity, separate
+input/solve/reconstruction timings, result digests, and a bitwise persistence/
+reconstruction check.
+
 ## Workloads
 
 - `smoke`: one deterministic node;
@@ -176,6 +200,21 @@ RUTIDE_BENCH_CONFIDENCE=monte-carlo \
 
 There is no paired Python command for this profile because Python UTide raises
 `NotImplementedError` when inference and Monte Carlo confidence are combined.
+
+Use the same harness with an explicit outlier pair to benchmark robust coupled-
+vector inference. The default OLS profile and its historical checksums are
+unchanged:
+
+```console
+RUTIDE_BENCH_FIELD=vector RUTIDE_BENCH_SAMPLING=irregular \
+  RUTIDE_BENCH_INFERENCE_MODE=exact RUTIDE_BENCH_METHOD=robust \
+  RUTIDE_BENCH_SERIES=100 \
+  cargo bench -p rutide-core --bench inference_throughput
+uv run --project benchmarks/python --locked \
+  python -m rutide_baseline.inference_benchmark \
+  --field vector --sampling irregular --inference-mode exact --method robust \
+  --series-count 100 --workers 1
+```
 
 The `fixed-raw` solver profile is the first Rust parity target. It fits M2, S2,
 N2, K1, and O1 with ordinary least squares, a mean and trend, raw phase, no nodal

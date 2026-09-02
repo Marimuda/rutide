@@ -5,7 +5,7 @@ use std::{env, error::Error, hint::black_box, time::Instant};
 use faer::{Par, set_global_parallelism};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use rutide_core::{
-    InferenceMode, LinearConfidence, MonteCarloOptions, ScalarInferenceBatch,
+    InferenceMode, LinearConfidence, MonteCarloOptions, RobustOptions, ScalarInferenceBatch,
     ScalarInferenceRelation, TidalConstituent, VectorInferenceBatch, VectorInferenceRelation,
 };
 
@@ -169,6 +169,7 @@ fn measure(
 struct RunSettings {
     monte_carlo: bool,
     monte_carlo_options: MonteCarloOptions,
+    robust: bool,
     warmups: usize,
     repetitions: usize,
 }
@@ -183,7 +184,22 @@ fn measure_scalar(
     measure(
         || {
             let solutions = pool.install(|| {
-                if settings.monte_carlo {
+                if settings.robust && settings.monte_carlo {
+                    batch.solve_time_major_with_missing_robust_and_monte_carlo_confidence(
+                        observations,
+                        latitudes,
+                        RobustOptions::default(),
+                        settings.monte_carlo_options,
+                        LinearConfidence::Colored,
+                    )
+                } else if settings.robust {
+                    batch.solve_time_major_with_missing_robust_and_linear_confidence(
+                        observations,
+                        latitudes,
+                        RobustOptions::default(),
+                        LinearConfidence::Colored,
+                    )
+                } else if settings.monte_carlo {
                     batch.solve_time_major_with_missing_and_monte_carlo_confidence(
                         observations,
                         latitudes,
@@ -219,7 +235,24 @@ fn measure_vector(
     measure(
         || {
             let solutions = pool.install(|| {
-                if settings.monte_carlo {
+                if settings.robust && settings.monte_carlo {
+                    batch.solve_vector_time_major_with_missing_robust_and_monte_carlo_confidence(
+                        eastward,
+                        northward,
+                        latitudes,
+                        RobustOptions::default(),
+                        settings.monte_carlo_options,
+                        LinearConfidence::Colored,
+                    )
+                } else if settings.robust {
+                    batch.solve_vector_time_major_with_missing_robust_and_linear_confidence(
+                        eastward,
+                        northward,
+                        latitudes,
+                        RobustOptions::default(),
+                        LinearConfidence::Colored,
+                    )
+                } else if settings.monte_carlo {
                     batch.solve_vector_time_major_with_missing_and_monte_carlo_confidence(
                         eastward,
                         northward,
@@ -268,6 +301,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "linear",
         &["linear", "monte-carlo"],
     )?;
+    let method = benchmark_setting("RUTIDE_BENCH_METHOD", "ols", &["ols", "robust"])?;
     let monte_carlo_options = MonteCarloOptions {
         realizations: setting("RUTIDE_BENCH_MC_REALIZATIONS", 200),
         seed: u64_setting("RUTIDE_BENCH_MC_SEED", 0),
@@ -279,6 +313,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let run_settings = RunSettings {
         monte_carlo: confidence == "monte-carlo",
         monte_carlo_options,
+        robust: method == "robust",
         warmups,
         repetitions,
     };
@@ -291,8 +326,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 + f64::from(u32::try_from(series).expect("series count fits u32")) * 1e-5
         })
         .collect::<Vec<_>>();
-    let scalar = time_major(&scalar_observations(&sampling)?, series_count);
-    let (eastward_source, northward_source) = vector_observations(&times, &sampling);
+    let mut scalar_source = scalar_observations(&sampling)?;
+    let (mut eastward_source, mut northward_source) = vector_observations(&times, &sampling);
+    if method == "robust" {
+        scalar_source[225] += 5.0;
+        eastward_source[225] += 5.0;
+        northward_source[513] -= 4.0;
+    }
+    let scalar = time_major(&scalar_source, series_count);
     let eastward = time_major(&eastward_source, series_count);
     let northward = time_major(&northward_source, series_count);
     let pool = ThreadPoolBuilder::new().num_threads(workers).build()?;
@@ -329,7 +370,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         measured
     };
     println!(
-        "summary field={field} sampling={sampling} inference_mode={mode_name} confidence={confidence} \
+        "summary field={field} sampling={sampling} inference_mode={mode_name} method={method} \
+         confidence={confidence} \
          series={series_count} workers={workers} warmups={warmups} repetitions={repetitions} \
          mc_realizations={} mc_seed={} \
          median_seconds={median_seconds:.9} median_series_per_second={:.3} \

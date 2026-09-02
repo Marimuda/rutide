@@ -7,6 +7,7 @@ import unittest
 import numpy as np
 
 from rutide_baseline.inference_benchmark import (
+    _add_robust_outliers,
     _inference,
     _scalar_observations,
     _times,
@@ -40,6 +41,24 @@ class InferenceBenchmarkTests(unittest.TestCase):
         self.assertEqual(np.count_nonzero(~np.isfinite(_scalar_observations("irregular"))), 3)
         eastward, northward = _vector_observations(irregular_times, "irregular")
         self.assertEqual(np.count_nonzero(~(np.isfinite(eastward) & np.isfinite(northward))), 4)
+
+    def test_robust_profile_adds_only_the_documented_isolated_outliers(self) -> None:
+        times = _times("irregular")
+        scalar = _scalar_observations("irregular")
+        eastward, northward = _vector_observations(times, "irregular")
+        original = scalar.copy(), eastward.copy(), northward.copy()
+
+        _add_robust_outliers(scalar, eastward, northward)
+
+        expected_scalar = original[0].copy()
+        expected_eastward = original[1].copy()
+        expected_northward = original[2].copy()
+        expected_scalar[225] += 5.0
+        expected_eastward[225] += 5.0
+        expected_northward[513] -= 4.0
+        np.testing.assert_equal(scalar, expected_scalar)
+        np.testing.assert_equal(eastward, expected_eastward)
+        np.testing.assert_equal(northward, expected_northward)
 
 
 if __name__ == "__main__":
