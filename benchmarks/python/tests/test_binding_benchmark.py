@@ -6,7 +6,12 @@ import unittest
 
 import numpy as np
 
-from rutide_baseline.binding_benchmark import make_fixture, result_digest, solve_options
+from rutide_baseline.binding_benchmark import (
+    finite_max_relative,
+    make_fixture,
+    result_digest,
+    solve_options,
+)
 
 
 class BindingBenchmarkTests(unittest.TestCase):
@@ -39,6 +44,11 @@ class BindingBenchmarkTests(unittest.TestCase):
         values = np.arange(6, dtype=np.float64)
         self.assertNotEqual(result_digest((values,)), result_digest((values.reshape(2, 3),)))
         self.assertEqual(result_digest((values,)), result_digest((values.copy(),)))
+
+    def test_relative_error_uses_reference_scale(self) -> None:
+        delta = np.array([0.1, 1.0, np.nan])
+        reference = np.array([10.0, 1000.0, 1.0])
+        self.assertAlmostEqual(finite_max_relative(delta, reference), 0.01)
 
 
 if __name__ == "__main__":

@@ -322,6 +322,12 @@ validation rather than partially applied.
   diagnostics, inference/options, and retained model time without retaining
   source observations; load recreates the native reconstruction model and may
   retune the batch worker count for the destination machine.
+- The public-binding benchmark directly compares Python UTide loops, RUTide
+  one-series loops, and RUTide batches. On retained 100-series profiles the
+  native batch is 111.37–186.12x faster for fitting and 124.68–262.74x faster
+  for reconstruction, with bitwise loop/batch RUTide results. Full conditions
+  and raw repetitions are in
+  `benchmarks/results/python-bindings-2026-09-02.md`.
 
 Bounded spatial input and incremental native-layer output are complete. The
 default 512 MiB promoted-observation budget reduced depth-averaged vector peak

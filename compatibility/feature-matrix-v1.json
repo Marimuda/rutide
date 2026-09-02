@@ -270,7 +270,8 @@
       "evidence": [
         "PYTHON_API.md",
         "python/tests/test_api.py",
-        "crates/rutide-python/src/lib.rs"
+        "crates/rutide-python/src/lib.rs",
+        "benchmarks/results/python-bindings-2026-09-02.md"
       ],
       "limitations": [
         "The Python interface is UTide-inspired rather than a strict drop-in replacement",

@@ -274,6 +274,12 @@ def validate_results(
         )
         errors[f"utide_vs_rutide_{name}_max_abs"] = finite_max_abs(oracle_delta)
         errors[f"rutide_loop_vs_batch_{name}_max_abs"] = finite_max_abs(batch_delta)
+        errors[f"utide_vs_rutide_{name}_max_relative"] = finite_max_relative(
+            oracle_delta, oracle[name]
+        )
+        errors[f"rutide_loop_vs_batch_{name}_max_relative"] = finite_max_relative(
+            batch_delta, loop[name]
+        )
         if name in angle_fields:
             if finite_max_abs(oracle_delta) > 2e-4 or finite_max_abs(batch_delta) > 2e-8:
                 raise RuntimeError(f"coefficient angle mismatch in {name}")
@@ -289,6 +295,12 @@ def validate_results(
         errors[f"rutide_loop_vs_batch_reconstruction_{component}_max_abs"] = finite_max_abs(
             loop_values - batch_values
         )
+        errors[f"utide_vs_rutide_reconstruction_{component}_max_relative"] = finite_max_relative(
+            oracle_values - loop_values, oracle_values
+        )
+        errors[f"rutide_loop_vs_batch_reconstruction_{component}_max_relative"] = (
+            finite_max_relative(loop_values - batch_values, loop_values)
+        )
         np.testing.assert_allclose(oracle_values, loop_values, rtol=2e-5, atol=2e-6)
         np.testing.assert_allclose(loop_values, batch_values, rtol=2e-10, atol=2e-10)
     return errors
@@ -303,6 +315,17 @@ def finite_max_abs(values: np.ndarray) -> float:
     """Return a JSON-safe maximum over finite entries."""
     finite = np.abs(np.asarray(values)[np.isfinite(values)])
     return float(np.max(finite)) if finite.size else 0.0
+
+
+def finite_max_relative(delta: np.ndarray, reference: np.ndarray) -> float:
+    """Return maximum relative error where both input arrays are finite."""
+    delta = np.asarray(delta)
+    reference = np.asarray(reference)
+    finite = np.isfinite(delta) & np.isfinite(reference)
+    if not finite.any():
+        return 0.0
+    scale = np.maximum(np.abs(reference[finite]), np.finfo(np.float64).tiny)
+    return float(np.max(np.abs(delta[finite]) / scale))
 
 
 def result_digest(arrays: dict[str, np.ndarray] | tuple[np.ndarray, ...]) -> str:
