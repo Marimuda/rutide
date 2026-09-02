@@ -12,6 +12,11 @@
       "stability": "pre-1.0",
       "rust_version": "1.98"
     },
+    "python_api": {
+      "stability": "pre-1.0",
+      "minimum_python": "3.9",
+      "abi": "abi3-py39"
+    },
     "netcdf": {
       "scalar_schema_version": 16,
       "vector_schema_version": 14
@@ -257,12 +262,20 @@
     },
     {
       "id": "python-bindings",
-      "title": "Python extension bindings",
-      "support": "planned",
+      "title": "UTide-inspired Python extension bindings",
+      "support": "supported",
       "scopes": ["python-api"],
-      "parity": "not-applicable",
-      "evidence": [],
-      "limitations": ["Will be added only for a demonstrated mixed Rust/Python workflow"]
+      "parity": "python-oracle",
+      "evidence": [
+        "PYTHON_API.md",
+        "python/tests/test_api.py",
+        "crates/rutide-python/src/lib.rs"
+      ],
+      "limitations": [
+        "The Python interface is UTide-inspired rather than a strict drop-in replacement",
+        "The endpoint fits one one-dimensional series at a time",
+        "Native fit objects are not yet serializable and arbitrary Python UTide coefficient dictionaries cannot be reconstructed"
+      ]
     }
   ]
 }

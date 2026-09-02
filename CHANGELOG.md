@@ -14,6 +14,9 @@ published API and file-schema contracts.
 - Broad scalar and vector Python-UTide-compatible harmonic analysis, including
   dynamic constituents, exact and approximate inference, robust fitting,
   linear and Monte Carlo confidence, diagnostics, and reconstruction.
+- A typed UTide-inspired `rutide.solve` / `rutide.reconstruct` Python package,
+  backed by a PyO3/NumPy stable-ABI extension with native model reuse and GIL-free
+  solving and reconstruction.
 - Irregular colored-confidence estimation through Lomb–Scargle residual spectra.
 - Bounded and incremental FVCOM scalar, depth-averaged, sigma-layer, and
   fixed-physical-depth application workflows.

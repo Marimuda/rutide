@@ -2,10 +2,12 @@
 members = [
   "crates/rutide-cli",
   "crates/rutide-core",
+  "crates/rutide-python",
 ]
 default-members = [
   "crates/rutide-cli",
   "crates/rutide-core",
+  "crates/rutide-python",
 ]
 resolver = "3"
 

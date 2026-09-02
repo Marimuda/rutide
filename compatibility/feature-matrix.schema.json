@@ -29,7 +29,7 @@
     "contracts": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["rust_api", "netcdf", "json_report", "result_digest"],
+      "required": ["rust_api", "python_api", "netcdf", "json_report", "result_digest"],
       "properties": {
         "rust_api": {
           "type": "object",
@@ -38,6 +38,16 @@
           "properties": {
             "stability": { "enum": ["pre-1.0"] },
             "rust_version": { "type": "string" }
+          }
+        },
+        "python_api": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["stability", "minimum_python", "abi"],
+          "properties": {
+            "stability": { "enum": ["pre-1.0"] },
+            "minimum_python": { "type": "string" },
+            "abi": { "type": "string" }
           }
         },
         "netcdf": {

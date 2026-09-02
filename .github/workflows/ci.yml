@@ -72,3 +72,37 @@ jobs:
 
       - name: Run tests
         run: uv run --locked python -m unittest discover -s tests -v
+
+  python-bindings:
+    name: Python bindings (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.13"]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.7.12"
+          enable-cache: true
+
+      - name: Synchronize locked environment
+        run: uv sync --locked --python "${{ matrix.python }}"
+
+      - name: Check Python formatting and lint
+        run: |
+          uv run --locked ruff format --check python
+          uv run --locked ruff check python
+
+      - name: Run Python API tests
+        run: uv run --locked python -m unittest discover -s python/tests -v
+
+      - name: Build wheel
+        if: matrix.python == '3.13'
+        run: uv build --wheel --out-dir dist

@@ -277,7 +277,7 @@ coverage supplies Monte Carlo inference, ordering, and reconstruction seams.
 Unsupported input combinations are named in the matrix and rejected during
 validation rather than partially applied.
 
-## 6. Product and resource work — planned
+## 6. Product and resource work — complete
 
 - Native depth-resolved FVCOM currents are complete. Explicit `siglay` selections
   read `u(time, siglay, nele)` / `v(time, siglay, nele)` in bounded chunks,
@@ -303,8 +303,15 @@ validation rather than partially applied.
 - The pre-1.0 Rust API, NetCDF/JSON schema, and digest stability contracts are
   documented in `COMPATIBILITY.md`; compiled schema constants are checked
   against the versioned machine-readable feature matrix.
-- Add Python bindings only if a drop-in or mixed Python/Rust workflow is an
-  actual user requirement, and publish reproducible release artifacts.
+- The mixed PyO3/maturin Python distribution exposes typed UTide-inspired
+  `solve` and `reconstruct` endpoints for scalar elevations and vector currents.
+  NumPy buffers cross the native boundary directly, numerical work releases the
+  GIL, and the immutable Rust fit is reused for reconstruction. The endpoint
+  covers dynamic selection, missing/irregular records, FFT/Lomb–Scargle
+  confidence, robust fits, inference, Monte Carlo, diagnostics, ordering, time
+  epochs, and filters. CPython 3.9+ stable-ABI wheels share the Cargo-sourced
+  workspace version; locked CI and protected release workflows build and test
+  packages without publishing implicitly.
 
 Bounded spatial input and incremental native-layer output are complete. The
 default 512 MiB promoted-observation budget reduced depth-averaged vector peak

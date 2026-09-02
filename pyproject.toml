@@ -1,0 +1,51 @@
+[build-system]
+requires = ["maturin==1.15.0"]
+build-backend = "maturin"
+
+[project]
+name = "rutide"
+dynamic = ["version"]
+description = "High-performance tidal harmonic analysis powered by Rust"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+keywords = ["tides", "harmonic analysis", "oceanography", "FVCOM", "ADCP"]
+authors = [
+  { name = "Jakup Svodstein", email = "jakupsv@setur.fo" },
+]
+dependencies = [
+  "numpy>=1.23.5,<3",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Rust",
+  "Topic :: Scientific/Engineering",
+]
+
+[dependency-groups]
+dev = [
+  "ruff==0.16.5",
+]
+
+[tool.maturin]
+manifest-path = "crates/rutide-python/Cargo.toml"
+module-name = "rutide._native"
+python-source = "python"
+features = ["pyo3/extension-module"]
+strip = true
+include = [
+  { path = "LICENSE", format = "sdist" },
+  { path = "PYTHON_API.md", format = "sdist" },
+  { path = "COMPATIBILITY.md", format = "sdist" },
+  { path = "python/tests/*.py", format = "sdist" },
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]

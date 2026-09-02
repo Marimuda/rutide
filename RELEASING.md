@@ -6,14 +6,17 @@ same package version through maturin.
 
 ## Prepare
 
-1. Update `CHANGELOG.md` and move completed entries out of `Unreleased`.
-2. Set the workspace version in `Cargo.toml` and update exact internal dependency
+1. Before the first public release, configure the canonical Git remote and add
+   matching repository/documentation/issues URLs to Cargo and `pyproject.toml`.
+   Do not publish placeholder ownership metadata.
+2. Update `CHANGELOG.md` and move completed entries out of `Unreleased`.
+3. Set the workspace version in `Cargo.toml` and update exact internal dependency
    requirements.
-3. Update `compatibility/feature-matrix-v1.json` and verify any NetCDF/JSON schema
+4. Update `compatibility/feature-matrix-v1.json` and verify any NetCDF/JSON schema
    changes have incremented their independent schema constants.
-4. Run the full Rust, Python, documentation, package, and wheel checks documented
+5. Run the full Rust, Python, documentation, package, and wheel checks documented
    in the repository README.
-5. Commit the release, create the signed `vX.Y.Z` tag, and push both commit and
+6. Commit the release, create the signed `vX.Y.Z` tag, and push both commit and
    tag. Tags must point at a clean commit whose reported package versions agree.
 
 ## Build and publish
@@ -29,6 +32,14 @@ Publish in dependency order:
 
 Uploading requires an explicit, protected release action and registry credentials.
 Local and pull-request checks only build and inspect packages; they never publish.
+The `Build Python release` workflow always builds immutable wheel/source artifacts
+for a version tag. PyPI upload occurs only for a manual dispatch on a tag with the
+`publish` input enabled, after approval by the `pypi` environment. Configure that
+environment and its PyPI trusted-publisher identity before the first release.
+
+Python wheels target Linux x86-64/AArch64, macOS x86-64/Apple Silicon, and Windows
+x86-64 with the CPython 3.9 stable ABI. Adding another target requires a tested
+wheel job; it must not be inferred from a source distribution alone.
 
 ## Verify
 

@@ -10,6 +10,10 @@
 **/__pycache__/
 **/*.egg-info/
 *.py[cod]
+/python/rutide/_native*.so
+/python/rutide/_native*.pyd
+/python/rutide/_native*.dll
+/python/rutide/_native*.dylib
 /perf.data*
 /*.profraw
 

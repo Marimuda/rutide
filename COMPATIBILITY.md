@@ -18,6 +18,7 @@ oracle.
 but its structs may still gain fields before 1.0 as output strategies and product
 interfaces settle. The command-line spelling and defaults are treated as stable
 within a schema version. Both crates require Rust 1.98 and forbid unsafe code.
+The workspace and Python distribution share one Cargo-sourced version.
 
 ## NetCDF and JSON reports
 
@@ -66,6 +67,19 @@ The machine-readable status is
 validated against
 [`compatibility/feature-matrix.schema.json`](compatibility/feature-matrix.schema.json)
 and checked against compiled constants in the Rust test suite.
+
+The `rutide` Python distribution supports CPython 3.9 and newer through a
+PyO3 `abi3-py39` extension. Its `solve` and `reconstruct` endpoints are shaped
+after Python UTide and expose UTide coefficient names plus descriptive aliases,
+but are not represented as a byte-for-byte drop-in interface. The supported
+arguments, time behavior, read-only result snapshots, and current serialization
+and one-series limitations are defined in [`PYTHON_API.md`](PYTHON_API.md).
+
+Within the pre-1.0 series, Python breaking changes require a workspace minor
+version and changelog migration note. Patch releases preserve documented
+endpoint names and semantics. The native fit retained by a `Coefficient` is the
+authoritative immutable reconstruction state; displayed NumPy coefficient arrays
+cannot be mutated independently of it.
 
 ## Solver-option composition
 

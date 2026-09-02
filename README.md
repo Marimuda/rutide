@@ -128,6 +128,8 @@ independent uncertain estimates.
 ```text
 crates/rutide-core/  Numerical library; no file-format or CLI concerns
 crates/rutide-cli/   FVCOM NetCDF application and benchmark entry point
+crates/rutide-python/ Native PyO3/NumPy extension
+python/rutide/        Typed UTide-inspired public Python package
 benchmarks/           Locked Python oracle harness and fixture manifests
 BENCHMARK_PLAN.md    Frozen experimental intent and measurement protocol
 ```
@@ -163,6 +165,11 @@ cargo ci
 cargo test-all
 cargo doc --workspace --all-features --no-deps --locked
 cargo run --bin rutide -- --version
+uv sync --locked
+uv run --locked ruff format --check python
+uv run --locked ruff check python
+uv run --locked python -m unittest discover -s python/tests -v
+uv build --wheel
 uv sync --project benchmarks/python --locked
 uv run --project benchmarks/python --locked ruff check benchmarks/python
 uv run --project benchmarks/python --locked \
@@ -171,6 +178,20 @@ uv run --project benchmarks/python --locked \
 
 `cargo ci` and `cargo test-all` are repository aliases defined in
 `.cargo/config.toml`. CI runs the same gates on every push and pull request.
+
+## Python
+
+The mixed Python/Rust package provides `rutide.solve` and `rutide.reconstruct`
+for one-dimensional scalar elevations and vector currents. The endpoint and
+result names follow Python UTide where practical, including `A`, `g`, `Lsmaj`,
+`Lsmin`, `theta`, `PE`, and `SNR`. Dynamic constituents, missing observations,
+irregular Lomb–Scargle confidence, robust fitting, exact/approximate inference,
+Monte Carlo confidence, and filtered reconstruction all use the same Rust core
+validated by the CLI.
+
+See the [Python API guide](PYTHON_API.md) for installation, examples, time
+epochs, supported options, intentional compatibility differences, and the
+native coefficient object's lifetime contract.
 
 Performance measurements must use release or benchmark profiles. Machine-specific
 compiler flags, CPU affinity, worker counts, and library thread settings belong in
