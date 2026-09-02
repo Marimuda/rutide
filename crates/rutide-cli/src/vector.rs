@@ -7,7 +7,10 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use netcdf::{FileMut, Variable};
+use netcdf::{
+    FileMut, Variable,
+    types::{FloatType, IntType, NcVariableType},
+};
 use rayon::{ThreadPoolBuilder, prelude::*};
 use rutide_core::{
     AnalysisError, COLORED_NOISE_FREQUENCY_BANDS_CPH, Constituent, FitOptions, GreenwichNodalBatch,
@@ -37,6 +40,7 @@ use super::{
 
 /// `NetCDF` and JSON report schema emitted by vector-current analyses.
 pub const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 13;
+const FIXED_DEPTH_ZETA_SPAN_AMPLIFICATION: usize = 6;
 
 /// Configuration for one FVCOM current analysis.
 #[derive(Clone, Debug, PartialEq)]
@@ -279,19 +283,99 @@ struct VectorInputMetadata {
 
 struct FixedDepthSource {
     source_layer_count: usize,
+    current_buffer_bytes_per_layer: usize,
+    zeta_buffer_bytes_per_node: usize,
+    wet_buffer_bytes_per_element: usize,
     element_nodes: Vec<[usize; 3]>,
-    node_sigma: Vec<f64>,
-    node_bathymetry: Vec<f64>,
-    sigma_fill: Option<f32>,
-    bathymetry_fill: Option<f32>,
+    layer_sigma: Vec<[f64; 3]>,
+    element_bathymetry: Vec<[f64; 3]>,
     zeta_fill: Option<f32>,
     wet_cells_fill: Option<i32>,
+}
+
+struct FixedDepthStaticGeometry {
+    layer_sigma: Vec<[f64; 3]>,
+    element_bathymetry: Vec<[f64; 3]>,
 }
 
 struct VectorInputChunk {
     eastward: Vec<f64>,
     northward: Vec<f64>,
     observation_counts: Vec<usize>,
+}
+
+enum FixedDepthFloatBlock {
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+}
+
+impl FixedDepthFloatBlock {
+    fn len(&self) -> usize {
+        match self {
+            Self::F32(values) => values.len(),
+            Self::F64(values) => values.len(),
+        }
+    }
+
+    fn retain_time_rows(
+        self,
+        source_time_count: usize,
+        series_count: usize,
+        retained_time_indices: &[usize],
+    ) -> Result<Self, AppError> {
+        match self {
+            Self::F32(values) => retain_time_major_rows(
+                values,
+                source_time_count,
+                series_count,
+                retained_time_indices,
+            )
+            .map(Self::F32),
+            Self::F64(values) => retain_time_major_rows(
+                values,
+                source_time_count,
+                series_count,
+                retained_time_indices,
+            )
+            .map(Self::F64),
+        }
+    }
+
+    fn normalize(
+        &mut self,
+        variable: &str,
+        fill_value: Option<f32>,
+        series_count: usize,
+    ) -> Result<(), AppError> {
+        match self {
+            Self::F32(values) => {
+                for (index, value) in values.iter_mut().enumerate() {
+                    let is_fill = fill_value.is_some_and(|fill| value.to_bits() == fill.to_bits());
+                    if value.is_nan() || is_fill {
+                        *value = f32::NAN;
+                    } else if value.is_infinite() {
+                        return Err(AppError::Invalid(format!(
+                            "{variable} contains an infinite value at series {}, time {}",
+                            index % series_count,
+                            index / series_count,
+                        )));
+                    }
+                }
+            }
+            Self::F64(values) => {
+                for (index, value) in values.iter_mut().enumerate() {
+                    *value = normalize_source_observation(
+                        variable,
+                        *value,
+                        fill_value,
+                        index % series_count,
+                        index / series_count,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl VectorInputData {
@@ -647,11 +731,11 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
     // promoted source-component buffers.
     let (mut chunk_plan, fixed_depth_elements_per_chunk) = if metadata.is_fixed_depth() {
         let depth_count = metadata.vertical_count();
-        let source_layer_count = metadata
+        let source = metadata
             .fixed_depth_source
             .as_ref()
-            .map(|source| source.source_layer_count)
             .ok_or_else(|| AppError::Invalid("fixed-depth geometry was not prepared".to_owned()))?;
+        let source_layer_count = source.source_layer_count;
         let requested_elements = config
             .chunk_series
             .map(|series| {
@@ -663,15 +747,35 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                 Ok(series / depth_count)
             })
             .transpose()?;
-        // Native u/v, interpolated u/v, worst-case three-node zeta, and wet mask
-        // coexist inside the reader. This makes the automatic 512 MiB budget
-        // conservative without charging for static geometry.
-        let component_count = source_layer_count
-            .checked_mul(2)
-            .and_then(|value| value.checked_add(depth_count * 2 + 4))
+        // Source-width u/v, a bounded three-node zeta span, wet mask, and
+        // interpolated u/v coexist inside the reader. Multiple depths
+        // temporarily use a second interpolated buffer while converting the
+        // parallel time-major result into depth-major chunks.
+        let current_bytes_per_element = source_layer_count
+            .checked_mul(source.current_buffer_bytes_per_layer)
             .ok_or_else(|| {
                 AppError::Invalid("fixed-depth chunk budget exceeds usize".to_owned())
             })?;
+        let zeta_bytes_per_element = 3_usize
+            .checked_mul(FIXED_DEPTH_ZETA_SPAN_AMPLIFICATION)
+            .and_then(|nodes| nodes.checked_mul(source.zeta_buffer_bytes_per_node))
+            .ok_or_else(|| {
+                AppError::Invalid("fixed-depth zeta chunk budget exceeds usize".to_owned())
+            })?;
+        let output_bytes_per_element = depth_count
+            .checked_mul(if depth_count == 1 { 2 } else { 4 })
+            .and_then(|components| components.checked_mul(std::mem::size_of::<f64>()))
+            .ok_or_else(|| {
+                AppError::Invalid("fixed-depth output chunk budget exceeds usize".to_owned())
+            })?;
+        let bytes_per_element = current_bytes_per_element
+            .checked_add(zeta_bytes_per_element)
+            .and_then(|bytes| bytes.checked_add(source.wet_buffer_bytes_per_element))
+            .and_then(|bytes| bytes.checked_add(output_bytes_per_element))
+            .ok_or_else(|| {
+                AppError::Invalid("fixed-depth chunk budget exceeds usize".to_owned())
+            })?;
+        let component_count = bytes_per_element.div_ceil(std::mem::size_of::<f64>());
         let element_plan = spatial_chunk_plan(
             requested_elements,
             metadata.element_indices.len(),
@@ -831,6 +935,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                     &dataset,
                     &metadata,
                     first_element..end_element,
+                    &worker_pool,
                 )?;
                 for (depth, chunk) in chunks.into_iter().enumerate() {
                     let first_series = depth * metadata.element_indices.len() + first_element;
@@ -1896,6 +2001,15 @@ fn read_fvcom_vector_metadata(
             }
             element_nodes.push(nodes);
         }
+        let geometry = prepare_fixed_depth_geometry(
+            &element_nodes,
+            &node_sigma,
+            &node_bathymetry,
+            sigma_fill,
+            bathymetry_fill,
+            layer_count,
+            node_count,
+        )?;
         let selected_nodes = element_nodes
             .iter()
             .flatten()
@@ -1929,11 +2043,44 @@ fn read_fvcom_vector_metadata(
         ]);
         Some(FixedDepthSource {
             source_layer_count: layer_count,
+            current_buffer_bytes_per_layer: if element_indices
+                .windows(2)
+                .all(|pair| pair[1] == pair[0] + 1)
+            {
+                [eastward_variable.vartype(), northward_variable.vartype()]
+                    .iter()
+                    .map(|value_type| {
+                        if *value_type == NcVariableType::Float(FloatType::F32) {
+                            std::mem::size_of::<f32>()
+                        } else {
+                            std::mem::size_of::<f64>()
+                        }
+                    })
+                    .sum()
+            } else {
+                2 * std::mem::size_of::<f64>()
+            },
+            zeta_buffer_bytes_per_node: if zeta_variable.vartype()
+                == NcVariableType::Float(FloatType::F32)
+            {
+                std::mem::size_of::<f32>()
+            } else {
+                std::mem::size_of::<f64>()
+            },
+            wet_buffer_bytes_per_element: if element_indices
+                .windows(2)
+                .all(|pair| pair[1] == pair[0] + 1)
+                && wet_cells_variable.vartype() == NcVariableType::Int(IntType::I32)
+            {
+                // The i32 source and compact u8 destination briefly overlap.
+                std::mem::size_of::<i32>() + std::mem::size_of::<u8>()
+            } else {
+                // The generic gather promotes to f64 before compacting to u8.
+                std::mem::size_of::<f64>() + std::mem::size_of::<u8>()
+            },
             element_nodes,
-            node_sigma,
-            node_bathymetry,
-            sigma_fill,
-            bathymetry_fill,
+            layer_sigma: geometry.layer_sigma,
+            element_bathymetry: geometry.element_bathymetry,
             zeta_fill,
             wet_cells_fill,
         })
@@ -1958,6 +2105,69 @@ fn read_fvcom_vector_metadata(
         northward_fill,
         input_file_bytes,
         logical_input_bytes,
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "FVCOM static geometry inputs and their fill values remain explicit"
+)]
+fn prepare_fixed_depth_geometry(
+    element_nodes: &[[usize; 3]],
+    node_sigma: &[f64],
+    node_bathymetry: &[f64],
+    sigma_fill: Option<f32>,
+    bathymetry_fill: Option<f32>,
+    layer_count: usize,
+    node_count: usize,
+) -> Result<FixedDepthStaticGeometry, AppError> {
+    let geometry_count = layer_count
+        .checked_mul(element_nodes.len())
+        .ok_or_else(|| AppError::Invalid("fixed-depth geometry exceeds usize".to_owned()))?;
+    let mut layer_sigma = vec![[f64::NAN; 3]; geometry_count];
+    let mut element_bathymetry = vec![[f64::NAN; 3]; element_nodes.len()];
+    let source_value = |name: &str,
+                        value: f64,
+                        fill: Option<f32>,
+                        node: usize,
+                        layer: Option<usize>|
+     -> Result<Option<f64>, AppError> {
+        if fill.is_some_and(|fill| value.to_bits() == f64::from(fill).to_bits()) || value.is_nan() {
+            return Ok(None);
+        }
+        if !value.is_finite() {
+            return Err(AppError::Invalid(format!(
+                "{name} contains an infinite value at node {node}{}",
+                layer.map_or_else(String::new, |layer| format!(", layer {layer}")),
+            )));
+        }
+        Ok(Some(value))
+    };
+    for layer in 0..layer_count {
+        for (element, nodes) in element_nodes.iter().copied().enumerate() {
+            let geometry = layer * element_nodes.len() + element;
+            for (vertex, node) in nodes.into_iter().enumerate() {
+                let sigma = source_value(
+                    "siglay",
+                    node_sigma[layer * node_count + node],
+                    sigma_fill,
+                    node,
+                    Some(layer),
+                )?;
+                let bathymetry =
+                    source_value("h", node_bathymetry[node], bathymetry_fill, node, None)?;
+                if let Some(sigma) = sigma {
+                    layer_sigma[geometry][vertex] = sigma;
+                }
+                if let Some(bathymetry) = bathymetry {
+                    element_bathymetry[element][vertex] = bathymetry;
+                }
+            }
+        }
+    }
+    Ok(FixedDepthStaticGeometry {
+        layer_sigma,
+        element_bathymetry,
     })
 }
 
@@ -2069,6 +2279,7 @@ fn read_fvcom_fixed_depth_element_chunk(
     dataset: &netcdf::File,
     metadata: &VectorInputMetadata,
     element_range: std::ops::Range<usize>,
+    worker_pool: &rayon::ThreadPool,
 ) -> Result<Vec<VectorInputChunk>, AppError> {
     let depths = metadata.fixed_depths_meters.as_deref().ok_or_else(|| {
         AppError::Invalid("fixed-depth reader requires requested depths".to_owned())
@@ -2106,213 +2317,468 @@ fn read_fvcom_fixed_depth_element_chunk(
         .source_layer_count
         .checked_mul(selected_elements.len())
         .ok_or_else(|| AppError::Invalid("fixed-depth source chunk exceeds usize".to_owned()))?;
-    let mut eastward = read_selected_layer_element_time_major(
+    let mut eastward = read_fixed_depth_current_block(
         &required_variable(dataset, "u")?,
         metadata.source_time_count,
         &all_layers,
         selected_elements,
-        0..native_series_count,
+        native_series_count,
     )?;
-    let mut northward = read_selected_layer_element_time_major(
+    let mut northward = read_fixed_depth_current_block(
         &required_variable(dataset, "v")?,
         metadata.source_time_count,
         &all_layers,
         selected_elements,
-        0..native_series_count,
+        native_series_count,
     )?;
-    eastward = retain_time_major_rows(
-        eastward,
+    eastward = eastward.retain_time_rows(
         metadata.source_time_count,
         native_series_count,
         &metadata.retained_time_indices,
     )?;
-    northward = retain_time_major_rows(
-        northward,
+    northward = northward.retain_time_rows(
         metadata.source_time_count,
         native_series_count,
         &metadata.retained_time_indices,
     )?;
-    for index in 0..eastward.len() {
-        let native_series = index % native_series_count;
-        let time = index / native_series_count;
-        eastward[index] = normalize_source_observation(
-            "u",
-            eastward[index],
-            metadata.eastward_fill,
-            native_series,
-            time,
-        )?;
-        northward[index] = normalize_source_observation(
-            "v",
-            northward[index],
-            metadata.northward_fill,
-            native_series,
-            time,
-        )?;
-    }
+    eastward.normalize("u", metadata.eastward_fill, native_series_count)?;
+    northward.normalize("v", metadata.northward_fill, native_series_count)?;
 
     let zeta_variable = required_variable(dataset, "zeta")?;
-    let mut zeta =
-        read_selected_time_major(&zeta_variable, metadata.source_time_count, &selected_nodes)?;
-    zeta = retain_time_major_rows(
-        zeta,
+    let mut zeta = read_sorted_time_major_bounded_span(
+        &zeta_variable,
+        metadata.source_time_count,
+        &selected_nodes,
+    )?;
+    zeta = zeta.retain_time_rows(
         metadata.source_time_count,
         selected_nodes.len(),
         &metadata.retained_time_indices,
     )?;
-    for (index, value) in zeta.iter_mut().enumerate() {
-        *value = normalize_source_observation(
-            "zeta",
-            *value,
-            source.zeta_fill,
-            index % selected_nodes.len(),
-            index / selected_nodes.len(),
-        )?;
-    }
+    zeta.normalize("zeta", source.zeta_fill, selected_nodes.len())?;
 
     let wet_variable = required_variable(dataset, "wet_cells")?;
-    let mut wet_cells =
-        read_selected_time_major(&wet_variable, metadata.source_time_count, selected_elements)?;
-    wet_cells = retain_time_major_rows(
-        wet_cells,
+    let wet_cells = read_fixed_depth_wet_block(
+        &wet_variable,
         metadata.source_time_count,
-        selected_elements.len(),
+        selected_elements,
         &metadata.retained_time_indices,
+        source.wet_cells_fill,
     )?;
-    for (index, value) in wet_cells.iter_mut().enumerate() {
-        if source
-            .wet_cells_fill
-            .is_some_and(|fill| value.to_bits() == f64::from(fill).to_bits())
-            || value.is_nan()
-        {
-            *value = f64::NAN;
-        } else if !value.is_finite()
-            || (value.to_bits() != 0.0_f64.to_bits() && value.to_bits() != 1.0_f64.to_bits())
-        {
-            return Err(AppError::Invalid(format!(
-                "wet_cells must contain only 0, 1, or its missing value; received {value} at selected element {}, retained time {}",
-                index % selected_elements.len(),
-                index / selected_elements.len(),
-            )));
+
+    let element_count = selected_elements.len();
+    macro_rules! interpolate {
+        ($eastward:expr, $northward:expr, $zeta:expr) => {
+            interpolate_fixed_depth_currents(
+                worker_pool,
+                depths,
+                source,
+                element_range.start,
+                &local_element_nodes,
+                selected_nodes.len(),
+                $zeta,
+                &wet_cells,
+                $eastward,
+                $northward,
+                metadata.modified_julian_days.len(),
+                element_count,
+            )
+        };
+    }
+    macro_rules! interpolate_with_zeta {
+        ($eastward:expr, $northward:expr) => {
+            match &zeta {
+                FixedDepthFloatBlock::F32(zeta) => interpolate!($eastward, $northward, zeta),
+                FixedDepthFloatBlock::F64(zeta) => interpolate!($eastward, $northward, zeta),
+            }
+        };
+    }
+    match (&eastward, &northward) {
+        (FixedDepthFloatBlock::F32(eastward), FixedDepthFloatBlock::F32(northward)) => {
+            interpolate_with_zeta!(eastward, northward)
+        }
+        (FixedDepthFloatBlock::F32(eastward), FixedDepthFloatBlock::F64(northward)) => {
+            interpolate_with_zeta!(eastward, northward)
+        }
+        (FixedDepthFloatBlock::F64(eastward), FixedDepthFloatBlock::F32(northward)) => {
+            interpolate_with_zeta!(eastward, northward)
+        }
+        (FixedDepthFloatBlock::F64(eastward), FixedDepthFloatBlock::F64(northward)) => {
+            interpolate_with_zeta!(eastward, northward)
         }
     }
+}
 
-    let time_count = metadata.modified_julian_days.len();
-    let element_count = selected_elements.len();
-    let output_value_count = time_count
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the parallel interpolation kernel keeps physical geometry and joint-current masking together"
+)]
+fn interpolate_fixed_depth_currents<E, N, Z>(
+    worker_pool: &rayon::ThreadPool,
+    depths: &[f64],
+    source: &FixedDepthSource,
+    first_source_element: usize,
+    local_element_nodes: &[[usize; 3]],
+    selected_node_count: usize,
+    zeta: &[Z],
+    wet_cells: &[u8],
+    source_eastward: &[E],
+    source_northward: &[N],
+    time_count: usize,
+    element_count: usize,
+) -> Result<Vec<VectorInputChunk>, AppError>
+where
+    E: Copy + Into<f64> + Sync,
+    N: Copy + Into<f64> + Sync,
+    Z: Copy + Into<f64> + Sync,
+{
+    struct InterpolationAccumulator {
+        observation_counts: Vec<usize>,
+        layer_depths: Vec<f64>,
+    }
+
+    let depth_count = depths.len();
+    let row_width = depth_count
         .checked_mul(element_count)
+        .ok_or_else(|| AppError::Invalid("fixed-depth output row exceeds usize".to_owned()))?;
+    let output_value_count = time_count
+        .checked_mul(row_width)
         .ok_or_else(|| AppError::Invalid("fixed-depth output chunk exceeds usize".to_owned()))?;
+    let native_series_count = source
+        .source_layer_count
+        .checked_mul(element_count)
+        .ok_or_else(|| AppError::Invalid("fixed-depth source row exceeds usize".to_owned()))?;
+    let mut eastward = vec![f64::NAN; output_value_count];
+    let mut northward = vec![f64::NAN; output_value_count];
+    let accumulated = worker_pool.install(|| {
+        eastward
+            .par_chunks_mut(row_width)
+            .zip(northward.par_chunks_mut(row_width))
+            .enumerate()
+            .fold(
+                || InterpolationAccumulator {
+                    observation_counts: vec![0; row_width],
+                    layer_depths: vec![0.0; source.source_layer_count],
+                },
+                |mut accumulated, (time, (eastward_row, northward_row))| {
+                    let zeta_row =
+                        &zeta[time * selected_node_count..(time + 1) * selected_node_count];
+                    let wet_row = &wet_cells[time * element_count..(time + 1) * element_count];
+                    let source_row = time * native_series_count;
+                    for element in 0..element_count {
+                        if wet_row[element] != 1 {
+                            continue;
+                        }
+                        let local_nodes = local_element_nodes[element];
+                        let surface = [
+                            zeta_row[local_nodes[0]].into(),
+                            zeta_row[local_nodes[1]].into(),
+                            zeta_row[local_nodes[2]].into(),
+                        ];
+                        if surface.iter().any(|value| !value.is_finite()) {
+                            continue;
+                        }
+                        let source_element = first_source_element + element;
+                        let bathymetry = source.element_bathymetry[source_element];
+                        let mut geometry_valid = true;
+                        for (layer, layer_depth) in accumulated.layer_depths.iter_mut().enumerate()
+                        {
+                            let geometry = layer * source.element_nodes.len() + source_element;
+                            let sigma = source.layer_sigma[geometry];
+                            let mut total = 0.0;
+                            for vertex in 0..3 {
+                                total += -sigma[vertex] * (bathymetry[vertex] + surface[vertex]);
+                            }
+                            *layer_depth = total / 3.0;
+                            geometry_valid &= layer_depth.is_finite();
+                        }
+                        if !geometry_valid
+                            || accumulated
+                                .layer_depths
+                                .windows(2)
+                                .any(|pair| pair[1] <= pair[0])
+                        {
+                            continue;
+                        }
+                        for (depth_position, target) in depths.iter().copied().enumerate() {
+                            let Some(lower_layer) = accumulated
+                                .layer_depths
+                                .windows(2)
+                                .position(|pair| target >= pair[0] && target <= pair[1])
+                            else {
+                                continue;
+                            };
+                            let upper_layer = lower_layer + 1;
+                            let lower_depth = accumulated.layer_depths[lower_layer];
+                            let upper_depth = accumulated.layer_depths[upper_layer];
+                            let lower_series = source_row + lower_layer * element_count + element;
+                            let upper_series = source_row + upper_layer * element_count + element;
+                            let u0 = source_eastward[lower_series].into();
+                            let u1 = source_eastward[upper_series].into();
+                            let v0 = source_northward[lower_series].into();
+                            let v1 = source_northward[upper_series].into();
+                            let interpolated = if target.to_bits() == lower_depth.to_bits() {
+                                (u0.is_finite() && v0.is_finite()).then_some((u0, v0))
+                            } else if target.to_bits() == upper_depth.to_bits() {
+                                (u1.is_finite() && v1.is_finite()).then_some((u1, v1))
+                            } else if u0.is_finite()
+                                && u1.is_finite()
+                                && v0.is_finite()
+                                && v1.is_finite()
+                            {
+                                let weight = (target - lower_depth) / (upper_depth - lower_depth);
+                                Some((u0 + weight * (u1 - u0), v0 + weight * (v1 - v0)))
+                            } else {
+                                None
+                            };
+                            let Some((interpolated_u, interpolated_v)) = interpolated else {
+                                continue;
+                            };
+                            let destination = depth_position * element_count + element;
+                            eastward_row[destination] = interpolated_u;
+                            northward_row[destination] = interpolated_v;
+                            accumulated.observation_counts[destination] += 1;
+                        }
+                    }
+                    accumulated
+                },
+            )
+            .reduce(
+                || InterpolationAccumulator {
+                    observation_counts: vec![0; row_width],
+                    layer_depths: Vec::new(),
+                },
+                |mut left, right| {
+                    for (left, right) in left
+                        .observation_counts
+                        .iter_mut()
+                        .zip(right.observation_counts)
+                    {
+                        *left += right;
+                    }
+                    left
+                },
+            )
+    });
+
+    if depth_count == 1 {
+        return Ok(vec![VectorInputChunk {
+            eastward,
+            northward,
+            observation_counts: accumulated.observation_counts,
+        }]);
+    }
     let mut chunks = depths
         .iter()
         .map(|_| VectorInputChunk {
-            eastward: vec![f64::NAN; output_value_count],
-            northward: vec![f64::NAN; output_value_count],
-            observation_counts: vec![0; element_count],
+            eastward: vec![f64::NAN; time_count * element_count],
+            northward: vec![f64::NAN; time_count * element_count],
+            observation_counts: Vec::new(),
         })
         .collect::<Vec<_>>();
-    let node_count = source.node_bathymetry.len();
-    let static_value = |name: &str,
-                        value: f64,
-                        fill: Option<f32>,
-                        node: usize,
-                        layer: Option<usize>|
-     -> Result<f64, AppError> {
-        if fill.is_some_and(|fill| value.to_bits() == f64::from(fill).to_bits()) || value.is_nan() {
-            return Ok(f64::NAN);
-        }
-        if !value.is_finite() {
-            return Err(AppError::Invalid(format!(
-                "{name} contains an infinite value at node {node}{}",
-                layer.map_or_else(String::new, |layer| format!(", layer {layer}")),
-            )));
-        }
-        Ok(value)
-    };
-    let mut layer_depths = vec![0.0; source.source_layer_count];
-    for time in 0..time_count {
-        for element in 0..element_count {
-            if wet_cells[time * element_count + element].to_bits() != 1.0_f64.to_bits() {
-                continue;
-            }
-            let nodes = source_element_nodes[element];
-            let local_nodes = local_element_nodes[element];
-            let mut geometry_valid = true;
-            for (layer, layer_depth) in layer_depths.iter_mut().enumerate() {
-                let mut total = 0.0;
-                for vertex in 0..3 {
-                    let node = nodes[vertex];
-                    let sigma = static_value(
-                        "siglay",
-                        source.node_sigma[layer * node_count + node],
-                        source.sigma_fill,
-                        node,
-                        Some(layer),
-                    )?;
-                    let bathymetry = static_value(
-                        "h",
-                        source.node_bathymetry[node],
-                        source.bathymetry_fill,
-                        node,
-                        None,
-                    )?;
-                    let surface = zeta[time * selected_nodes.len() + local_nodes[vertex]];
-                    if !sigma.is_finite() || !bathymetry.is_finite() || !surface.is_finite() {
-                        geometry_valid = false;
-                        break;
-                    }
-                    total += -sigma * (bathymetry + surface);
-                }
-                *layer_depth = total / 3.0;
-            }
-            if !geometry_valid
-                || layer_depths
-                    .windows(2)
-                    .any(|pair| !pair[0].is_finite() || pair[1] <= pair[0])
-            {
-                continue;
-            }
-            for (depth_position, target) in depths.iter().copied().enumerate() {
-                let Some(lower_layer) = layer_depths
-                    .windows(2)
-                    .position(|pair| target >= pair[0] && target <= pair[1])
-                else {
-                    continue;
-                };
-                let upper_layer = lower_layer + 1;
-                let lower_depth = layer_depths[lower_layer];
-                let weight = (target - lower_depth) / (layer_depths[upper_layer] - lower_depth);
-                let lower_series = lower_layer * element_count + element;
-                let upper_series = upper_layer * element_count + element;
-                let source_row = time * native_series_count;
-                let u0 = eastward[source_row + lower_series];
-                let u1 = eastward[source_row + upper_series];
-                let v0 = northward[source_row + lower_series];
-                let v1 = northward[source_row + upper_series];
-                let interpolated = if target.to_bits() == lower_depth.to_bits() {
-                    u0.is_finite()
-                        .then_some((u0, v0))
-                        .filter(|(_, v)| v.is_finite())
-                } else if target.to_bits() == layer_depths[upper_layer].to_bits() {
-                    u1.is_finite()
-                        .then_some((u1, v1))
-                        .filter(|(_, v)| v.is_finite())
-                } else if u0.is_finite() && u1.is_finite() && v0.is_finite() && v1.is_finite() {
-                    Some((u0 + weight * (u1 - u0), v0 + weight * (v1 - v0)))
-                } else {
-                    None
-                };
-                let Some((interpolated_u, interpolated_v)) = interpolated else {
-                    continue;
-                };
-                let destination = time * element_count + element;
-                let chunk = &mut chunks[depth_position];
-                chunk.eastward[destination] = interpolated_u;
-                chunk.northward[destination] = interpolated_v;
-                chunk.observation_counts[element] += 1;
-            }
+    for (depth_position, chunk) in chunks.iter_mut().enumerate() {
+        chunk.observation_counts.extend_from_slice(
+            &accumulated.observation_counts
+                [depth_position * element_count..(depth_position + 1) * element_count],
+        );
+        for time in 0..time_count {
+            let source_start = time * row_width + depth_position * element_count;
+            let destination_start = time * element_count;
+            chunk.eastward[destination_start..destination_start + element_count]
+                .copy_from_slice(&eastward[source_start..source_start + element_count]);
+            chunk.northward[destination_start..destination_start + element_count]
+                .copy_from_slice(&northward[source_start..source_start + element_count]);
         }
     }
     Ok(chunks)
+}
+
+fn read_fixed_depth_current_block(
+    variable: &Variable<'_>,
+    time_count: usize,
+    all_layers: &[usize],
+    selected_elements: &[usize],
+    native_series_count: usize,
+) -> Result<FixedDepthFloatBlock, AppError> {
+    let contiguous_elements = selected_elements
+        .windows(2)
+        .all(|pair| pair[1] == pair[0] + 1);
+    let complete_layers = all_layers.iter().copied().eq(0..all_layers.len());
+    if contiguous_elements && complete_layers {
+        let extents = (
+            ..,
+            ..,
+            selected_elements[0]..selected_elements[selected_elements.len() - 1] + 1,
+        );
+        let values = if variable.vartype() == NcVariableType::Float(FloatType::F32) {
+            FixedDepthFloatBlock::F32(variable.get_values::<f32, _>(extents)?)
+        } else {
+            FixedDepthFloatBlock::F64(variable.get_values::<f64, _>(extents)?)
+        };
+        let expected = time_count.checked_mul(native_series_count).ok_or_else(|| {
+            AppError::Invalid("fixed-depth current shape exceeds usize".to_owned())
+        })?;
+        if values.len() != expected {
+            return Err(AppError::Invalid(format!(
+                "fixed-depth current read returned {} values; expected {expected}",
+                values.len()
+            )));
+        }
+        return Ok(values);
+    }
+    read_selected_layer_element_time_major(
+        variable,
+        time_count,
+        all_layers,
+        selected_elements,
+        0..native_series_count,
+    )
+    .map(FixedDepthFloatBlock::F64)
+}
+
+fn read_sorted_time_major_bounded_span(
+    variable: &Variable<'_>,
+    time_count: usize,
+    selected_indices: &[usize],
+) -> Result<FixedDepthFloatBlock, AppError> {
+    if selected_indices.is_empty() || selected_indices.windows(2).any(|pair| pair[1] <= pair[0]) {
+        return Err(AppError::Invalid(
+            "bounded-span input indices must be non-empty and increasing".to_owned(),
+        ));
+    }
+    let source_start = selected_indices[0];
+    let source_end = selected_indices[selected_indices.len() - 1]
+        .checked_add(1)
+        .ok_or_else(|| AppError::Invalid("bounded-span input end overflows".to_owned()))?;
+    let span = source_end - source_start;
+    if span
+        <= selected_indices
+            .len()
+            .saturating_mul(FIXED_DEPTH_ZETA_SPAN_AMPLIFICATION)
+    {
+        if variable.vartype() == NcVariableType::Float(FloatType::F32) {
+            let source = variable.get_values::<f32, _>((.., source_start..source_end))?;
+            return compact_bounded_span_values(
+                source,
+                time_count,
+                span,
+                source_start,
+                selected_indices,
+            )
+            .map(FixedDepthFloatBlock::F32);
+        }
+        let source = variable.get_values::<f64, _>((.., source_start..source_end))?;
+        return compact_bounded_span_values(
+            source,
+            time_count,
+            span,
+            source_start,
+            selected_indices,
+        )
+        .map(FixedDepthFloatBlock::F64);
+    }
+    read_selected_time_major(variable, time_count, selected_indices).map(FixedDepthFloatBlock::F64)
+}
+
+fn compact_bounded_span_values<T: Copy>(
+    mut source: Vec<T>,
+    time_count: usize,
+    span: usize,
+    source_start: usize,
+    selected_indices: &[usize],
+) -> Result<Vec<T>, AppError> {
+    let source_value_count = time_count
+        .checked_mul(span)
+        .ok_or_else(|| AppError::Invalid("bounded-span source shape exceeds usize".to_owned()))?;
+    if source.len() != source_value_count {
+        return Err(AppError::Invalid(format!(
+            "bounded-span read returned {} values; expected {source_value_count}",
+            source.len()
+        )));
+    }
+    if span == selected_indices.len() {
+        return Ok(source);
+    }
+    let value_count = time_count
+        .checked_mul(selected_indices.len())
+        .ok_or_else(|| AppError::Invalid("bounded-span input shape exceeds usize".to_owned()))?;
+    for time in 0..time_count {
+        for (destination, index) in selected_indices.iter().copied().enumerate() {
+            source[time * selected_indices.len() + destination] =
+                source[time * span + index - source_start];
+        }
+    }
+    source.truncate(value_count);
+    Ok(source)
+}
+
+fn read_fixed_depth_wet_block(
+    variable: &Variable<'_>,
+    source_time_count: usize,
+    selected_elements: &[usize],
+    retained_time_indices: &[usize],
+    fill_value: Option<i32>,
+) -> Result<Vec<u8>, AppError> {
+    let contiguous = selected_elements
+        .windows(2)
+        .all(|pair| pair[1] == pair[0] + 1);
+    if contiguous && variable.vartype() == NcVariableType::Int(IntType::I32) {
+        let values = variable.get_values::<i32, _>((
+            ..,
+            selected_elements[0]..selected_elements[selected_elements.len() - 1] + 1,
+        ))?;
+        let values = retain_time_major_rows(
+            values,
+            source_time_count,
+            selected_elements.len(),
+            retained_time_indices,
+        )?;
+        return values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                if fill_value == Some(value) || value == 0 {
+                    Ok(0)
+                } else if value == 1 {
+                    Ok(1)
+                } else {
+                    Err(AppError::Invalid(format!(
+                        "wet_cells must contain only 0, 1, or its missing value; received {value} at selected element {}, retained time {}",
+                        index % selected_elements.len(),
+                        index / selected_elements.len(),
+                    )))
+                }
+            })
+            .collect();
+    }
+    let values = read_selected_time_major(variable, source_time_count, selected_elements)?;
+    let values = retain_time_major_rows(
+        values,
+        source_time_count,
+        selected_elements.len(),
+        retained_time_indices,
+    )?;
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            if fill_value.is_some_and(|fill| value.to_bits() == f64::from(fill).to_bits())
+                || value.is_nan()
+                || value.to_bits() == 0.0_f64.to_bits()
+            {
+                Ok(0)
+            } else if value.to_bits() == 1.0_f64.to_bits() {
+                Ok(1)
+            } else {
+                Err(AppError::Invalid(format!(
+                    "wet_cells must contain only 0, 1, or its missing value; received {value} at selected element {}, retained time {}",
+                    index % selected_elements.len(),
+                    index / selected_elements.len(),
+                )))
+            }
+        })
+        .collect()
 }
 
 fn read_selected_layer_element_time_major(
@@ -4996,6 +5462,7 @@ fn write_vector_reconstruction_variables(
 mod tests {
     use std::fs;
 
+    use rayon::ThreadPoolBuilder;
     use rutide_core::{
         FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections,
         PhaseReference, ReconstructionFilter, RobustOptions, TidalConstituent,
@@ -5004,10 +5471,21 @@ mod tests {
 
     use super::{
         AnalysisMethod, ConfidenceInterval, ConstituentOrder, ConstituentSelection, NodeSelection,
-        VectorAnalyzeConfig, VectorInferenceConfig, analyze_vector,
+        VectorAnalyzeConfig, VectorInferenceConfig, analyze_vector, compact_bounded_span_values,
         read_fvcom_fixed_depth_element_chunk, read_fvcom_vector, read_fvcom_vector_metadata,
         temporary_sibling,
     };
+
+    #[test]
+    fn bounded_span_compaction_preserves_later_time_rows() {
+        let selected_indices = [2, 4, 7];
+        let source = (0..3)
+            .flat_map(|time| (2..8).map(move |index| time * 100 + index))
+            .collect::<Vec<_>>();
+        let compacted = compact_bounded_span_values(source, 3, 6, 2, &selected_indices)
+            .expect("compact bounded time-major span");
+        assert_eq!(compacted, [2, 4, 7, 102, 104, 107, 202, 204, 207]);
+    }
 
     #[test]
     #[allow(
@@ -5140,6 +5618,10 @@ mod tests {
         dataset.close().expect("close fixed-depth fixture");
 
         let source = netcdf::open(&input_path).expect("open fixed-depth fixture");
+        let interpolation_pool = ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("build interpolation pool");
         let metadata = read_fvcom_vector_metadata(
             &input_path,
             &source,
@@ -5148,8 +5630,9 @@ mod tests {
             Some(&[8.0, 12.0]),
         )
         .expect("read fixed-depth metadata");
-        let chunks = read_fvcom_fixed_depth_element_chunk(&source, &metadata, 0..2)
-            .expect("interpolate fixed depths");
+        let chunks =
+            read_fvcom_fixed_depth_element_chunk(&source, &metadata, 0..2, &interpolation_pool)
+                .expect("interpolate fixed depths");
         assert_eq!(chunks.len(), 2);
         for (depth_position, target) in [8.0_f64, 12.0].into_iter().enumerate() {
             let chunk = &chunks[depth_position];
@@ -5196,8 +5679,13 @@ mod tests {
             Some(&[10.0]),
         )
         .expect("read exact-layer fixed-depth metadata");
-        let exact = read_fvcom_fixed_depth_element_chunk(&source, &exact_metadata, 0..2)
-            .expect("interpolate exact layer depth");
+        let exact = read_fvcom_fixed_depth_element_chunk(
+            &source,
+            &exact_metadata,
+            0..2,
+            &interpolation_pool,
+        )
+        .expect("interpolate exact layer depth");
         assert_eq!(exact[0].observation_counts, [71, 70]);
         assert!(exact[0].eastward[0].is_finite());
         drop(source);

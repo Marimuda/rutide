@@ -1,10 +1,12 @@
 # Fixed-physical-depth FVCOM currents — 2026-09-02
 
 This snapshot validates and measures schema-v13 interpolation of FVCOM native
-sigma-layer currents to physical depths below the instantaneous free surface. It
-uses the 25,778,391,080-byte `frs2f_0001.nc` fixture with 745 hourly records, 10
-native layers, 144,860 elements, and 75,160 nodes on the repository's dual AMD
-EPYC 7713 host. Rust was built in release mode with thin LTO, one codegen unit,
+sigma-layer currents to physical depths below the instantaneous free surface.
+It records both the initial implementation and the subsequent typed-I/O and
+parallel-interpolation optimization. The fixture is the 25,778,391,080-byte
+`frs2f_0001.nc` file with 745 hourly records, 10 native layers, 144,860
+elements, and 75,160 nodes on the repository's dual AMD EPYC 7713 host. Rust
+was built in release mode with thin LTO, one codegen unit,
 `-C target-cpu=native`, NetCDF-C 4.8.1, and mimalloc. Runs used 64 workers and
 five explicit constituents (`M2,S2,N2,K1,O1`), a mean and trend, Greenwich
 phases, exact nodal corrections, ordinary least squares, and no confidence
@@ -14,11 +16,12 @@ These are single unisolated, warm-cache observations. They characterize the
 implementation and memory/runtime tradeoff on this machine; differences of a
 few percent should not be treated as a distributional claim.
 
-The implementation parent was `d465b36`; this document and the fixed-depth
-changes are committed together. The host exposed 128 physical cores in one NUMA
-node and 251 GiB RAM. CPU affinity was not fixed.
+The initial implementation parent was `d465b36` and its committed result was
+`d2f362f`. The optimization uses `d2f362f` as its parent; this document and the
+optimization are committed together. The host exposed 128 physical cores in
+one NUMA node and 251 GiB RAM. CPU affinity was not fixed.
 
-The measured throughput command was:
+The initial tuned throughput command was:
 
 ```console
 /usr/bin/time -v target/release/rutide analyze-vector \
@@ -29,10 +32,12 @@ The measured throughput command was:
   --workers 64 --chunk-series 16384 --overwrite
 ```
 
-Omitting `--chunk-series 16384` produced the automatic-memory row below. The
-real-file correctness output used `--element-count 32 --depths 100,500` and was
-checked with `python -m rutide_baseline.compare_vector` from the locked
-`benchmarks/python` environment.
+The optimized host-throughput run changed `--chunk-series` to `144860`, keeping
+the full field in one block. Omitting `--chunk-series` produced the respective
+automatic-memory rows below. The real-file correctness output used
+`--element-count 32 --depths 100,500` and was checked with
+`python -m rutide_baseline.compare_vector` from the locked `benchmarks/python`
+environment.
 
 ## Scientific correctness
 
@@ -62,9 +67,10 @@ The synthetic integration fixture separately covers time-varying surface
 elevation, horizontally varying sigma coordinates, exact layer-centre matches,
 missing bracket currents and geometry, dry cells, unavailable output rows,
 out-of-order ragged robust diagnostics, reconstruction, and chunk-invariant
-digests.
+digests. A separate non-contiguous real-file selection of elements 0, 16, and
+31 exercised the sparse gather fallback and also passed the Python oracle.
 
-## Full-field 10 m result
+## Initial full-field 10 m result
 
 At 10 m, 131,557 of the rectangular 144,860 element coordinates had enough
 physical samples for the five-constituent model. The other 13,303 coordinates
@@ -95,10 +101,54 @@ now consume 94.2% of the optimized internal total, so future acceleration belong
 in classic-NetCDF access and interpolation layout rather than the harmonic
 kernel.
 
+## Typed-I/O and interpolation optimization
+
+The follow-up implements that identified target without changing schema or
+scientific semantics:
+
+- contiguous element blocks read each complete `u` and `v` time-layer-element
+  hyperslab once instead of issuing one NetCDF request per layer and component;
+- native `f32` currents and free-surface values remain `f32` while resident and
+  are promoted only when the interpolation kernel consumes them;
+- zeta nodes are read through one bounded contiguous span and compacted in
+  place, while `i32` wet cells compact to `u8`;
+- selected static sigma and bathymetry geometry is prepared once; and
+- independent time rows interpolate in the configured Rayon worker pool while
+  preserving the original floating-point operation order.
+
+The automatic planner now includes typed current buffers, a conservative
+sixfold zeta-span bound, the wet-mask conversion, and parallel interpolation
+outputs in its 512 MiB observation budget. Static geometry remains outside that
+reported observation-buffer quantity. All optimized runs retained the exact
+canonical digest shown above.
+
+| Optimized profile | Elements/chunk | Chunks | Input (s) | Solve (s) | Result (s) | Output (s) | Internal total (s) | Process wall (s) | Peak RSS (KiB) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| automatic 512 MiB budget | 4,032 | 36 | 11.1129 | 3.2832 | 0.4222 | 0.2194 | 15.0833 | 15.17 | 796,596 |
+| `--chunk-series 16384` | 16,384 | 9 | 8.1310 | 3.2013 | 0.2916 | 0.1737 | 11.8384 | 11.92 | 2,311,464 |
+| `--chunk-series 32768` | 32,768 | 5 | 8.2057 | 2.9829 | 0.2538 | 0.1677 | 11.6609 | 11.76 | 4,055,668 |
+| `--chunk-series 65536` | 65,536 | 3 | 7.9470 | 2.8291 | 0.2553 | 0.1696 | 11.2386 | 11.35 | 7,040,816 |
+| full-domain `--chunk-series 144860` | 144,860 | 1 | 7.4821 | 3.0056 | 0.2100 | 0.1559 | 10.8878 | 10.96 | 11,157,136 |
+
+At the same 16,384-element block size, wall time fell from 62.84 s to 11.92 s
+(5.27x) and peak RSS fell 43.1%, from 4,062,200 KiB to 2,311,464 KiB. The
+corrected portable automatic mode fell from 74.00 s to 15.17 s (4.88x) while
+also slightly reducing measured peak RSS. On this high-memory host, one
+full-domain block avoids the remaining repeated NetCDF requests and reaches
+10.96 s: 5.73x faster than the initial tuned application and 8.1% faster than
+the optimized 16,384-element profile, at a 10.64 GiB peak. Its reported
+18,994,043,200-byte observation-buffer bound is intentionally conservative.
+
+Using all 128 exposed workers with the full-domain block took 11.14 s versus
+10.96 s with 64 workers; the extra scheduling and reduction overhead did not
+repay itself. The measured host recommendation is therefore 64 workers and one
+full-domain block when roughly 11 GiB of free memory is available. The
+automatic mode remains the portable recommendation.
+
 ## Python baseline interpretation
 
 Python UTide does not provide FVCOM fixed-physical-depth preprocessing, so there
-is no honest like-for-like Python application timer to divide into the 62.84 s
+is no honest like-for-like Python application timer to divide into the 10.96 s
 Rust result. Correctness is instead established by independent Python
 interpolation followed by the pinned solver, as described above.
 
@@ -106,7 +156,8 @@ For scale only, the retained depth-averaged five-constituent Python run processe
 the same 745-point vector fits at about 1,250 elements/s. Applying that already
 measured solver rate to the 131,557 fitted 10 m series implies roughly 105 s for
 Python UTide fitting alone, before any fixed-depth interpolation or full NetCDF
-output. RUTide's matched harmonic stage is 33.9x faster by this throughput
-comparison. This is deliberately not labeled an end-to-end fixed-depth speedup;
-the 62.84 s Rust application is currently limited by work that Python UTide does
-not implement.
+output. RUTide's matched harmonic stage remains 33.9x faster by this throughput
+comparison. The complete optimized Rust application is also about 9.6x faster
+than that estimated Python fitting time alone, but this is deliberately not
+labeled a like-for-like end-to-end speedup because Python UTide does not
+implement the FVCOM preprocessing.

@@ -280,7 +280,11 @@ combinations must be rejected during validation rather than partially applied.
   frozen scientific contract and focused fixture are in
   `FIXED_DEPTH_INTERPOLATION.md`; real-file correctness and full-domain resource
   measurements are retained in
-  `benchmarks/results/fixed-depth-fvcom-2026-09-02.md`.
+  `benchmarks/results/fixed-depth-fvcom-2026-09-02.md`. Typed whole-block current
+  reads, bounded zeta reads, compact wet masks, prepared geometry, and parallel
+  interpolation reduce the full-field 10 m run from 62.84 s to 10.96 s on the
+  benchmark host while preserving the canonical digest and Python-oracle
+  result.
 - The pre-1.0 Rust API, NetCDF/JSON schema, and digest stability contracts are
   documented in `COMPATIBILITY.md`; compiled schema constants are checked
   against the versioned machine-readable feature matrix.

@@ -2177,12 +2177,12 @@ fn read_fvcom_time_axis(
     ))
 }
 
-fn retain_time_major_rows(
-    mut values: Vec<f64>,
+fn retain_time_major_rows<T: Copy>(
+    mut values: Vec<T>,
     source_time_count: usize,
     series_count: usize,
     retained_time_indices: &[usize],
-) -> Result<Vec<f64>, AppError> {
+) -> Result<Vec<T>, AppError> {
     let expected = source_time_count
         .checked_mul(series_count)
         .ok_or_else(|| AppError::Invalid("source observation shape exceeds usize".to_owned()))?;

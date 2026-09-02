@@ -61,9 +61,17 @@ reconstruction uses `(time, depth, element)`. `depth` has units `m`,
 `positive="down"`, and the instantaneous-free-surface reference is explicit in
 global metadata. `element_index` preserves the requested source order.
 
-Input is processed in bounded element blocks. Each block reads every native
-source layer once, computes all requested depths, and then solves each target
-slice. Consequently, requesting additional depths increases interpolation,
-solver, and output work but does not reread the expensive native `u`/`v` block.
-Results use the same incremental, transactional NetCDF path as native sigma
-layers.
+Input is processed in bounded element blocks. A contiguous block reads each
+complete `u` and `v` time-layer-element hyperslab with one NetCDF request,
+retains native `f32` storage until values enter the `f64` interpolation kernel,
+and computes time rows in parallel. Nodal `zeta` uses a bounded contiguous span
+when the span is no more than six times the selected-node count; otherwise it
+falls back to sparse gathers. Wet cells are compacted to a byte mask. Sparse
+element selections retain the general gather path.
+
+Each block reads every native source layer once, computes all requested depths,
+and then solves each target slice. Consequently, requesting additional depths
+increases interpolation, solver, and output work but does not reread the
+expensive native `u`/`v` block. The automatic memory planner conservatively
+accounts for the bounded zeta span and typed source buffers. Results use the
+same incremental, transactional NetCDF path as native sigma layers.

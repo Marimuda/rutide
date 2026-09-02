@@ -437,6 +437,9 @@ semantics are in
 Real-file Python-oracle correctness and full-domain 10 m performance are
 recorded in
 [`benchmarks/results/fixed-depth-fvcom-2026-09-02.md`](benchmarks/results/fixed-depth-fvcom-2026-09-02.md).
+On the documented 251 GiB host, 64 workers with one 144,860-element block
+completed that 144,860-series product in 10.96 s at a 10.64 GiB peak; omit
+`--chunk-series` to retain the portable automatic-memory profile.
 
 Vertically resolved results are written incrementally to a temporary NetCDF file
 and atomically installed only after all chunks and the canonical digest complete.
