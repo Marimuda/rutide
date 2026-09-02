@@ -135,7 +135,8 @@ The local `UTide/` checkout is deliberately ignored. It is the pinned Python
 behavioral oracle described in the benchmark plan, not vendored RUTide source.
 Large FVCOM data and generated benchmark results also remain outside Git.
 
-The completed compatibility surface and remaining scientific, interface, and
+The public compatibility contracts and machine-readable feature status are in
+[`COMPATIBILITY.md`](COMPATIBILITY.md); remaining scientific, interface, and
 resource tasks are tracked in [`ROADMAP.md`](ROADMAP.md). Irregular scalar and
 vector colored confidence use Lomb–Scargle residual spectra, robust fitting and
 Monte Carlo confidence are complete. Scalar and coupled-vector inferred

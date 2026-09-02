@@ -28,10 +28,21 @@ use sha2::{Digest, Sha256};
 
 mod vector;
 
-pub use vector::{VectorAnalyzeConfig, VectorRunReport, VectorSampleResult, analyze_vector};
+pub use vector::{
+    VECTOR_OUTPUT_SCHEMA_VERSION, VectorAnalyzeConfig, VectorRunReport, VectorSampleResult,
+    analyze_vector,
+};
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
-const OUTPUT_SCHEMA_VERSION: u32 = 15;
+/// `NetCDF` and JSON report schema emitted by scalar analyses.
+pub const SCALAR_OUTPUT_SCHEMA_VERSION: u32 = 15;
+/// Schema version of the embedded machine-readable compatibility matrix.
+pub const FEATURE_MATRIX_SCHEMA_VERSION: u32 = 1;
+/// Machine-readable feature and Python-oracle compatibility status.
+pub const FEATURE_MATRIX_JSON: &str = include_str!("../../../compatibility/feature-matrix-v1.json");
+/// JSON Schema describing [`FEATURE_MATRIX_JSON`].
+pub const FEATURE_MATRIX_SCHEMA_JSON: &str =
+    include_str!("../../../compatibility/feature-matrix.schema.json");
 const DEFAULT_OBSERVATION_CHUNK_BYTES: usize = 512 * 1024 * 1024;
 /// Backward-compatible benchmark constituent set used when none is specified.
 pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
@@ -1326,7 +1337,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         .as_secs();
 
     let report = RunReport {
-        schema_version: OUTPUT_SCHEMA_VERSION,
+        schema_version: SCALAR_OUTPUT_SCHEMA_VERSION,
         created_unix_seconds,
         rutide_version: rutide_core::VERSION,
         profile: selection.profile(
@@ -2742,7 +2753,10 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         output.add_dimension("time", modified_julian_days.len())?;
     }
     output.add_attribute("title", "RUTide scalar harmonic coefficients")?;
-    output.add_attribute("rutide_schema_version", i64::from(OUTPUT_SCHEMA_VERSION))?;
+    output.add_attribute(
+        "rutide_schema_version",
+        i64::from(SCALAR_OUTPUT_SCHEMA_VERSION),
+    )?;
     output.add_attribute("rutide_version", rutide_core::VERSION)?;
     output.add_attribute(
         "source_time_count",
@@ -3397,15 +3411,73 @@ mod tests {
     use std::fs;
 
     use super::{
-        ConstituentOrder, NodeSelection, ScalarInferenceConfig, constituent_order_indices,
-        encode_hex, normalize_source_observation, read_fvcom_scalar, resolve_node_selection,
+        ConstituentOrder, FEATURE_MATRIX_JSON, FEATURE_MATRIX_SCHEMA_JSON,
+        FEATURE_MATRIX_SCHEMA_VERSION, NodeSelection, SCALAR_OUTPUT_SCHEMA_VERSION,
+        ScalarInferenceConfig, VECTOR_OUTPUT_SCHEMA_VERSION, constituent_order_indices, encode_hex,
+        normalize_source_observation, read_fvcom_scalar, resolve_node_selection,
         spatial_chunk_plan, summarize_sampling, temporary_sibling, write_inference_metadata,
         write_reconstruction_variables, write_sampling_diagnostics,
     };
     use rutide_core::{
-        Constituent, GreenwichNodalOls, InferenceMode, LinearConfidence, ReconstructionFilter,
-        SamplingDiagnosticsPlan, ScalarInferenceRelation, ScalarSolution, TidalConstituent,
+        CATALOG_ORACLE_REVISION, Constituent, GreenwichNodalOls, InferenceMode, LinearConfidence,
+        ReconstructionFilter, SamplingDiagnosticsPlan, ScalarInferenceRelation, ScalarSolution,
+        TidalConstituent,
     };
+    use serde_json::Value;
+
+    #[test]
+    fn embedded_feature_matrix_matches_compiled_contracts() {
+        let matrix: Value =
+            serde_json::from_str(FEATURE_MATRIX_JSON).expect("valid feature matrix");
+        let schema: Value =
+            serde_json::from_str(FEATURE_MATRIX_SCHEMA_JSON).expect("valid feature matrix schema");
+        assert_eq!(
+            schema["properties"]["matrix_schema_version"]["const"],
+            Value::from(FEATURE_MATRIX_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            matrix["matrix_schema_version"],
+            Value::from(FEATURE_MATRIX_SCHEMA_VERSION)
+        );
+        assert_eq!(matrix["project_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(matrix["python_oracle"]["revision"], CATALOG_ORACLE_REVISION);
+        assert_eq!(
+            matrix["contracts"]["netcdf"]["scalar_schema_version"],
+            Value::from(SCALAR_OUTPUT_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            matrix["contracts"]["netcdf"]["vector_schema_version"],
+            Value::from(VECTOR_OUTPUT_SCHEMA_VERSION)
+        );
+
+        let features = matrix["features"].as_array().expect("feature array");
+        let ids = features
+            .iter()
+            .map(|feature| feature["id"].as_str().expect("feature id"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            ids.len(),
+            features.len(),
+            "feature identifiers must be unique"
+        );
+        assert!(ids.contains("harmonic-ols"));
+        assert!(ids.contains("fvcom-sigma-layer-currents"));
+        assert!(ids.contains("incremental-result-output"));
+
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for feature in features {
+            let support = feature["support"].as_str().expect("support status");
+            assert!(matches!(support, "supported" | "planned" | "not-planned"));
+            let evidence = feature["evidence"].as_array().expect("evidence array");
+            if support == "supported" {
+                assert!(!evidence.is_empty(), "supported feature requires evidence");
+            }
+            for path in evidence {
+                let path = path.as_str().expect("evidence path");
+                assert!(workspace.join(path).exists(), "missing evidence: {path}");
+            }
+        }
+    }
 
     #[test]
     fn selection_preserves_explicit_order() {

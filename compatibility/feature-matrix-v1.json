@@ -1,0 +1,241 @@
+{
+  "$schema": "./feature-matrix.schema.json",
+  "matrix_schema_version": 1,
+  "project_version": "0.1.0",
+  "last_reviewed": "2026-09-02",
+  "python_oracle": {
+    "implementation": "UTide",
+    "revision": "8fabe121752bc317931472a10a42e306715106de"
+  },
+  "contracts": {
+    "rust_api": {
+      "stability": "pre-1.0",
+      "rust_version": "1.98"
+    },
+    "netcdf": {
+      "scalar_schema_version": 15,
+      "vector_schema_version": 12
+    },
+    "json_report": {
+      "version_source": "matching-netcdf-schema"
+    },
+    "result_digest": {
+      "stability": "schema-and-profile"
+    }
+  },
+  "features": [
+    {
+      "id": "harmonic-ols",
+      "title": "Scalar and vector ordinary least squares",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar", "fvcom-vector"],
+      "parity": "python-oracle",
+      "evidence": ["crates/rutide-core/tests/python_oracle_fixed_raw.rs", "crates/rutide-core/tests/python_oracle_greenwich_nodal.rs"]
+    },
+    {
+      "id": "mean-and-trend",
+      "title": "Optional mean and linear trend",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar", "fvcom-vector"],
+      "parity": "python-oracle",
+      "evidence": ["crates/rutide-core/tests/python_oracle_greenwich_nodal.rs"]
+    },
+    {
+      "id": "constituent-catalog",
+      "title": "Generated 146-constituent base and shallow-water catalog",
+      "support": "supported",
+      "scopes": ["core"],
+      "parity": "python-oracle",
+      "evidence": ["crates/rutide-core/src/catalog_generated.rs"]
+    },
+    {
+      "id": "rayleigh-selection",
+      "title": "Record-length-based Rayleigh constituent selection",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar", "fvcom-vector"],
+      "parity": "python-oracle",
+      "evidence": ["crates/rutide-core/src/selection.rs"]
+    },
+    {
+      "id": "phase-references",
+      "title": "Greenwich, midpoint-linearized, and raw phase references",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar", "fvcom-vector"],
+      "parity": "python-oracle",
+      "evidence": ["crates/rutide-core/tests/python_oracle_greenwich_nodal.rs"]
+    },
+    {
+      "id": "nodal-corrections",
+      "title": "Exact, midpoint-linearized, and disabled nodal corrections",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar", "fvcom-vector"],
+      "parity": "python-oracle",
+      "evidence": ["crates/rutide-core/tests/python_oracle_greenwich_nodal.rs"]
+    },
+    {
+      "id": "missing-observations",
+      "title": "Per-series scalar and joint-component vector missing masks",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar", "fvcom-vector"],
+      "parity": "python-oracle",
+      "evidence": ["crates/rutide-core/tests/python_oracle_greenwich_nodal.rs"]
+    },
+    {
+      "id": "irregular-time",
+      "title": "Irregular and gappy least-squares fits",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar", "fvcom-vector"],
+      "parity": "python-oracle",
+      "evidence": ["crates/rutide-core/tests/python_oracle_greenwich_nodal.rs"]
+    },
+    {
+      "id": "colored-confidence-fft",
+      "title": "Regular and gappy-grid FFT colored confidence",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar", "fvcom-vector"],
+      "parity": "python-oracle",
+      "evidence": ["crates/rutide-core/tests/python_oracle_greenwich_nodal.rs"]
+    },
+    {
+      "id": "colored-confidence-lomb-scargle",
+      "title": "Irregular-time Lomb-Scargle colored confidence",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar", "fvcom-vector"],
+      "parity": "python-oracle",
+      "evidence": ["benchmarks/results/irregular-confidence-2026-09-01.md"]
+    },
+    {
+      "id": "linear-confidence",
+      "title": "Linearized scalar and vector confidence intervals",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar", "fvcom-vector"],
+      "parity": "python-oracle",
+      "evidence": ["crates/rutide-core/tests/python_oracle_greenwich_nodal.rs"]
+    },
+    {
+      "id": "monte-carlo-confidence",
+      "title": "Seeded covariance-sampling confidence intervals",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar", "fvcom-vector"],
+      "parity": "rust-extension",
+      "evidence": ["benchmarks/results/monte-carlo-confidence-2026-09-01.md"],
+      "limitations": ["Python UTide does not expose a complete executable oracle for every Monte Carlo path"]
+    },
+    {
+      "id": "robust-fitting",
+      "title": "Cauchy iteratively reweighted least squares",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar", "fvcom-vector"],
+      "parity": "python-oracle",
+      "evidence": ["benchmarks/results/robust-fitting-2026-09-01.md"]
+    },
+    {
+      "id": "scalar-inference",
+      "title": "Exact and approximate scalar inferred constituents",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar"],
+      "parity": "python-oracle",
+      "evidence": ["crates/rutide-core/tests/python_oracle_inference.rs"]
+    },
+    {
+      "id": "vector-inference",
+      "title": "Exact and approximate rotary vector inference",
+      "support": "supported",
+      "scopes": ["core", "fvcom-vector"],
+      "parity": "python-oracle",
+      "evidence": ["crates/rutide-core/tests/python_oracle_inference.rs"]
+    },
+    {
+      "id": "inference-monte-carlo",
+      "title": "Shared-reference Monte Carlo inference propagation",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar", "fvcom-vector"],
+      "parity": "rust-extension",
+      "evidence": ["benchmarks/results/inferred-monte-carlo-2026-09-02.md"]
+    },
+    {
+      "id": "diagnostic-ranking",
+      "title": "Percent energy, SNR, and stable constituent presentation ranking",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar", "fvcom-vector", "output"],
+      "parity": "python-oracle",
+      "evidence": ["crates/rutide-core/tests/python_oracle_greenwich_nodal.rs"]
+    },
+    {
+      "id": "reconstruction",
+      "title": "Filtered scalar and vector tidal reconstruction",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar", "fvcom-vector", "output"],
+      "parity": "python-oracle",
+      "evidence": ["crates/rutide-core/tests/python_oracle_greenwich_nodal.rs"]
+    },
+    {
+      "id": "time-epochs",
+      "title": "Validated MJD, Python ordinal, Unix, and civil-time normalization",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar", "fvcom-vector"],
+      "parity": "python-oracle",
+      "evidence": ["crates/rutide-core/src/time.rs"]
+    },
+    {
+      "id": "fvcom-surface-elevation",
+      "title": "FVCOM zeta(time,node) application",
+      "support": "supported",
+      "scopes": ["fvcom-scalar", "output"],
+      "parity": "python-oracle",
+      "evidence": ["benchmarks/results/fvcom-scalar-application-2026-08-31.md"]
+    },
+    {
+      "id": "fvcom-depth-averaged-currents",
+      "title": "FVCOM ua/va depth-averaged currents",
+      "support": "supported",
+      "scopes": ["fvcom-vector", "output"],
+      "parity": "python-oracle",
+      "evidence": ["benchmarks/results/fvcom-vector-application-2026-09-01.md"]
+    },
+    {
+      "id": "fvcom-sigma-layer-currents",
+      "title": "FVCOM u/v native sigma-layer currents",
+      "support": "supported",
+      "scopes": ["fvcom-vector", "output"],
+      "parity": "python-oracle",
+      "evidence": ["benchmarks/results/depth-resolved-fvcom-2026-09-02.md"],
+      "limitations": ["Native terrain-following layers are not fixed physical depths"]
+    },
+    {
+      "id": "bounded-observation-chunks",
+      "title": "Bounded scalar and vector observation input",
+      "support": "supported",
+      "scopes": ["fvcom-scalar", "fvcom-vector"],
+      "parity": "not-applicable",
+      "evidence": ["benchmarks/results/spatial-chunking-2026-09-02.md"]
+    },
+    {
+      "id": "incremental-result-output",
+      "title": "Incremental result output for result-heavy layered fields",
+      "support": "planned",
+      "scopes": ["fvcom-vector", "output"],
+      "parity": "not-applicable",
+      "evidence": [],
+      "limitations": ["Current implementation retains compact results until one transactional NetCDF write"]
+    },
+    {
+      "id": "fixed-depth-currents",
+      "title": "Interpolation of native layers to fixed physical depths",
+      "support": "planned",
+      "scopes": ["fvcom-vector", "output"],
+      "parity": "not-applicable",
+      "evidence": [],
+      "limitations": ["Requires explicit wet/dry and moving-free-surface interpolation semantics"]
+    },
+    {
+      "id": "python-bindings",
+      "title": "Python extension bindings",
+      "support": "planned",
+      "scopes": ["python-api"],
+      "parity": "not-applicable",
+      "evidence": [],
+      "limitations": ["Will be added only for a demonstrated mixed Rust/Python workflow"]
+    }
+  ]
+}

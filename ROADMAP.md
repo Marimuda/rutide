@@ -272,10 +272,11 @@ combinations must be rejected during validation rather than partially applied.
   records in storage order, and a 96-series, three-layer real-FVCOM comparison
   passes the pinned Python UTide oracle. Fixed-physical-depth interpolation is
   intentionally separate from native terrain-following layers.
-- Stabilize the Rust library and NetCDF schemas, then add Python bindings only if
-  a drop-in or mixed Python/Rust workflow is an actual user requirement.
-- Publish reproducible release artifacts, compatibility documentation, and a
-  machine-readable feature matrix.
+- The pre-1.0 Rust API, NetCDF/JSON schema, and digest stability contracts are
+  documented in `COMPATIBILITY.md`; compiled schema constants are checked
+  against the versioned machine-readable feature matrix.
+- Add Python bindings only if a drop-in or mixed Python/Rust workflow is an
+  actual user requirement, and publish reproducible release artifacts.
 
 Bounded spatial input is complete. The default 512 MiB promoted-observation
 budget reduced the 64-worker vector peak RSS from 2.23 GiB to 0.94 GiB with a

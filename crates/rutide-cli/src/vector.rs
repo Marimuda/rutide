@@ -34,7 +34,8 @@ use super::{
     write_robust_schema_metadata, write_sampling_diagnostics, write_variable,
 };
 
-const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 12;
+/// `NetCDF` and JSON report schema emitted by vector-current analyses.
+pub const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 12;
 
 /// Configuration for one depth-averaged or native sigma-layer FVCOM current analysis.
 #[derive(Clone, Debug, PartialEq)]
