@@ -53,6 +53,108 @@ class Coefficient(Bunch):
             super().__setattr__(key, value)
 
 
+class CoefficientBatch(Bunch):
+    """Time-major multi-series coefficients returned by :func:`solve_many`."""
+
+    _fit: _native.BatchFit
+
+    def __init__(self, fit: _native.BatchFit) -> None:
+        values = _arrays_from_lists(fit.summary())
+        series = np.arange(fit.series_count, dtype=np.intp)
+        series.setflags(write=False)
+        values["series"] = series
+        values["dims"] = Bunch(
+            coefficients=("series", "constituent"),
+            frequency=("series", "constituent"),
+            ranking=("series", "presentation_rank"),
+            series=("series",),
+            robust_weights=("retained_time", "series"),
+        )
+        super().__init__(values)
+        object.__setattr__(self, "_fit", fit)
+
+    def __setattr__(self, key: str, value: Any) -> None:
+        if key == "_fit":
+            object.__setattr__(self, key, value)
+        else:
+            super().__setattr__(key, value)
+
+    def to_xarray(self) -> Any:
+        """Return an ``xarray.Dataset`` when the optional xarray package is installed."""
+
+        try:
+            import xarray as xr
+        except ImportError as error:
+            raise ImportError(
+                "CoefficientBatch.to_xarray() requires the optional xarray package"
+            ) from error
+
+        coordinates = {
+            "series": self.series,
+            "constituent": self.name,
+            "presentation_rank": np.arange(self.rank_index.shape[1], dtype=np.intp),
+            "retained_time": self.aux.time_position,
+        }
+        variables: dict[str, Any] = {
+            "frequency_cph": (self.dims.frequency, self.frequency_cph),
+            "rank_index": (self.dims.ranking, self.rank_index),
+            "latitude": (self.dims.series, self.aux.lat),
+            "nobs": (self.dims.series, self.nobs),
+            "reference_time_mjd": (self.dims.series, self.reference_time_mjd),
+        }
+        harmonic_fields = (
+            (
+                "semi_major",
+                "semi_minor",
+                "inclination_degrees",
+                "phase_degrees",
+                "semi_major_ci",
+                "semi_minor_ci",
+                "inclination_ci_degrees",
+                "phase_ci_degrees",
+                "percent_energy",
+                "signal_to_noise",
+            )
+            if self._fit.is_vector
+            else (
+                "amplitude",
+                "phase_degrees",
+                "amplitude_ci",
+                "phase_ci_degrees",
+                "percent_energy",
+                "signal_to_noise",
+            )
+        )
+        for name in harmonic_fields:
+            if self[name] is not None:
+                variables[name] = (self.dims.coefficients, self[name])
+        series_fields = (
+            ("umean", "vmean", "uslope", "vslope") if self._fit.is_vector else ("mean", "slope")
+        )
+        for name in series_fields:
+            variables[name] = (self.dims.series, self[name])
+        if self.robust is not None:
+            variables["robust_weight"] = (self.dims.robust_weights, self.weights)
+            variables["robust_leverage"] = (
+                self.dims.robust_weights,
+                self.robust.leverage,
+            )
+            for name in ("iterations", "residual_scale", "ols_rms_residual", "rms_residual"):
+                variables[f"robust_{name}"] = (self.dims.series, self.robust[name])
+        return xr.Dataset(
+            data_vars=variables,
+            coords=coordinates,
+            attrs={
+                "rutide_version": _native.__version__,
+                "method": self.method,
+                "confidence": self.confidence,
+                "phase_reference": self.phase_reference,
+                "nodal_corrections": self.nodal_corrections,
+                "trend": self.trend,
+            },
+        )
+
+
 class Tide(Bunch):
     """Scalar heights or vector currents returned by :func:`reconstruct`."""
 
@@ -98,48 +200,108 @@ def solve(
     if lat is None:
         raise ValueError("lat is required for astronomical and nodal corrections")
 
-    constituents = _constituent_selection(constit)
-    inferred, references, ratios, phase_offsets, approximate = _parse_inference(
-        infer, northward is not None
-    )
-    robust = dict(robust_kw or {})
-    robust_weight = str(_pop_alias(robust, "weight_function", "weight", "cauchy"))
-    robust_tuning = _optional_float(_pop_alias(robust, "tuning_constant", "tune", None))
-    robust_tolerance = float(_pop_alias(robust, "tolerance", "tol", 0.001))
-    robust_max_iterations = int(_pop_alias(robust, "max_iterations", "maxit", 50))
-    if robust:
-        unknown = ", ".join(sorted(robust))
-        raise TypeError(f"unknown robust_kw option(s): {unknown}")
-    if order_constit is None:
-        order_constit = "PE"
     fit = _native.solve(
         time_mjd,
         eastward,
         northward,
         float(lat),
-        constituents,
-        float(Rayleigh_min),
-        method,
-        "none" if conf_int is None else conf_int,
-        bool(white),
-        bool(trend),
-        phase,
-        _nodal_name(nodal),
-        int(MC_n),
-        int(MC_seed),
-        robust_weight,
-        robust_tuning,
-        robust_tolerance,
-        robust_max_iterations,
-        inferred,
-        references,
-        ratios,
-        phase_offsets,
-        approximate,
-        order_constit if isinstance(order_constit, str) else "explicit",
-        [] if isinstance(order_constit, str) else [str(name) for name in order_constit],
+        *_solver_arguments(
+            constit,
+            conf_int,
+            method,
+            trend,
+            phase,
+            nodal,
+            infer,
+            order_constit,
+            MC_n,
+            MC_seed,
+            robust_kw,
+            Rayleigh_min,
+            white,
+            northward is not None,
+        ),
     )
     return Coefficient(fit)
+
+
+def solve_many(
+    t: ArrayLike,
+    u: ArrayLike,
+    v: ArrayLike | None = None,
+    lat: float | ArrayLike | None = None,
+    *,
+    constit: Literal["auto"] | Sequence[str] | None = "auto",
+    conf_int: Literal["linear", "MC", "none"] | None = "linear",
+    method: Literal["ols", "robust"] = "ols",
+    trend: bool = True,
+    phase: Literal["Greenwich", "linear_time", "raw"] = "Greenwich",
+    nodal: bool | Literal["linear_time"] = True,
+    infer: Mapping[str, Any] | None = None,
+    order_constit: Literal["PE", "SNR", "frequency"] | Sequence[str] | None = "PE",
+    MC_n: int = 200,
+    MC_seed: int = 0,
+    robust_kw: Mapping[str, Any] | None = None,
+    Rayleigh_min: float = 1.0,
+    white: bool = False,
+    epoch: Epoch | None = None,
+    workers: int | None = None,
+    memory_limit_mb: float | None = 512.0,
+    verbose: bool = True,
+) -> CoefficientBatch:
+    """Fit multiple ``(time, series)`` scalar or vector series.
+
+    Astronomy, missing-value masks, irregular spectral plans, and worker setup
+    are shared inside Rust. ``memory_limit_mb`` bounds the temporary native
+    component buffer used by each solve chunk; it does not include the caller's
+    arrays, the one owned native input copy, or retained coefficient results.
+    """
+
+    del verbose
+    time_mjd = _time_to_mjd(t, epoch)
+    eastward = _as_matrix(u, "u")
+    northward = None if v is None else _as_matrix(v, "v")
+    if time_mjd.size != eastward.shape[0]:
+        raise ValueError("t length must match the first dimension of u")
+    if northward is not None and northward.shape != eastward.shape:
+        raise ValueError("u and v must have the same shape")
+    if lat is None:
+        raise ValueError("lat is required for astronomical and nodal corrections")
+    latitudes = _as_latitudes(lat, eastward.shape[1])
+    if workers is not None and int(workers) <= 0:
+        raise ValueError("workers must be greater than zero or None")
+    if memory_limit_mb is None:
+        memory_limit_bytes = None
+    else:
+        memory_limit_mb = float(memory_limit_mb)
+        if not np.isfinite(memory_limit_mb) or memory_limit_mb <= 0.0:
+            raise ValueError("memory_limit_mb must be finite and greater than zero or None")
+        memory_limit_bytes = int(memory_limit_mb * 1024 * 1024)
+    fit = _native.solve_many(
+        time_mjd,
+        eastward,
+        northward,
+        latitudes,
+        *_solver_arguments(
+            constit,
+            conf_int,
+            method,
+            trend,
+            phase,
+            nodal,
+            infer,
+            order_constit,
+            MC_n,
+            MC_seed,
+            robust_kw,
+            Rayleigh_min,
+            white,
+            northward is not None,
+        ),
+        None if workers is None else int(workers),
+        memory_limit_bytes,
+    )
+    return CoefficientBatch(fit)
 
 
 def reconstruct(
@@ -179,6 +341,43 @@ def reconstruct(
     return Tide(h=_restore_missing(target.size, finite, heights))
 
 
+def reconstruct_many(
+    t: ArrayLike,
+    coef: CoefficientBatch,
+    epoch: Epoch | None = None,
+    verbose: bool = True,
+    constit: Sequence[str] | None = None,
+    min_SNR: float | None = 2.0,
+    min_PE: float = 0.0,
+) -> Tide:
+    """Reconstruct all series in a :class:`CoefficientBatch`."""
+
+    del verbose
+    if not isinstance(coef, CoefficientBatch):
+        raise TypeError("coef must be the CoefficientBatch returned by rutide.solve_many")
+    target = _time_to_mjd(t, epoch)
+    finite = np.isfinite(target)
+    if finite.any():
+        result = _native.reconstruct_many(
+            np.ascontiguousarray(target[finite]),
+            coef._fit,
+            None if constit is None else [str(name) for name in constit],
+            None if min_SNR is None else float(min_SNR),
+            float(min_PE),
+        )
+    else:
+        empty = np.empty((0, coef._fit.series_count), dtype=np.float64)
+        result = (None, empty, empty) if coef._fit.is_vector else (empty, None, None)
+    if coef._fit.is_vector:
+        _, eastward, northward = result
+        return Tide(
+            u=_restore_missing_matrix(target.size, finite, eastward),
+            v=_restore_missing_matrix(target.size, finite, northward),
+        )
+    heights, _, _ = result
+    return Tide(h=_restore_missing_matrix(target.size, finite, heights))
+
+
 def _as_vector(value: ArrayLike, name: str) -> npt.NDArray[np.float64]:
     masked = np.ma.isMaskedArray(value)
     array = np.asarray(np.ma.getdata(value) if masked else value, dtype=np.float64)
@@ -188,6 +387,85 @@ def _as_vector(value: ArrayLike, name: str) -> npt.NDArray[np.float64]:
         array = array.copy()
         array[np.ma.getmaskarray(value)] = np.nan
     return np.ascontiguousarray(array)
+
+
+def _as_matrix(value: ArrayLike, name: str) -> npt.NDArray[np.float64]:
+    masked = np.ma.isMaskedArray(value)
+    array = np.asarray(np.ma.getdata(value) if masked else value, dtype=np.float64)
+    if array.ndim != 2:
+        raise ValueError(f"{name} must be two-dimensional with shape (time, series)")
+    if array.shape[1] == 0:
+        raise ValueError(f"{name} must contain at least one series")
+    if masked:
+        array = array.copy()
+        array[np.ma.getmaskarray(value)] = np.nan
+    return np.ascontiguousarray(array)
+
+
+def _as_latitudes(value: float | ArrayLike, series_count: int) -> npt.NDArray[np.float64]:
+    latitudes = np.asarray(value, dtype=np.float64)
+    if latitudes.ndim == 0:
+        latitudes = np.full(series_count, float(latitudes), dtype=np.float64)
+    elif latitudes.ndim != 1 or latitudes.size != series_count:
+        raise ValueError(
+            f"lat must be a scalar or contain one value for each of {series_count} series"
+        )
+    if not np.all(np.isfinite(latitudes)):
+        raise ValueError("lat values must be finite")
+    return np.ascontiguousarray(latitudes)
+
+
+def _solver_arguments(
+    constit: Literal["auto"] | Sequence[str] | None,
+    conf_int: Literal["linear", "MC", "none"] | None,
+    method: Literal["ols", "robust"],
+    trend: bool,
+    phase: Literal["Greenwich", "linear_time", "raw"],
+    nodal: bool | Literal["linear_time"],
+    infer: Mapping[str, Any] | None,
+    order_constit: Literal["PE", "SNR", "frequency"] | Sequence[str] | None,
+    MC_n: int,
+    MC_seed: int,
+    robust_kw: Mapping[str, Any] | None,
+    Rayleigh_min: float,
+    white: bool,
+    vector: bool,
+) -> tuple[Any, ...]:
+    constituents = _constituent_selection(constit)
+    inferred, references, ratios, phase_offsets, approximate = _parse_inference(infer, vector)
+    robust = dict(robust_kw or {})
+    robust_weight = str(_pop_alias(robust, "weight_function", "weight", "cauchy"))
+    robust_tuning = _optional_float(_pop_alias(robust, "tuning_constant", "tune", None))
+    robust_tolerance = float(_pop_alias(robust, "tolerance", "tol", 0.001))
+    robust_max_iterations = int(_pop_alias(robust, "max_iterations", "maxit", 50))
+    if robust:
+        unknown = ", ".join(sorted(robust))
+        raise TypeError(f"unknown robust_kw option(s): {unknown}")
+    if order_constit is None:
+        order_constit = "PE"
+    return (
+        constituents,
+        float(Rayleigh_min),
+        method,
+        "none" if conf_int is None else conf_int,
+        bool(white),
+        bool(trend),
+        phase,
+        _nodal_name(nodal),
+        int(MC_n),
+        int(MC_seed),
+        robust_weight,
+        robust_tuning,
+        robust_tolerance,
+        robust_max_iterations,
+        inferred,
+        references,
+        ratios,
+        phase_offsets,
+        approximate,
+        order_constit if isinstance(order_constit, str) else "explicit",
+        [] if isinstance(order_constit, str) else [str(name) for name in order_constit],
+    )
 
 
 def _constituent_selection(
@@ -314,4 +592,12 @@ def _restore_missing(
 ) -> npt.NDArray[np.float64]:
     output = np.full(size, np.nan, dtype=np.float64)
     output[finite] = values
+    return output
+
+
+def _restore_missing_matrix(
+    size: int, finite: npt.NDArray[np.bool_], values: npt.NDArray[np.float64]
+) -> npt.NDArray[np.float64]:
+    output = np.full((size, values.shape[1]), np.nan, dtype=np.float64)
+    output[finite, :] = values
     return output

@@ -73,7 +73,9 @@ PyO3 `abi3-py39` extension. Its `solve` and `reconstruct` endpoints are shaped
 after Python UTide and expose UTide coefficient names plus descriptive aliases,
 but are not represented as a byte-for-byte drop-in interface. The supported
 arguments, time behavior, read-only result snapshots, and current serialization
-and one-series limitations are defined in [`PYTHON_API.md`](PYTHON_API.md).
+limitations are defined in [`PYTHON_API.md`](PYTHON_API.md). The batch endpoint
+uses stable `(series, constituent)` result axes and separate per-series
+presentation maps; missing masks never reorder the constituent dimension.
 
 Within the pre-1.0 series, Python breaking changes require a workspace minor
 version and changelog migration note. Patch releases preserve documented

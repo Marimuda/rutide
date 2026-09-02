@@ -1,5 +1,7 @@
 //! Native implementation behind `RUTide`'s `UTide`-inspired Python API.
 
+mod batch;
+
 use std::{collections::HashSet, ops::Deref, sync::Arc};
 
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
@@ -216,11 +218,15 @@ fn reconstruct<'py>(
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", rutide_core::VERSION)?;
     module.add_class::<Fit>()?;
+    module.add_class::<batch::BatchFit>()?;
     module.add_function(wrap_pyfunction!(solve, module)?)?;
     module.add_function(wrap_pyfunction!(reconstruct, module)?)?;
+    module.add_function(wrap_pyfunction!(batch::solve_many, module)?)?;
+    module.add_function(wrap_pyfunction!(batch::reconstruct_many, module)?)?;
     Ok(())
 }
 
+#[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
 struct SolveConfig {
     latitude: f64,
@@ -865,15 +871,33 @@ fn constituent_order(
     frequencies: &[f64],
     solution: &FittedSolution,
 ) -> Result<Vec<usize>, String> {
+    constituent_order_from_diagnostics(
+        order_name,
+        order_names,
+        names,
+        frequencies,
+        percent_energy(solution),
+        signal_to_noise(solution),
+    )
+}
+
+fn constituent_order_from_diagnostics(
+    order_name: &str,
+    order_names: &[String],
+    names: &[String],
+    frequencies: &[f64],
+    percent_energy: &[f64],
+    signal_to_noise: Option<&[f64]>,
+) -> Result<Vec<usize>, String> {
     let mut indices = (0..names.len()).collect::<Vec<_>>();
     match order_name.to_ascii_lowercase().as_str() {
         "pe" => indices.sort_by(|left, right| {
-            percent_energy(solution)[*right]
-                .total_cmp(&percent_energy(solution)[*left])
+            percent_energy[*right]
+                .total_cmp(&percent_energy[*left])
                 .then_with(|| left.cmp(right))
         }),
         "snr" => {
-            let snr = signal_to_noise(solution).ok_or(
+            let snr = signal_to_noise.ok_or(
                 "order_constit='SNR' requires confidence intervals (conf_int='linear' or 'MC')",
             )?;
             indices.sort_by(|left, right| {

@@ -304,10 +304,15 @@ validation rather than partially applied.
   documented in `COMPATIBILITY.md`; compiled schema constants are checked
   against the versioned machine-readable feature matrix.
 - The mixed PyO3/maturin Python distribution exposes typed UTide-inspired
-  `solve` and `reconstruct` endpoints for scalar elevations and vector currents.
+  `solve` / `reconstruct` and time-major `solve_many` / `reconstruct_many`
+  endpoints for scalar elevations and vector currents.
   NumPy buffers cross the native boundary directly, numerical work releases the
-  GIL, and the immutable Rust fit is reused for reconstruction. The endpoint
-  covers dynamic selection, missing/irregular records, FFT/Lomb–Scargle
+  GIL, and immutable Rust fits are reused for reconstruction. The batch endpoint
+  shares astronomical preparation and repeated missing masks across varying
+  latitudes, uses deterministic configurable workers and Monte Carlo streams,
+  bounds temporary native observation chunks, and exposes stable xarray-friendly
+  coefficient axes with per-series rankings. The endpoints
+  cover dynamic selection, missing/irregular records, FFT/Lomb–Scargle
   confidence, robust fits, inference, Monte Carlo, diagnostics, ordering, time
   epochs, and filters. CPython 3.9+ stable-ABI wheels share the Cargo-sourced
   workspace version; locked CI and protected release workflows build and test

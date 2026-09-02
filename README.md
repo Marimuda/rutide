@@ -181,13 +181,19 @@ uv run --project benchmarks/python --locked \
 
 ## Python
 
-The mixed Python/Rust package provides `rutide.solve` and `rutide.reconstruct`
-for one-dimensional scalar elevations and vector currents. The endpoint and
+The mixed Python/Rust package provides `rutide.solve` / `rutide.reconstruct` for
+individual scalar elevations and vector currents, plus time-major
+`rutide.solve_many` / `rutide.reconstruct_many` batch endpoints. The endpoint and
 result names follow Python UTide where practical, including `A`, `g`, `Lsmaj`,
 `Lsmin`, `theta`, `PE`, and `SNR`. Dynamic constituents, missing observations,
 irregular Lomb–Scargle confidence, robust fitting, exact/approximate inference,
 Monte Carlo confidence, and filtered reconstruction all use the same Rust core
 validated by the CLI.
+
+The batch endpoint shares astronomy, grouped missing masks, irregular spectral
+plans, and a dedicated worker pool inside Rust. Coefficients use stable
+`(series, constituent)` shapes with per-series presentation rankings and optional
+xarray conversion; a working-memory limit bounds native solve chunks.
 
 See the [Python API guide](PYTHON_API.md) for installation, examples, time
 epochs, supported options, intentional compatibility differences, and the

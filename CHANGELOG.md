@@ -17,6 +17,9 @@ published API and file-schema contracts.
 - A typed UTide-inspired `rutide.solve` / `rutide.reconstruct` Python package,
   backed by a PyO3/NumPy stable-ABI extension with native model reuse and GIL-free
   solving and reconstruction.
+- Time-major `solve_many` / `reconstruct_many` Python bindings with varying
+  latitudes, joint vector masks, deterministic worker pools, bounded native
+  chunks, stable coefficient axes, per-series rankings, and xarray conversion.
 - Irregular colored-confidence estimation through Lomb–Scargle residual spectra.
 - Bounded and incremental FVCOM scalar, depth-averaged, sigma-layer, and
   fixed-physical-depth application workflows.

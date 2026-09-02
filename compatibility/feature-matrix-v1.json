@@ -273,7 +273,6 @@
       ],
       "limitations": [
         "The Python interface is UTide-inspired rather than a strict drop-in replacement",
-        "The endpoint fits one one-dimensional series at a time",
         "Native fit objects are not yet serializable and arbitrary Python UTide coefficient dictionaries cannot be reconstructed"
       ]
     }

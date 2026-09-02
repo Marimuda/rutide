@@ -76,6 +76,51 @@ The ellipse fields also have `semi_major`, `semi_minor`,
 `inclination_degrees`, and `phase_degrees` aliases. Confidence fields follow the
 same convention with `_ci` suffixes.
 
+## Batched arrays
+
+`solve_many` fits a time-major `(time, series)` matrix without a Python loop.
+It shares astronomical preparation and repeated missing-value masks, executes
+independent fits on a dedicated Rayon worker pool, and retains deterministic
+series order and Monte Carlo streams across worker and chunk counts.
+
+```python
+from rutide import reconstruct_many, solve_many
+
+# height.shape == (time, station); one latitude per station is optional.
+coef = solve_many(
+    time_mjd,
+    height,
+    lat=station_latitude,
+    constit=["M2", "S2", "N2", "K1", "O1"],
+    workers=16,
+    memory_limit_mb=512,
+)
+tide = reconstruct_many(time_mjd, coef)
+
+print(coef.A.shape)          # (station, constituent)
+print(coef.rank_index.shape) # (station, presentation_rank)
+print(tide.h.shape)          # (time, station)
+```
+
+Pass eastward and northward `(time, series)` arrays to use the vector path.
+`lat` may be one scalar shared by all series or a one-dimensional per-series
+array. Masked arrays and NaNs are accepted; vector components use a joint mask.
+Non-finite timestamps remove that row globally, with the retained-to-source row
+mapping available as `coef.aux.time_position`.
+
+The coefficient matrices always preserve one stable fitted-constituent axis.
+`rank_index[series]` maps requested PE, SNR, frequency, or explicit presentation
+rank to that stable axis. Reference-time frequencies have shape
+`(series, constituent)` because different missing masks can produce different
+fit epochs. The `dims` mapping names array dimensions, and `coef.to_xarray()`
+creates an `xarray.Dataset` when the optional `xarray` package is installed.
+
+`workers=None` uses available parallelism, capped at the series count.
+`memory_limit_mb` bounds each temporary native component chunk, not the caller's
+NumPy arrays, the single Rust-owned input copy needed for GIL-free execution, or
+the retained solution arrays. Set it to `None` to process the entire matrix in
+one native chunk. Both fitting and reconstruction release the GIL.
+
 ## Important options
 
 | Python option | Supported values and behavior |
@@ -150,8 +195,9 @@ SNR filtering requires a fit with confidence intervals. Set `min_SNR=None` for
 PE-only filtering or to reconstruct a fit made with `conf_int="none"`. An
 explicit `constit=[...]` selection takes precedence over diagnostic thresholds.
 
-Version `0.2` accepts only a `Coefficient` created by the same RUTide process;
-it does not import arbitrary Python UTide coefficient dictionaries and does not
-yet serialize native fit objects. The one-dimensional endpoint fits one station
-or model series at a time. Large multi-series FVCOM workflows should continue
-to use the batched Rust API or CLI, which avoids repeated model preparation.
+Version `0.2` accepts only coefficients created by the same RUTide process; it
+does not import arbitrary Python UTide coefficient dictionaries and does not yet
+serialize native fit objects. `solve_many` covers in-memory station and model
+matrices. The CLI remains the appropriate interface when FVCOM NetCDF input and
+incremental output must stay bounded rather than materializing the complete
+array in Python.

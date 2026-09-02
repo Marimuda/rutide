@@ -289,5 +289,232 @@ class VectorApiTests(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(coefficients.Lsmaj_ci)))
 
 
+class BatchApiTests(unittest.TestCase):
+    def test_scalar_batch_matches_individual_irregular_colored_fits(self) -> None:
+        count = 1_200
+        series_count = 4
+        steps = np.where(np.arange(count) % 17 == 0, 1.2, 1.0)
+        time = 60_100.0 + np.cumsum(steps) / 24.0
+        observations = np.column_stack(
+            [
+                0.1 * series
+                + harmonic(time, M2_CPH, 0.8 + 0.05 * series, 0.1 * series)
+                + harmonic(time, S2_CPH, 0.2, -0.05 * series)
+                + 0.01 * np.sin(np.arange(count) * (0.2 + 0.01 * series))
+                for series in range(series_count)
+            ]
+        )
+        observations[30, 1] = np.nan
+        observations[31:34, 3] = np.nan
+        time[7] = np.nan
+        latitudes = np.linspace(57.0, 63.0, series_count)
+
+        batch = rutide.solve_many(
+            time,
+            observations,
+            lat=latitudes,
+            constit=["M2", "S2"],
+            conf_int="linear",
+            white=False,
+            trend=False,
+            phase="raw",
+            nodal=False,
+            order_constit="frequency",
+            workers=2,
+            memory_limit_mb=0.02,
+            verbose=False,
+        )
+
+        self.assertIsInstance(batch, rutide.CoefficientBatch)
+        self.assertEqual(batch.A.shape, (series_count, 2))
+        self.assertEqual(batch.frequency_cph.shape, (series_count, 2))
+        self.assertEqual(batch.rank_index.shape, (series_count, 2))
+        self.assertEqual(batch.worker_count, 2)
+        self.assertLess(batch.chunk_series, series_count)
+        np.testing.assert_array_equal(batch.aux.time_position, np.delete(np.arange(count), 7))
+        self.assertFalse(batch.A.flags.writeable)
+
+        for series in range(series_count):
+            coefficient = rutide.solve(
+                time,
+                observations[:, series],
+                lat=float(latitudes[series]),
+                constit=["M2", "S2"],
+                conf_int="linear",
+                white=False,
+                trend=False,
+                phase="raw",
+                nodal=False,
+                order_constit="frequency",
+                verbose=False,
+            )
+            for batch_name, single_name in [
+                ("A", "A"),
+                ("g", "g"),
+                ("A_ci", "A_ci"),
+                ("g_ci", "g_ci"),
+                ("PE", "PE"),
+                ("SNR", "SNR"),
+            ]:
+                with self.subTest(series=series, field=batch_name):
+                    np.testing.assert_allclose(
+                        batch[batch_name][series],
+                        coefficient[single_name],
+                        rtol=1e-9 if batch_name == "SNR" else 1e-10,
+                        atol=2e-11,
+                    )
+            self.assertAlmostEqual(batch.mean[series], coefficient.mean, places=12)
+            self.assertAlmostEqual(
+                batch.reference_time_mjd[series], coefficient.reference_time_mjd, places=12
+            )
+
+        target = time.copy()
+        target[7] = 60_100.0 + 7 / 24.0
+        reconstructed = rutide.reconstruct_many(target, batch, min_SNR=None, verbose=False)
+        self.assertEqual(reconstructed.h.shape, observations.shape)
+        for series in range(series_count):
+            coefficient = rutide.solve(
+                time,
+                observations[:, series],
+                lat=float(latitudes[series]),
+                constit=["M2", "S2"],
+                conf_int="linear",
+                trend=False,
+                phase="raw",
+                nodal=False,
+                order_constit="frequency",
+                verbose=False,
+            )
+            expected = rutide.reconstruct(target, coefficient, min_SNR=None, verbose=False)
+            np.testing.assert_allclose(
+                reconstructed.h[:, series], expected.h, rtol=2e-11, atol=2e-11
+            )
+
+    def test_vector_batch_inference_joint_masks_and_reconstruction(self) -> None:
+        count = 1_400
+        series_count = 3
+        time = 60_200.0 + np.arange(count) / 24.0
+        eastward = np.column_stack(
+            [
+                harmonic(time, M2_CPH, 0.7 + 0.1 * series, 0.2)
+                + harmonic(time, S2_CPH, 0.14 + 0.02 * series, 0.4)
+                for series in range(series_count)
+            ]
+        )
+        northward = np.column_stack(
+            [
+                harmonic(time, M2_CPH, 0.3, -0.25 + 0.1 * series)
+                + harmonic(time, S2_CPH, 0.06, -0.05 + 0.1 * series)
+                for series in range(series_count)
+            ]
+        )
+        eastward[20, 0] = np.nan
+        northward[21, 0] = np.nan
+        northward[30, 2] = np.nan
+        inference = {
+            "inferred_names": ["S2"],
+            "reference_names": ["M2"],
+            "amp_ratios": [0.2, 0.2],
+            "phase_offsets": [0.0, 0.0],
+            "approximate": False,
+        }
+
+        batch = rutide.solve_many(
+            time,
+            eastward,
+            northward,
+            lat=60.0,
+            constit=["M2", "S2"],
+            infer=inference,
+            conf_int="none",
+            trend=False,
+            phase="raw",
+            nodal=False,
+            order_constit="frequency",
+            workers=2,
+            verbose=False,
+        )
+
+        np.testing.assert_array_equal(batch.nobs, [count - 2, count, count - 1])
+        self.assertEqual(batch.Lsmaj.shape, (series_count, 2))
+        currents = rutide.reconstruct_many(time, batch, min_SNR=None, verbose=False)
+        self.assertEqual(currents.u.shape, eastward.shape)
+        self.assertEqual(currents.v.shape, northward.shape)
+        for series in range(series_count):
+            coefficient = rutide.solve(
+                time,
+                eastward[:, series],
+                northward[:, series],
+                lat=60.0,
+                constit=["M2", "S2"],
+                infer=inference,
+                conf_int="none",
+                trend=False,
+                phase="raw",
+                nodal=False,
+                order_constit="frequency",
+                verbose=False,
+            )
+            np.testing.assert_allclose(
+                batch.Lsmaj[series], coefficient.Lsmaj, rtol=2e-11, atol=2e-11
+            )
+            expected = rutide.reconstruct(time, coefficient, min_SNR=None, verbose=False)
+            np.testing.assert_allclose(currents.u[:, series], expected.u, rtol=2e-11, atol=2e-11)
+            np.testing.assert_allclose(currents.v[:, series], expected.v, rtol=2e-11, atol=2e-11)
+
+    def test_batch_monte_carlo_is_worker_and_chunk_invariant(self) -> None:
+        count = 1_000
+        series_count = 5
+        time = 60_000.0 + np.arange(count) / 24.0
+        observations = np.column_stack(
+            [
+                harmonic(time, M2_CPH, 1.0 + 0.03 * series, 0.1 * series)
+                + 0.02 * np.sin(np.arange(count) * (0.31 + 0.01 * series))
+                for series in range(series_count)
+            ]
+        )
+        observations[100, :] = np.nan
+        common = dict(
+            lat=np.linspace(58.0, 62.0, series_count),
+            constit=["M2"],
+            conf_int="MC",
+            MC_n=48,
+            MC_seed=99,
+            trend=False,
+            phase="raw",
+            nodal=False,
+            verbose=False,
+        )
+        serial = rutide.solve_many(time, observations, workers=1, memory_limit_mb=None, **common)
+        parallel = rutide.solve_many(time, observations, workers=3, memory_limit_mb=0.01, **common)
+        for field in ["A", "g", "A_ci", "g_ci", "PE", "SNR"]:
+            np.testing.assert_array_equal(serial[field], parallel[field])
+
+    def test_robust_batch_exposes_dense_mask_aligned_diagnostics(self) -> None:
+        count = 1_000
+        time = 60_000.0 + np.arange(count) / 24.0
+        observations = np.column_stack(
+            [harmonic(time, M2_CPH, 1.0, 0.1), harmonic(time, M2_CPH, 0.8, -0.2)]
+        )
+        observations[100, 0] = np.nan
+        observations[400, 1] += 15.0
+        coefficients = rutide.solve_many(
+            time,
+            observations,
+            lat=60.0,
+            constit=["M2"],
+            conf_int="none",
+            method="robust",
+            trend=False,
+            robust_kw={"weight": "cauchy"},
+            workers=2,
+            verbose=False,
+        )
+        self.assertEqual(coefficients.weights.shape, observations.shape)
+        self.assertTrue(np.isnan(coefficients.weights[100, 0]))
+        self.assertLess(coefficients.weights[400, 1], 0.1)
+        np.testing.assert_array_equal(coefficients.weights, coefficients.robust.weights)
+
+
 if __name__ == "__main__":
     unittest.main()

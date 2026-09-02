@@ -1213,6 +1213,7 @@ version = "0.2.0"
 dependencies = [
  "numpy",
  "pyo3",
+ "rayon",
  "rutide-core",
 ]
 
