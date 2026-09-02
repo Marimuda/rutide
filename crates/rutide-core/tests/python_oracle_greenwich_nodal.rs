@@ -3,7 +3,8 @@
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
     AnalysisError, FitOptions, GreenwichNodalBatch, GreenwichNodalOls, GreenwichNodalReconstructor,
-    LinearConfidence, MonteCarloOptions, ReconstructionFilter, RobustOptions, TidalConstituent,
+    LinearConfidence, MonteCarloOptions, PhaseReference, ReconstructionFilter, RobustOptions,
+    SolverOptions, TidalConstituent,
 };
 
 const CONSTITUENTS: [TidalConstituent; 5] = [
@@ -460,6 +461,171 @@ fn matches_python_utide_with_trend_disabled() {
         0.0,
         f64::EPSILON,
     );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "freezes both alternative Python phase conventions and reconstruction"
+)]
+fn matches_python_utide_linear_time_and_raw_phase_references() {
+    let time = oracle_times();
+    let observations = oracle_observations();
+    let (eastward, northward) = synthetic_vector_observations(&time);
+    let cases = [
+        (
+            PhaseReference::LinearTime,
+            [
+                189.408_331_234_778_02,
+                228.999_253_389_470_43,
+                163.408_535_069_800_82,
+                154.311_435_223_613_07,
+                20.062_605_139_148_403,
+            ],
+            [
+                0.015_535_798_974_723_54,
+                0.015_537_235_572_621_52,
+                0.015_537_821_673_953_643,
+                0.010_076_433_270_726_003,
+                0.010_093_351_511_414_264,
+            ],
+            [
+                253.895_020_678_359_5,
+                101.169_510_998_662_16,
+                333.136_727_464_829_33,
+                4.911_679_784_651_596_5,
+                173.409_132_482_426_06,
+            ],
+        ),
+        (
+            PhaseReference::Raw,
+            [
+                32.893_091_760_778_66,
+                228.999_253_389_470_54,
+                121.770_106_138_534_79,
+                314.343_354_168_933_6,
+                63.515_446_719_829_1,
+            ],
+            [
+                0.015_535_772_994_845_773,
+                0.015_537_235_572_621_506,
+                0.015_529_269_548_147_888,
+                0.010_088_082_429_123_063,
+                0.010_075_783_858_567_193,
+            ],
+            [
+                97.379_781_204_362_53,
+                101.169_510_998_661_41,
+                291.498_298_533_565_3,
+                164.943_598_729_974_78,
+                216.861_974_063_106_03,
+            ],
+        ),
+    ];
+
+    for (phase_reference, expected_phase, expected_amplitude_ci, expected_vector_phase) in cases {
+        let solver_options = SolverOptions::new(FitOptions::default(), phase_reference);
+        let model = GreenwichNodalOls::prepare_modified_julian_days_with_solver_options(
+            &time,
+            LATITUDE_DEGREES_NORTH,
+            &CONSTITUENTS,
+            solver_options,
+        )
+        .expect("valid alternative-phase model");
+        assert_eq!(model.phase_reference(), phase_reference);
+        assert_eq!(model.fit_options(), FitOptions::default());
+        let scalar = model
+            .solve_with_linear_confidence(&observations, LinearConfidence::Colored)
+            .expect("valid alternative-phase scalar solution");
+        for (index, (actual, expected)) in
+            scalar.amplitude.iter().zip(EXPECTED_AMPLITUDE).enumerate()
+        {
+            assert_close(
+                &format!("{} amplitude[{index}]", phase_reference.name()),
+                *actual,
+                expected,
+                5e-11,
+            );
+        }
+        for (field, actual, expected, tolerance) in [
+            ("phase", &scalar.phase_degrees, &expected_phase, 5e-8),
+            (
+                "amplitude CI",
+                scalar.amplitude_ci.as_ref().expect("amplitude CI"),
+                &expected_amplitude_ci,
+                5e-9,
+            ),
+        ] {
+            for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert_close(
+                    &format!("{} {field}[{index}]", phase_reference.name()),
+                    *actual,
+                    *expected,
+                    tolerance,
+                );
+            }
+        }
+        assert_close("alternative-phase mean", scalar.mean, EXPECTED_MEAN, 5e-11);
+        assert_close(
+            "alternative-phase slope",
+            scalar.slope_per_day,
+            EXPECTED_SLOPE_PER_DAY,
+            5e-11,
+        );
+
+        let vector = model
+            .solve_vector_with_linear_confidence(&eastward, &northward, LinearConfidence::Colored)
+            .expect("valid alternative-phase vector solution");
+        for (index, (actual, expected)) in vector
+            .phase_degrees
+            .iter()
+            .zip(expected_vector_phase)
+            .enumerate()
+        {
+            assert_close(
+                &format!("{} vector phase[{index}]", phase_reference.name()),
+                *actual,
+                expected,
+                5e-7,
+            );
+        }
+
+        let batch = GreenwichNodalBatch::prepare_modified_julian_days_with_solver_options(
+            &time,
+            &CONSTITUENTS,
+            solver_options,
+        )
+        .expect("valid alternative-phase batch");
+        assert_eq!(batch.phase_reference(), phase_reference);
+        let batch_solution = batch
+            .solve_time_major_with_linear_confidence(
+                &observations,
+                &[LATITUDE_DEGREES_NORTH],
+                LinearConfidence::Colored,
+            )
+            .expect("valid alternative-phase batch solution");
+        assert_eq!(batch_solution.as_slice(), std::slice::from_ref(&scalar));
+
+        let reconstruction = model
+            .reconstruct_modified_julian_days(
+                &RECONSTRUCTION_TIMES,
+                &scalar,
+                &ReconstructionFilter::All,
+            )
+            .expect("valid alternative-phase reconstruction");
+        for (index, (actual, expected)) in reconstruction
+            .iter()
+            .zip(EXPECTED_RECONSTRUCTION_ALL)
+            .enumerate()
+        {
+            assert_close(
+                &format!("{} reconstruction[{index}]", phase_reference.name()),
+                *actual,
+                expected,
+                2e-9,
+            );
+        }
+    }
 }
 
 #[test]

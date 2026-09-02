@@ -20,8 +20,9 @@ pub use catalog::{
 };
 pub use corrected::{
     GreenwichNodalBatch, GreenwichNodalOls, GreenwichNodalReconstructor, InferenceMode,
-    ReconstructionFilter, ScalarInferenceBatch, ScalarInferenceOls, ScalarInferenceRelation,
-    VectorInferenceBatch, VectorInferenceOls, VectorInferenceRelation,
+    PhaseReference, ReconstructionFilter, ScalarInferenceBatch, ScalarInferenceOls,
+    ScalarInferenceRelation, SolverOptions, VectorInferenceBatch, VectorInferenceOls,
+    VectorInferenceRelation,
 };
 pub use error::AnalysisError;
 pub use monte_carlo::MonteCarloOptions;

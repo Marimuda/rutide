@@ -3,9 +3,9 @@
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
     AnalysisError, FitOptions, GreenwichNodalOls, InferenceMode, LinearConfidence,
-    MonteCarloOptions, ReconstructionFilter, RobustOptions, ScalarInferenceBatch,
-    ScalarInferenceOls, ScalarInferenceRelation, TidalConstituent, VectorInferenceBatch,
-    VectorInferenceOls, VectorInferenceRelation,
+    MonteCarloOptions, PhaseReference, ReconstructionFilter, RobustOptions, ScalarInferenceBatch,
+    ScalarInferenceOls, ScalarInferenceRelation, SolverOptions, TidalConstituent,
+    VectorInferenceBatch, VectorInferenceOls, VectorInferenceRelation,
 };
 
 const LATITUDE: f64 = 60.957_717_895_507_81;
@@ -404,6 +404,166 @@ fn matches_resolved_and_unresolved_exact_and_approximate_oracles() {
     check_oracle(169, InferenceMode::Approximate, &UNRESOLVED_APPROXIMATE);
     check_oracle(745, InferenceMode::Exact, &RESOLVED_EXACT);
     check_oracle(745, InferenceMode::Approximate, &RESOLVED_APPROXIMATE);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "freezes raw-phase scalar and rotary inference for both inference bases"
+)]
+fn matches_python_utide_raw_phase_inference() {
+    let time = oracle_times(745);
+    let observations = oracle_observations(745);
+    let (eastward, northward) = synthetic_vector_observations(&time);
+    let solver_options = SolverOptions::new(FitOptions::default(), PhaseReference::Raw);
+    let cases = [
+        (
+            InferenceMode::Exact,
+            [
+                0.005_028_435_291_965_646,
+                0.520_730_863_552_237_2,
+                0.072_060_131_614_432_98,
+                0.182_255_802_243_283_03,
+                0.036_030_065_807_216_49,
+            ],
+            [
+                105.526_653_483_661_26,
+                26.759_103_653_931_25,
+                330.955_162_374_618_96,
+                6.759_103_653_931_246,
+                285.955_162_374_618_96,
+            ],
+            [
+                0.023_755_802_182_448_618,
+                0.023_082_978_863_443_085,
+                0.023_227_973_669_740_765,
+                0.005_712_339_749_791_541,
+                0.008_213_443_400_514_409,
+            ],
+            [
+                0.001_436_137_553_619_472_4,
+                0.003_321_938_416_592_665,
+                0.017_710_989_158_913_27,
+                0.000_991_493_526_142_924_3,
+                0.007_725_093_906_552_807,
+            ],
+            [
+                90.966_028_641_381_09,
+                97.469_789_977_797_26,
+                244.326_021_062_437_35,
+                92.469_789_977_797_26,
+                206.826_021_062_437_38,
+            ],
+        ),
+        (
+            InferenceMode::Approximate,
+            [
+                0.005_229_454_597_209_795,
+                0.643_285_317_861_481_1,
+                0.114_127_814_702_408_49,
+                0.225_149_861_251_518_37,
+                0.057_063_907_351_204_24,
+            ],
+            [
+                108.035_852_537_566_64,
+                31.113_115_275_527_484,
+                317.374_753_679_574_2,
+                11.113_115_275_527_482,
+                272.374_753_679_574_27,
+            ],
+            [
+                0.018_276_605_363_953_42,
+                0.017_201_516_538_898_797,
+                0.018_418_399_867_047_27,
+                0.004_257_003_743_669_934,
+                0.006_512_075_460_551_206_5,
+            ],
+            [
+                0.001_419_564_960_052_018_2,
+                0.002_892_924_116_988_444_4,
+                0.006_303_401_752_531_963,
+                0.000_873_617_305_017_977_8,
+                0.002_687_291_860_869_615,
+            ],
+            [
+                90.921_709_702_780_5,
+                96.539_030_785_258_35,
+                196.284_745_298_951_2,
+                91.539_030_785_258_33,
+                158.784_745_298_951_2,
+            ],
+        ),
+    ];
+
+    for (
+        mode,
+        expected_amplitude,
+        expected_phase,
+        expected_ci,
+        expected_major,
+        expected_vector_phase,
+    ) in cases
+    {
+        let scalar_model = ScalarInferenceOls::prepare_modified_julian_days_with_solver_options(
+            &time,
+            LATITUDE,
+            &requested(),
+            &RELATIONSHIPS,
+            mode,
+            solver_options,
+        )
+        .expect("valid raw-phase scalar inference model");
+        assert_eq!(scalar_model.phase_reference(), PhaseReference::Raw);
+        let scalar = scalar_model
+            .solve_with_linear_confidence(&observations, LinearConfidence::White)
+            .expect("valid raw-phase scalar inference solution");
+        for (field, actual, expected, tolerance) in [
+            ("amplitude", &scalar.amplitude, &expected_amplitude, 5e-10),
+            ("phase", &scalar.phase_degrees, &expected_phase, 5e-7),
+            (
+                "amplitude CI",
+                scalar.amplitude_ci.as_ref().expect("amplitude CI"),
+                &expected_ci,
+                5e-8,
+            ),
+        ] {
+            for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert_close(
+                    &format!("raw {mode:?} scalar {field}[{index}]"),
+                    *actual,
+                    *expected,
+                    tolerance,
+                );
+            }
+        }
+
+        let vector_model = VectorInferenceOls::prepare_modified_julian_days_with_solver_options(
+            &time,
+            LATITUDE,
+            &requested(),
+            &VECTOR_RELATIONSHIPS,
+            mode,
+            solver_options,
+        )
+        .expect("valid raw-phase vector inference model");
+        assert_eq!(vector_model.phase_reference(), PhaseReference::Raw);
+        let vector = vector_model
+            .solve_vector_with_linear_confidence(&eastward, &northward, LinearConfidence::White)
+            .expect("valid raw-phase vector inference solution");
+        for (field, actual, expected, tolerance) in [
+            ("semi-major", &vector.semi_major, &expected_major, 5e-10),
+            ("phase", &vector.phase_degrees, &expected_vector_phase, 5e-7),
+        ] {
+            for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert_close(
+                    &format!("raw {mode:?} vector {field}[{index}]"),
+                    *actual,
+                    *expected,
+                    tolerance,
+                );
+            }
+        }
+    }
 }
 
 #[test]

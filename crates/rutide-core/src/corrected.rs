@@ -33,6 +33,70 @@ use crate::{
 const MIN_SHARED_LOMB_SERIES: usize = 16;
 const MAX_SHARED_LOMB_PLANS_PER_BATCH: usize = 4;
 
+/// Astronomical argument used to reference reported constituent phases.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PhaseReference {
+    /// Evaluate the exact Greenwich astronomical argument at every timestamp.
+    #[default]
+    Greenwich,
+    /// Evaluate the Greenwich argument at the fit epoch and advance it with the
+    /// constituent's linearized reference-time frequency.
+    LinearTime,
+    /// Reference phase directly to the fit epoch, without a Greenwich argument.
+    Raw,
+}
+
+impl PhaseReference {
+    /// Stable machine-readable name used by reports and serialized outputs.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Greenwich => "greenwich",
+            Self::LinearTime => "linear-time",
+            Self::Raw => "raw",
+        }
+    }
+}
+
+/// Solver configuration shared by the corrected scalar and vector APIs.
+///
+/// The fields are private so future nodal-correction choices can be added
+/// without requiring callers to update struct literals.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SolverOptions {
+    fit_options: FitOptions,
+    phase_reference: PhaseReference,
+}
+
+impl SolverOptions {
+    /// Construct a corrected solver configuration.
+    #[must_use]
+    pub const fn new(fit_options: FitOptions, phase_reference: PhaseReference) -> Self {
+        Self {
+            fit_options,
+            phase_reference,
+        }
+    }
+
+    /// Return the fitted mean/trend configuration.
+    #[must_use]
+    pub const fn fit_options(self) -> FitOptions {
+        self.fit_options
+    }
+
+    /// Return the astronomical phase-reference convention.
+    #[must_use]
+    pub const fn phase_reference(self) -> PhaseReference {
+        self.phase_reference
+    }
+}
+
+impl From<FitOptions> for SolverOptions {
+    fn from(fit_options: FitOptions) -> Self {
+        Self::new(fit_options, PhaseReference::Greenwich)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BatchConfidence {
     Linear(LinearConfidence),
@@ -202,6 +266,7 @@ pub struct GreenwichNodalOls {
     reference_time_modified_julian_day: f64,
     base_constituents: Vec<TidalConstituent>,
     recipes: Vec<CorrectionRecipe>,
+    phase_reference: PhaseReference,
     model: FixedRawOls,
 }
 
@@ -263,6 +328,7 @@ pub struct ScalarInferenceOls {
     reference_time_modified_julian_day: f64,
     base_constituents: Vec<TidalConstituent>,
     recipes: Vec<CorrectionRecipe>,
+    phase_reference: PhaseReference,
     model: FixedRawOls,
 }
 
@@ -327,6 +393,7 @@ pub struct VectorInferenceOls {
     time_span_days: f64,
     time_count: usize,
     fit_options: FitOptions,
+    phase_reference: PhaseReference,
     base_constituents: Vec<TidalConstituent>,
     recipes: Vec<CorrectionRecipe>,
     confidence_sampling: ConfidenceSampling,
@@ -388,11 +455,11 @@ impl GreenwichNodalOls {
         latitude_degrees_north: f64,
         constituents: &[TidalConstituent],
     ) -> Result<Self, AnalysisError> {
-        Self::prepare_modified_julian_days_with_options(
+        Self::prepare_modified_julian_days_with_solver_options(
             modified_julian_days,
             latitude_degrees_north,
             constituents,
-            FitOptions::default(),
+            SolverOptions::default(),
         )
     }
 
@@ -408,8 +475,28 @@ impl GreenwichNodalOls {
         constituents: &[TidalConstituent],
         fit_options: FitOptions,
     ) -> Result<Self, AnalysisError> {
+        Self::prepare_modified_julian_days_with_solver_options(
+            modified_julian_days,
+            latitude_degrees_north,
+            constituents,
+            fit_options.into(),
+        )
+    }
+
+    /// Build and factorize a corrected basis with explicit solver options.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] when timestamps, latitude, constituents, or
+    /// the requested model are invalid.
+    pub fn prepare_modified_julian_days_with_solver_options(
+        modified_julian_days: &[f64],
+        latitude_degrees_north: f64,
+        constituents: &[TidalConstituent],
+        solver_options: SolverOptions,
+    ) -> Result<Self, AnalysisError> {
         validate_latitude(latitude_degrees_north)?;
-        let basis = CorrectionBasis::prepare(modified_julian_days, constituents, fit_options)?;
+        let basis = CorrectionBasis::prepare(modified_julian_days, constituents, solver_options)?;
         let model = basis.model_at_latitude(latitude_degrees_north)?;
 
         Ok(Self {
@@ -418,6 +505,7 @@ impl GreenwichNodalOls {
             reference_time_modified_julian_day: basis.reference_time_modified_julian_day,
             base_constituents: basis.base_constituents,
             recipes: basis.recipes,
+            phase_reference: basis.phase_reference,
             model,
         })
     }
@@ -456,6 +544,12 @@ impl GreenwichNodalOls {
     #[must_use]
     pub const fn fit_options(&self) -> FitOptions {
         self.model.fit_options()
+    }
+
+    /// Return the configured astronomical phase-reference convention.
+    #[must_use]
+    pub const fn phase_reference(&self) -> PhaseReference {
+        self.phase_reference
     }
 
     /// Fit one complete, finite scalar observation series.
@@ -797,6 +891,7 @@ impl GreenwichNodalOls {
             self.tidal_constituents.clone(),
             &self.base_constituents,
             self.recipes.clone(),
+            self.phase_reference,
         )?
         .reconstruct_at_latitude(solution, self.latitude_degrees_north, filter)
     }
@@ -819,6 +914,7 @@ impl GreenwichNodalOls {
             self.tidal_constituents.clone(),
             &self.base_constituents,
             self.recipes.clone(),
+            self.phase_reference,
         )?
         .reconstruct_vector_at_latitude(solution, self.latitude_degrees_north, filter)
     }
@@ -844,13 +940,13 @@ impl ScalarInferenceOls {
         relationships: &[ScalarInferenceRelation],
         mode: InferenceMode,
     ) -> Result<Self, AnalysisError> {
-        Self::prepare_modified_julian_days_with_options(
+        Self::prepare_modified_julian_days_with_solver_options(
             modified_julian_days,
             latitude_degrees_north,
             constituents,
             relationships,
             mode,
-            FitOptions::default(),
+            SolverOptions::default(),
         )
     }
 
@@ -868,13 +964,37 @@ impl ScalarInferenceOls {
         mode: InferenceMode,
         fit_options: FitOptions,
     ) -> Result<Self, AnalysisError> {
+        Self::prepare_modified_julian_days_with_solver_options(
+            modified_julian_days,
+            latitude_degrees_north,
+            constituents,
+            relationships,
+            mode,
+            fit_options.into(),
+        )
+    }
+
+    /// Build a scalar inferred-constituent model with explicit solver options.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AnalysisError` for invalid input, inference relationships, or
+    /// an underdetermined requested model.
+    pub fn prepare_modified_julian_days_with_solver_options(
+        modified_julian_days: &[f64],
+        latitude_degrees_north: f64,
+        constituents: &[TidalConstituent],
+        relationships: &[ScalarInferenceRelation],
+        mode: InferenceMode,
+        solver_options: SolverOptions,
+    ) -> Result<Self, AnalysisError> {
         validate_latitude(latitude_degrees_north)?;
         let layout = scalar_inference_layout(constituents, relationships)?;
         let basis = CorrectionBasis::prepare_with_model_count(
             modified_julian_days,
             &layout.tidal_constituents,
             layout.fit_count,
-            fit_options,
+            solver_options,
         )?;
         let record = basis.record_subset((0..basis.time_terms.len()).collect(), true)?;
         Self::from_basis_record(
@@ -911,6 +1031,7 @@ impl ScalarInferenceOls {
             reference_time_modified_julian_day: record.reference_time,
             base_constituents: basis.base_constituents.clone(),
             recipes: basis.recipes.clone(),
+            phase_reference: basis.phase_reference,
             model,
         })
     }
@@ -961,6 +1082,12 @@ impl ScalarInferenceOls {
     #[must_use]
     pub const fn fit_options(&self) -> FitOptions {
         self.model.fit_options()
+    }
+
+    /// Return the configured astronomical phase-reference convention.
+    #[must_use]
+    pub const fn phase_reference(&self) -> PhaseReference {
+        self.phase_reference
     }
 
     /// Fit one finite scalar series and expand inferred coefficients.
@@ -1115,6 +1242,7 @@ impl ScalarInferenceOls {
             self.tidal_constituents.clone(),
             &self.base_constituents,
             self.recipes.clone(),
+            self.phase_reference,
         )?
         .reconstruct_at_latitude(solution, self.latitude_degrees_north, filter)
     }
@@ -1382,13 +1510,13 @@ impl VectorInferenceOls {
         relationships: &[VectorInferenceRelation],
         mode: InferenceMode,
     ) -> Result<Self, AnalysisError> {
-        Self::prepare_modified_julian_days_with_options(
+        Self::prepare_modified_julian_days_with_solver_options(
             modified_julian_days,
             latitude_degrees_north,
             constituents,
             relationships,
             mode,
-            FitOptions::default(),
+            SolverOptions::default(),
         )
     }
 
@@ -1406,13 +1534,37 @@ impl VectorInferenceOls {
         mode: InferenceMode,
         fit_options: FitOptions,
     ) -> Result<Self, AnalysisError> {
+        Self::prepare_modified_julian_days_with_solver_options(
+            modified_julian_days,
+            latitude_degrees_north,
+            constituents,
+            relationships,
+            mode,
+            fit_options.into(),
+        )
+    }
+
+    /// Build a coupled vector inference model with explicit solver options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid inputs, inference relationships, or an
+    /// underdetermined requested model.
+    pub fn prepare_modified_julian_days_with_solver_options(
+        modified_julian_days: &[f64],
+        latitude_degrees_north: f64,
+        constituents: &[TidalConstituent],
+        relationships: &[VectorInferenceRelation],
+        mode: InferenceMode,
+        solver_options: SolverOptions,
+    ) -> Result<Self, AnalysisError> {
         validate_latitude(latitude_degrees_north)?;
         let layout = vector_inference_layout(constituents, relationships)?;
         let basis = CorrectionBasis::prepare_with_model_count(
             modified_julian_days,
             &layout.tidal_constituents,
             layout.fit_count,
-            fit_options,
+            solver_options,
         )?;
         let record = basis.record_subset((0..basis.time_terms.len()).collect(), true)?;
         Self::from_basis_record(
@@ -1452,6 +1604,7 @@ impl VectorInferenceOls {
             time_span_days: record.time_span_days,
             time_count: record.positions.len(),
             fit_options: basis.fit_options,
+            phase_reference: basis.phase_reference,
             base_constituents: basis.base_constituents.clone(),
             recipes: basis.recipes.clone(),
             confidence_sampling: record.confidence_sampling.clone(),
@@ -1506,6 +1659,12 @@ impl VectorInferenceOls {
     #[must_use]
     pub const fn fit_options(&self) -> FitOptions {
         self.fit_options
+    }
+
+    /// Return the configured astronomical phase-reference convention.
+    #[must_use]
+    pub const fn phase_reference(&self) -> PhaseReference {
+        self.phase_reference
     }
 
     /// Fit one eastward/northward current series.
@@ -1674,6 +1833,7 @@ impl VectorInferenceOls {
             self.tidal_constituents.clone(),
             &self.base_constituents,
             self.recipes.clone(),
+            self.phase_reference,
         )?
         .reconstruct_vector_at_latitude(solution, self.latitude_degrees_north, filter)
     }
@@ -2426,7 +2586,10 @@ pub enum ReconstructionFilter {
 #[derive(Debug)]
 pub struct GreenwichNodalReconstructor {
     tidal_constituents: Vec<TidalConstituent>,
+    constituent_frequency_cph: Vec<f64>,
     recipes: Vec<CorrectionRecipe>,
+    phase_reference: PhaseReference,
+    reference_greenwich_phase: Vec<f64>,
     reference_time_modified_julian_day: f64,
     time_terms: Vec<ReconstructionTimeTerms>,
 }
@@ -2445,6 +2608,28 @@ impl GreenwichNodalReconstructor {
         reference_time_modified_julian_day: f64,
         constituents: &[TidalConstituent],
     ) -> Result<Self, AnalysisError> {
+        Self::prepare_modified_julian_days_with_phase_reference(
+            modified_julian_days,
+            reference_time_modified_julian_day,
+            constituents,
+            PhaseReference::Greenwich,
+        )
+    }
+
+    /// Prepare a reconstruction basis with an explicit phase reference.
+    ///
+    /// Target times may be unordered or repeated, but must be finite and nonempty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for an invalid reference time, target time, or
+    /// constituent list.
+    pub fn prepare_modified_julian_days_with_phase_reference(
+        modified_julian_days: &[f64],
+        reference_time_modified_julian_day: f64,
+        constituents: &[TidalConstituent],
+        phase_reference: PhaseReference,
+    ) -> Result<Self, AnalysisError> {
         validate_tidal_constituents(constituents)?;
         let (base_constituents, recipes) = dependency_recipes(constituents);
         Self::from_parts(
@@ -2453,6 +2638,7 @@ impl GreenwichNodalReconstructor {
             constituents.to_vec(),
             &base_constituents,
             recipes,
+            phase_reference,
         )
     }
 
@@ -2462,8 +2648,25 @@ impl GreenwichNodalReconstructor {
         tidal_constituents: Vec<TidalConstituent>,
         base_constituents: &[TidalConstituent],
         recipes: Vec<CorrectionRecipe>,
+        phase_reference: PhaseReference,
     ) -> Result<Self, AnalysisError> {
         validate_reconstruction_times(modified_julian_days, reference_time_modified_julian_day)?;
+        let scalar_constituents = scalar_constituents_at_reference(
+            &tidal_constituents,
+            base_constituents,
+            &recipes,
+            reference_time_modified_julian_day,
+        );
+        validate_derived_frequencies(&scalar_constituents)?;
+        let constituent_frequency_cph = scalar_constituents
+            .iter()
+            .map(|constituent| constituent.frequency_cph)
+            .collect();
+        let reference_greenwich_phase = greenwich_phases_at_time(
+            base_constituents,
+            &recipes,
+            reference_time_modified_julian_day,
+        );
         let time_terms = modified_julian_days
             .iter()
             .copied()
@@ -2492,7 +2695,10 @@ impl GreenwichNodalReconstructor {
             .collect();
         Ok(Self {
             tidal_constituents,
+            constituent_frequency_cph,
             recipes,
+            phase_reference,
+            reference_greenwich_phase,
             reference_time_modified_julian_day,
             time_terms,
         })
@@ -2514,6 +2720,12 @@ impl GreenwichNodalReconstructor {
     #[must_use]
     pub fn tidal_constituents(&self) -> &[TidalConstituent] {
         &self.tidal_constituents
+    }
+
+    /// Return the configured astronomical phase-reference convention.
+    #[must_use]
+    pub const fn phase_reference(&self) -> PhaseReference {
+        self.phase_reference
     }
 
     /// Reconstruct one scalar solution at a specified latitude.
@@ -2550,7 +2762,15 @@ impl GreenwichNodalReconstructor {
                 .map(|constituent| {
                     let (nodal_amplitude, nodal_phase) =
                         self.recipes[constituent].combine_nodal(&base_corrections);
-                    let angle = TAU * (nodal_phase + terms.greenwich_phase[constituent])
+                    let astronomical_phase = phase_cycles(
+                        self.phase_reference,
+                        terms.greenwich_phase[constituent],
+                        self.reference_greenwich_phase[constituent],
+                        terms.modified_julian_day,
+                        self.reference_time_modified_julian_day,
+                        self.constituent_frequency_cph[constituent],
+                    );
+                    let angle = TAU * (nodal_phase + astronomical_phase)
                         - solution.phase_degrees[constituent].to_radians();
                     nodal_amplitude * solution.amplitude[constituent] * angle.cos()
                 })
@@ -2658,12 +2878,12 @@ impl ScalarInferenceBatch {
         relationships: &[ScalarInferenceRelation],
         mode: InferenceMode,
     ) -> Result<Self, AnalysisError> {
-        Self::prepare_modified_julian_days_with_options(
+        Self::prepare_modified_julian_days_with_solver_options(
             modified_julian_days,
             constituents,
             relationships,
             mode,
-            FitOptions::default(),
+            SolverOptions::default(),
         )
     }
 
@@ -2680,12 +2900,34 @@ impl ScalarInferenceBatch {
         mode: InferenceMode,
         fit_options: FitOptions,
     ) -> Result<Self, AnalysisError> {
+        Self::prepare_modified_julian_days_with_solver_options(
+            modified_julian_days,
+            constituents,
+            relationships,
+            mode,
+            fit_options.into(),
+        )
+    }
+
+    /// Prepare shared scalar-inference astronomy with explicit solver options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input, relationships, or an underdetermined
+    /// requested model.
+    pub fn prepare_modified_julian_days_with_solver_options(
+        modified_julian_days: &[f64],
+        constituents: &[TidalConstituent],
+        relationships: &[ScalarInferenceRelation],
+        mode: InferenceMode,
+        solver_options: SolverOptions,
+    ) -> Result<Self, AnalysisError> {
         let layout = scalar_inference_layout(constituents, relationships)?;
         let basis = CorrectionBasis::prepare_with_model_count(
             modified_julian_days,
             &layout.tidal_constituents,
             layout.fit_count,
-            fit_options,
+            solver_options,
         )?;
         Ok(Self {
             basis,
@@ -2705,6 +2947,12 @@ impl ScalarInferenceBatch {
     #[must_use]
     pub const fn fit_options(&self) -> FitOptions {
         self.basis.fit_options
+    }
+
+    /// Return the configured astronomical phase-reference convention.
+    #[must_use]
+    pub const fn phase_reference(&self) -> PhaseReference {
+        self.basis.phase_reference
     }
 
     /// Return every reported constituent in coefficient order.
@@ -2764,6 +3012,7 @@ impl ScalarInferenceBatch {
             self.layout.tidal_constituents.clone(),
             &self.basis.base_constituents,
             self.basis.recipes.clone(),
+            self.basis.phase_reference,
         )
     }
 
@@ -3115,12 +3364,12 @@ impl VectorInferenceBatch {
         relationships: &[VectorInferenceRelation],
         mode: InferenceMode,
     ) -> Result<Self, AnalysisError> {
-        Self::prepare_modified_julian_days_with_options(
+        Self::prepare_modified_julian_days_with_solver_options(
             modified_julian_days,
             constituents,
             relationships,
             mode,
-            FitOptions::default(),
+            SolverOptions::default(),
         )
     }
 
@@ -3137,12 +3386,34 @@ impl VectorInferenceBatch {
         mode: InferenceMode,
         fit_options: FitOptions,
     ) -> Result<Self, AnalysisError> {
+        Self::prepare_modified_julian_days_with_solver_options(
+            modified_julian_days,
+            constituents,
+            relationships,
+            mode,
+            fit_options.into(),
+        )
+    }
+
+    /// Prepare shared vector-inference astronomy with explicit solver options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input, relationships, or an underdetermined
+    /// requested model.
+    pub fn prepare_modified_julian_days_with_solver_options(
+        modified_julian_days: &[f64],
+        constituents: &[TidalConstituent],
+        relationships: &[VectorInferenceRelation],
+        mode: InferenceMode,
+        solver_options: SolverOptions,
+    ) -> Result<Self, AnalysisError> {
         let layout = vector_inference_layout(constituents, relationships)?;
         let basis = CorrectionBasis::prepare_with_model_count(
             modified_julian_days,
             &layout.tidal_constituents,
             layout.fit_count,
-            fit_options,
+            solver_options,
         )?;
         Ok(Self {
             basis,
@@ -3162,6 +3433,12 @@ impl VectorInferenceBatch {
     #[must_use]
     pub const fn fit_options(&self) -> FitOptions {
         self.basis.fit_options
+    }
+
+    /// Return the configured astronomical phase-reference convention.
+    #[must_use]
+    pub const fn phase_reference(&self) -> PhaseReference {
+        self.basis.phase_reference
     }
 
     /// Return every reported constituent in coefficient order.
@@ -3221,6 +3498,7 @@ impl VectorInferenceBatch {
             self.layout.tidal_constituents.clone(),
             &self.basis.base_constituents,
             self.basis.recipes.clone(),
+            self.basis.phase_reference,
         )
     }
 
@@ -3609,10 +3887,10 @@ impl GreenwichNodalBatch {
         modified_julian_days: &[f64],
         constituents: &[TidalConstituent],
     ) -> Result<Self, AnalysisError> {
-        Self::prepare_modified_julian_days_with_options(
+        Self::prepare_modified_julian_days_with_solver_options(
             modified_julian_days,
             constituents,
-            FitOptions::default(),
+            SolverOptions::default(),
         )
     }
 
@@ -3626,8 +3904,25 @@ impl GreenwichNodalBatch {
         constituents: &[TidalConstituent],
         fit_options: FitOptions,
     ) -> Result<Self, AnalysisError> {
+        Self::prepare_modified_julian_days_with_solver_options(
+            modified_julian_days,
+            constituents,
+            fit_options.into(),
+        )
+    }
+
+    /// Prepare shared astronomical terms with explicit solver options.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] when inputs or the requested model are invalid.
+    pub fn prepare_modified_julian_days_with_solver_options(
+        modified_julian_days: &[f64],
+        constituents: &[TidalConstituent],
+        solver_options: SolverOptions,
+    ) -> Result<Self, AnalysisError> {
         Ok(Self {
-            basis: CorrectionBasis::prepare(modified_julian_days, constituents, fit_options)?,
+            basis: CorrectionBasis::prepare(modified_julian_days, constituents, solver_options)?,
         })
     }
 
@@ -3641,6 +3936,12 @@ impl GreenwichNodalBatch {
     #[must_use]
     pub const fn fit_options(&self) -> FitOptions {
         self.basis.fit_options
+    }
+
+    /// Return the configured astronomical phase-reference convention.
+    #[must_use]
+    pub const fn phase_reference(&self) -> PhaseReference {
+        self.basis.phase_reference
     }
 
     /// Return the prepared catalog constituents in coefficient order.
@@ -3699,6 +4000,7 @@ impl GreenwichNodalBatch {
             self.basis.tidal_constituents.clone(),
             &self.basis.base_constituents,
             self.basis.recipes.clone(),
+            self.basis.phase_reference,
         )
     }
 
@@ -4306,6 +4608,7 @@ struct CorrectionBasis {
     reference_time_modified_julian_day: f64,
     time_span_days: f64,
     fit_options: FitOptions,
+    phase_reference: PhaseReference,
     sample_interval_hours: Option<f64>,
 }
 
@@ -4556,13 +4859,13 @@ impl CorrectionBasis {
     fn prepare(
         modified_julian_days: &[f64],
         constituents: &[TidalConstituent],
-        fit_options: FitOptions,
+        solver_options: SolverOptions,
     ) -> Result<Self, AnalysisError> {
         Self::prepare_with_model_count(
             modified_julian_days,
             constituents,
             constituents.len(),
-            fit_options,
+            solver_options,
         )
     }
 
@@ -4570,8 +4873,9 @@ impl CorrectionBasis {
         modified_julian_days: &[f64],
         constituents: &[TidalConstituent],
         model_constituent_count: usize,
-        fit_options: FitOptions,
+        solver_options: SolverOptions,
     ) -> Result<Self, AnalysisError> {
+        let fit_options = solver_options.fit_options();
         validate_tidal_constituents(constituents)?;
         let (reference_time, time_span_days) =
             validate_time_with_options(modified_julian_days, model_constituent_count, fit_options)?;
@@ -4619,6 +4923,7 @@ impl CorrectionBasis {
             reference_time_modified_julian_day: reference_time,
             time_span_days,
             fit_options,
+            phase_reference: solver_options.phase_reference(),
             sample_interval_hours: equidistant_sample_interval_hours(modified_julian_days),
         })
     }
@@ -4653,7 +4958,15 @@ impl CorrectionBasis {
                 .map(|constituent_index| {
                     let (nodal_amplitude, nodal_phase) =
                         self.recipes[constituent_index].combine_nodal(&base_corrections);
-                    let angle = TAU * (nodal_phase + terms.greenwich_phase[constituent_index]);
+                    let astronomical_phase = phase_cycles(
+                        self.phase_reference,
+                        terms.greenwich_phase[constituent_index],
+                        record.reference_greenwich_phase[constituent_index],
+                        terms.modified_julian_day,
+                        record.reference_time,
+                        record.scalar_constituents[constituent_index].frequency_cph,
+                    );
+                    let angle = TAU * (nodal_phase + astronomical_phase);
                     (nodal_amplitude * angle.cos(), nodal_amplitude * angle.sin())
                 })
                 .collect::<Vec<_>>();
@@ -4717,7 +5030,15 @@ impl CorrectionBasis {
                 .map(|constituent_index| {
                     let (nodal_amplitude, nodal_phase) =
                         self.recipes[constituent_index].combine_nodal(&base_corrections);
-                    let angle = TAU * (nodal_phase + terms.greenwich_phase[constituent_index]);
+                    let astronomical_phase = phase_cycles(
+                        self.phase_reference,
+                        terms.greenwich_phase[constituent_index],
+                        record.reference_greenwich_phase[constituent_index],
+                        terms.modified_julian_day,
+                        record.reference_time,
+                        record.scalar_constituents[constituent_index].frequency_cph,
+                    );
+                    let angle = TAU * (nodal_phase + astronomical_phase);
                     c64::new(nodal_amplitude * angle.cos(), nodal_amplitude * angle.sin())
                 })
                 .collect::<Vec<_>>();
@@ -4802,9 +5123,12 @@ impl CorrectionBasis {
                 )
             };
         validate_derived_frequencies(&scalar_constituents)?;
+        let reference_greenwich_phase =
+            greenwich_phases_at_time(&self.base_constituents, &self.recipes, reference_time);
         Ok(RecordSubset {
             positions,
             scalar_constituents,
+            reference_greenwich_phase,
             reference_time,
             time_span_days,
             confidence_sampling,
@@ -4832,7 +5156,15 @@ impl CorrectionBasis {
             for constituent_index in 0..self.tidal_constituents.len() {
                 let (nodal_amplitude, nodal_phase) =
                     self.recipes[constituent_index].combine_nodal(&base_corrections);
-                let angle = TAU * (nodal_phase + terms.greenwich_phase[constituent_index]);
+                let astronomical_phase = phase_cycles(
+                    self.phase_reference,
+                    terms.greenwich_phase[constituent_index],
+                    record.reference_greenwich_phase[constituent_index],
+                    terms.modified_julian_day,
+                    record.reference_time,
+                    record.scalar_constituents[constituent_index].frequency_cph,
+                );
+                let angle = TAU * (nodal_phase + astronomical_phase);
                 design[(time_index, constituent_index * 2)] = nodal_amplitude * angle.cos();
                 design[(time_index, constituent_index * 2 + 1)] = nodal_amplitude * angle.sin();
             }
@@ -4865,6 +5197,7 @@ struct TimeTerms {
 struct RecordSubset {
     positions: Vec<usize>,
     scalar_constituents: Vec<Constituent>,
+    reference_greenwich_phase: Vec<f64>,
     reference_time: f64,
     time_span_days: f64,
     confidence_sampling: ConfidenceSampling,
@@ -5122,6 +5455,39 @@ fn base_greenwich_phase(constituent: TidalConstituent, astronomy: [f64; 6]) -> f
         .semi
         .expect("base catalog constituent has a phase offset"))
         % 1.0
+}
+
+fn greenwich_phases_at_time(
+    base_constituents: &[TidalConstituent],
+    recipes: &[CorrectionRecipe],
+    modified_julian_day: f64,
+) -> Vec<f64> {
+    let astronomy = at_modified_julian_day(modified_julian_day);
+    let base_phases = base_constituents
+        .iter()
+        .copied()
+        .map(|constituent| base_greenwich_phase(constituent, astronomy.cycles))
+        .collect::<Vec<_>>();
+    recipes
+        .iter()
+        .map(|recipe| recipe.combine_phase(&base_phases))
+        .collect()
+}
+
+fn phase_cycles(
+    phase_reference: PhaseReference,
+    exact_greenwich_phase: f64,
+    reference_greenwich_phase: f64,
+    modified_julian_day: f64,
+    reference_time: f64,
+    frequency_cph: f64,
+) -> f64 {
+    let linear_advance = 24.0 * (modified_julian_day - reference_time) * frequency_cph;
+    match phase_reference {
+        PhaseReference::Greenwich => exact_greenwich_phase,
+        PhaseReference::LinearTime => reference_greenwich_phase + linear_advance,
+        PhaseReference::Raw => linear_advance,
+    }
 }
 
 fn validate_latitude(latitude: f64) -> Result<(), AnalysisError> {
