@@ -18,8 +18,11 @@ use crate::{
     VectorSolution,
     astronomy::at_modified_julian_day,
     catalog::{CONSTITUENT_COUNT, Metadata},
+    monte_carlo::scalar_transformed_intervals,
     robust::fit_complex_with_initial as robust_complex_fit_with_initial,
-    scalar::{ConfidenceSampling, equidistant_sample_interval_hours, validate_time},
+    scalar::{
+        ConfidenceSampling, constituent_stream, equidistant_sample_interval_hours, validate_time,
+    },
     vector::{from_component_solutions, linearized_ellipse_sigmas},
 };
 
@@ -873,6 +876,21 @@ impl ScalarInferenceOls {
             .map(|solution| self.expand_solution(solution))
     }
 
+    /// Fit one scalar series with nonlinear Monte Carlo confidence intervals,
+    /// propagating every reference draw through its inference relationships.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid observations, options, or covariance.
+    pub fn solve_with_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<ScalarSolution, AnalysisError> {
+        self.solve_with_monte_carlo_confidence_impl(observations, None, options, noise, 0)
+    }
+
     /// Fit one scalar series with linear confidence intervals and SNR.
     ///
     /// # Errors
@@ -917,6 +935,28 @@ impl ScalarInferenceOls {
         self.model
             .solve_robust_with_linear_confidence(observations, options, noise)
             .map(|solution| self.expand_solution(solution))
+    }
+
+    /// Robustly fit one scalar series with inferred Monte Carlo intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid observations, robust or Monte Carlo
+    /// options, convergence, or covariance.
+    pub fn solve_robust_with_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<ScalarSolution, AnalysisError> {
+        self.solve_with_monte_carlo_confidence_impl(
+            observations,
+            Some(robust_options),
+            monte_carlo_options,
+            noise,
+            0,
+        )
     }
 
     /// Fit several complete time-major scalar series.
@@ -979,6 +1019,107 @@ impl ScalarInferenceOls {
             self.recipes.clone(),
         )?
         .reconstruct_at_latitude(solution, self.latitude_degrees_north, filter)
+    }
+
+    fn solve_with_monte_carlo_confidence_impl(
+        &self,
+        observations: &[f64],
+        robust: Option<RobustOptions>,
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+        stream: u64,
+    ) -> Result<ScalarSolution, AnalysisError> {
+        options.validate()?;
+        let (base, covariances) = if let Some(robust) = robust {
+            self.model
+                .solve_robust_with_scalar_coefficient_covariances(observations, robust, noise)?
+        } else {
+            self.model
+                .solve_with_scalar_coefficient_covariances(observations, noise)?
+        };
+        let mut solution = self.expand_solution(base);
+        self.apply_monte_carlo_intervals(&mut solution, &covariances, options, stream)?;
+        Ok(solution)
+    }
+
+    fn apply_monte_carlo_intervals(
+        &self,
+        solution: &mut ScalarSolution,
+        covariances: &[[[f64; 2]; 2]],
+        options: MonteCarloOptions,
+        stream: u64,
+    ) -> Result<(), AnalysisError> {
+        let mut output_intervals = vec![None; self.output_mappings.len()];
+        let mut cosine_variance = vec![0.0; self.output_mappings.len()];
+        let mut sine_variance = vec![0.0; self.output_mappings.len()];
+        for (source, covariance) in covariances.iter().copied().enumerate() {
+            let mappings = self
+                .output_mappings
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, mapping)| mapping.source_fit_index == source)
+                .collect::<Vec<_>>();
+            let ratios = mappings
+                .iter()
+                .map(|(_, mapping)| [mapping.ratio_real, mapping.ratio_imaginary])
+                .collect::<Vec<_>>();
+            let source_output = mappings
+                .iter()
+                .find_map(|(output, mapping)| (!mapping.inferred).then_some(*output))
+                .expect("every fitted source retains its reported reference output");
+            let intervals = scalar_transformed_intervals(
+                [
+                    solution.cosine_coefficient[source_output],
+                    solution.sine_coefficient[source_output],
+                ],
+                covariance,
+                &ratios,
+                options,
+                constituent_stream(stream, source),
+            )
+            .ok_or(AnalysisError::InvalidConfidenceCovariance {
+                constituent: source,
+            })?;
+            for (((output, mapping), interval), ratio) in
+                mappings.into_iter().zip(intervals).zip(ratios)
+            {
+                output_intervals[output] = Some(interval);
+                let transformed = transform_scalar_covariance(covariance, ratio);
+                cosine_variance[output] = transformed[0][0];
+                sine_variance[output] = transformed[1][1];
+                debug_assert_eq!(mapping.source_fit_index, source);
+            }
+        }
+        let intervals = output_intervals
+            .into_iter()
+            .enumerate()
+            .map(|(constituent, interval)| {
+                interval.ok_or(AnalysisError::InvalidConfidenceCovariance { constituent })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let amplitude_ci = intervals
+            .iter()
+            .map(|interval| interval.amplitude)
+            .collect::<Vec<_>>();
+        solution.phase_ci_degrees = Some(
+            intervals
+                .iter()
+                .map(|interval| interval.phase_degrees)
+                .collect(),
+        );
+        solution.signal_to_noise = Some(
+            solution
+                .amplitude
+                .iter()
+                .zip(&amplitude_ci)
+                .map(|(amplitude, interval)| amplitude.powi(2) / (interval / 1.96).powi(2))
+                .collect(),
+        );
+        solution.amplitude_ci = Some(amplitude_ci);
+        solution.cosine_coefficient_variance = Some(cosine_variance);
+        solution.sine_coefficient_variance = Some(sine_variance);
+        Ok(())
     }
 
     #[allow(
@@ -1106,6 +1247,27 @@ impl ScalarInferenceOls {
             robust: solution.robust,
         }
     }
+}
+
+fn transform_scalar_covariance(
+    covariance: [[f64; 2]; 2],
+    [ratio_real, ratio_imaginary]: [f64; 2],
+) -> [[f64; 2]; 2] {
+    let transform = [
+        [ratio_real, ratio_imaginary],
+        [-ratio_imaginary, ratio_real],
+    ];
+    std::array::from_fn(|row| {
+        std::array::from_fn(|column| {
+            (0..2)
+                .flat_map(|left| {
+                    (0..2).map(move |right| {
+                        transform[row][left] * covariance[left][right] * transform[column][right]
+                    })
+                })
+                .sum()
+        })
+    })
 }
 
 impl VectorInferenceOls {

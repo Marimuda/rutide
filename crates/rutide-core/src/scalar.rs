@@ -72,6 +72,9 @@ impl ConfidenceSpec<'_> {
     }
 }
 
+pub(crate) type ScalarCoefficientCovariance = [[f64; 2]; 2];
+pub(crate) type ScalarConfidenceSolution = (ScalarSolution, Vec<ScalarCoefficientCovariance>);
+
 /// Scalar coefficients returned by a fixed raw-phase OLS fit.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScalarSolution {
@@ -379,9 +382,50 @@ impl FixedRawOls {
         stream: u64,
     ) -> Result<ScalarSolution, AnalysisError> {
         monte_carlo_options.validate()?;
+        let (mut solution, covariances) = self.solve_robust_with_scalar_coefficient_covariances(
+            observations,
+            robust_options,
+            noise,
+        )?;
+        self.apply_scalar_monte_carlo_intervals(
+            &mut solution,
+            &covariances,
+            monte_carlo_options,
+            stream,
+        )?;
+        Ok(solution)
+    }
+
+    pub(crate) fn solve_with_scalar_coefficient_covariances(
+        &self,
+        observations: &[f64],
+        noise: LinearConfidence,
+    ) -> Result<ScalarConfidenceSolution, AnalysisError> {
+        let observation_matrix = self.observation_matrix(observations, 1)?;
+        let coefficients = self.decomposition.solve_lstsq(observation_matrix.as_ref());
+        let solution = self.component_solution(coefficients.as_ref(), 0, None);
+        let normal_inverse = self.coefficient_normal_inverse(None);
+        let covariances = self.scalar_coefficient_covariances(
+            observations,
+            1,
+            0,
+            coefficients.as_ref(),
+            &normal_inverse,
+            noise,
+            None,
+        );
+        Ok((solution, covariances))
+    }
+
+    pub(crate) fn solve_robust_with_scalar_coefficient_covariances(
+        &self,
+        observations: &[f64],
+        robust_options: RobustOptions,
+        noise: LinearConfidence,
+    ) -> Result<ScalarConfidenceSolution, AnalysisError> {
         let observation_matrix = self.observation_matrix(observations, 1)?;
         let fit = self.robust_fit(&observation_matrix, robust_options)?;
-        let mut solution =
+        let solution =
             self.component_solution(fit.coefficients.as_ref(), 0, Some(fit.diagnostics.clone()));
         let normal_inverse = self.coefficient_normal_inverse(Some(&fit.diagnostics.weights));
         let covariances = self.scalar_coefficient_covariances(
@@ -393,13 +437,7 @@ impl FixedRawOls {
             noise,
             Some(&fit.diagnostics.weights),
         );
-        self.apply_scalar_monte_carlo_intervals(
-            &mut solution,
-            &covariances,
-            monte_carlo_options,
-            stream,
-        )?;
-        Ok(solution)
+        Ok((solution, covariances))
     }
 
     pub(crate) fn solve_two_component_robust(
@@ -1572,7 +1610,7 @@ fn scale_matrix(matrix: &mut [[f64; 2]; 2], numerator: f64, denominator: f64) {
     }
 }
 
-fn constituent_stream(series_stream: u64, constituent: usize) -> u64 {
+pub(crate) fn constituent_stream(series_stream: u64, constituent: usize) -> u64 {
     series_stream
         .wrapping_mul(0xD134_2543_DE82_EF95)
         .wrapping_add(

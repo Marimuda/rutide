@@ -1,9 +1,9 @@
 //! Scalar inferred-constituent parity against the pinned Python `UTide` oracle.
 
 use rutide_core::{
-    AnalysisError, InferenceMode, LinearConfidence, ReconstructionFilter, RobustOptions,
-    ScalarInferenceBatch, ScalarInferenceOls, ScalarInferenceRelation, TidalConstituent,
-    VectorInferenceBatch, VectorInferenceOls, VectorInferenceRelation,
+    AnalysisError, InferenceMode, LinearConfidence, MonteCarloOptions, ReconstructionFilter,
+    RobustOptions, ScalarInferenceBatch, ScalarInferenceOls, ScalarInferenceRelation,
+    TidalConstituent, VectorInferenceBatch, VectorInferenceOls, VectorInferenceRelation,
 };
 
 const LATITUDE: f64 = 60.957_717_895_507_81;
@@ -402,6 +402,96 @@ fn matches_resolved_and_unresolved_exact_and_approximate_oracles() {
     check_oracle(169, InferenceMode::Approximate, &UNRESOLVED_APPROXIMATE);
     check_oracle(745, InferenceMode::Exact, &RESOLVED_EXACT);
     check_oracle(745, InferenceMode::Approximate, &RESOLVED_APPROXIMATE);
+}
+
+#[test]
+fn scalar_monte_carlo_propagates_shared_reference_draws() {
+    let time = oracle_times(745);
+    let observations = oracle_observations(745);
+    let options = MonteCarloOptions {
+        realizations: 257,
+        seed: 20_260_902,
+    };
+    for mode in [InferenceMode::Exact, InferenceMode::Approximate] {
+        let model = ScalarInferenceOls::prepare_modified_julian_days(
+            &time,
+            LATITUDE,
+            &requested(),
+            &RELATIONSHIPS,
+            mode,
+        )
+        .expect("valid inferred model");
+        for noise in [LinearConfidence::White, LinearConfidence::Colored] {
+            let solution = model
+                .solve_with_monte_carlo_confidence(&observations, options, noise)
+                .expect("valid inferred Monte Carlo solution");
+            let repeated = model
+                .solve_with_monte_carlo_confidence(&observations, options, noise)
+                .expect("repeated inferred Monte Carlo solution");
+            assert_eq!(solution, repeated);
+
+            let amplitude_ci = solution.amplitude_ci.as_ref().expect("amplitude CI");
+            let phase_ci = solution.phase_ci_degrees.as_ref().expect("phase CI");
+            assert_close(
+                "S2 amplitude CI ratio",
+                amplitude_ci[3],
+                RELATIONSHIPS[0].amplitude_ratio * amplitude_ci[1],
+                2e-14,
+            );
+            assert_close("S2 phase CI rotation", phase_ci[3], phase_ci[1], 2e-12);
+            assert_close(
+                "O1 amplitude CI ratio",
+                amplitude_ci[4],
+                RELATIONSHIPS[1].amplitude_ratio * amplitude_ci[2],
+                2e-14,
+            );
+            assert_close("O1 phase CI rotation", phase_ci[4], phase_ci[2], 2e-12);
+            assert!(
+                solution
+                    .signal_to_noise
+                    .as_ref()
+                    .expect("Monte Carlo SNR")
+                    .iter()
+                    .all(|value| value.is_finite())
+            );
+        }
+    }
+
+    let model = ScalarInferenceOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE,
+        &requested(),
+        &RELATIONSHIPS,
+        InferenceMode::Exact,
+    )
+    .expect("valid robust inferred model");
+    let mut contaminated = observations;
+    for (index, offset) in [(71, 5.0), (218, -4.0), (503, 6.0)] {
+        contaminated[index] += offset;
+    }
+    let solution = model
+        .solve_robust_with_monte_carlo_confidence(
+            &contaminated,
+            RobustOptions::default(),
+            options,
+            LinearConfidence::Colored,
+        )
+        .expect("valid robust inferred Monte Carlo solution");
+    assert!(solution.robust.is_some());
+    let amplitude_ci = solution.amplitude_ci.as_ref().expect("robust amplitude CI");
+    let phase_ci = solution.phase_ci_degrees.as_ref().expect("robust phase CI");
+    assert_close(
+        "robust S2 amplitude CI ratio",
+        amplitude_ci[3],
+        RELATIONSHIPS[0].amplitude_ratio * amplitude_ci[1],
+        2e-14,
+    );
+    assert_close(
+        "robust S2 phase CI rotation",
+        phase_ci[3],
+        phase_ci[1],
+        2e-12,
+    );
 }
 
 #[test]

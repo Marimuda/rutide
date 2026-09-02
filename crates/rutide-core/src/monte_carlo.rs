@@ -36,6 +36,7 @@ impl MonteCarloOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct ScalarMonteCarloIntervals {
     pub(crate) amplitude: f64,
     pub(crate) phase_degrees: f64,
@@ -70,6 +71,49 @@ pub(crate) fn scalar_intervals(
         amplitude: confidence_mad(&amplitude),
         phase_degrees: confidence_mad(&phase),
     })
+}
+
+/// Sample one fitted scalar coefficient pair and apply every dependent complex
+/// ratio to the same realizations. This preserves the deterministic dependence
+/// between a reference constituent and all constituents inferred from it.
+pub(crate) fn scalar_transformed_intervals(
+    coefficients: [f64; 2],
+    covariance: [[f64; 2]; 2],
+    ratios: &[[f64; 2]],
+    options: MonteCarloOptions,
+    stream: u64,
+) -> Option<Vec<ScalarMonteCarloIntervals>> {
+    let samples = multivariate_samples(coefficients, covariance, options, stream)?;
+    Some(
+        ratios
+            .iter()
+            .map(|[ratio_real, ratio_imaginary]| {
+                let transform = |cosine: f64, sine: f64| {
+                    [
+                        ratio_real * cosine + ratio_imaginary * sine,
+                        -ratio_imaginary * cosine + ratio_real * sine,
+                    ]
+                };
+                let fitted = transform(coefficients[0], coefficients[1]);
+                let mut amplitude = Vec::with_capacity(options.realizations);
+                let mut phase = Vec::with_capacity(options.realizations);
+                for [cosine, sine] in samples
+                    .iter()
+                    .copied()
+                    .map(|sample| transform(sample[0], sample[1]))
+                {
+                    amplitude.push(cosine.hypot(sine));
+                    phase.push(sine.atan2(cosine).to_degrees().rem_euclid(360.0));
+                }
+                phase[0] = fitted[1].atan2(fitted[0]).to_degrees().rem_euclid(360.0);
+                cluster_degrees(&mut phase, 360.0);
+                ScalarMonteCarloIntervals {
+                    amplitude: confidence_mad(&amplitude),
+                    phase_degrees: confidence_mad(&phase),
+                }
+            })
+            .collect(),
+    )
 }
 
 pub(crate) fn vector_intervals(
@@ -300,7 +344,7 @@ fn derived_seed(seed: u64, stream: u64) -> u64 {
 mod tests {
     use super::{
         MonteCarloOptions, cholesky, multivariate_samples, nearest_positive_definite,
-        scalar_intervals, vector_intervals,
+        scalar_intervals, scalar_transformed_intervals, vector_intervals,
     };
 
     #[test]
@@ -328,6 +372,26 @@ mod tests {
         assert_eq!(first.amplitude, repeated.amplitude);
         assert_eq!(first.phase_degrees, repeated.phase_degrees);
         assert_ne!(first.amplitude, other.amplitude);
+    }
+
+    #[test]
+    fn transformed_scalar_samples_preserve_inference_invariants() {
+        let options = MonteCarloOptions {
+            realizations: 2_000,
+            seed: 123,
+        };
+        let intervals = scalar_transformed_intervals(
+            [1.0, 0.5],
+            [[0.04, 0.01], [0.01, 0.09]],
+            &[[1.0, 0.0], [0.35, 0.0], [0.0, 0.35]],
+            options,
+            7,
+        )
+        .expect("valid covariance");
+        assert!((intervals[1].amplitude - 0.35 * intervals[0].amplitude).abs() < 1e-14);
+        assert!((intervals[2].amplitude - 0.35 * intervals[0].amplitude).abs() < 1e-14);
+        assert!((intervals[1].phase_degrees - intervals[0].phase_degrees).abs() < 1e-12);
+        assert!((intervals[2].phase_degrees - intervals[0].phase_degrees).abs() < 1e-12);
     }
 
     #[test]
