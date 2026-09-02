@@ -106,3 +106,10 @@ jobs:
       - name: Build wheel
         if: matrix.python == '3.13'
         run: uv build --wheel --out-dir dist
+
+      - name: Install and smoke-test wheel in a clean environment
+        if: matrix.python == '3.13'
+        shell: bash
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | python -c 'import json, sys; versions = {p["version"] for p in json.load(sys.stdin)["packages"] if p["name"].startswith("rutide")}; assert len(versions) == 1, versions; print(versions.pop())')"
+          python python/tests/install_artifact_and_smoke.py dist wheel "${version}"

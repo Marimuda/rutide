@@ -33,9 +33,18 @@ Publish in dependency order:
 Uploading requires an explicit, protected release action and registry credentials.
 Local and pull-request checks only build and inspect packages; they never publish.
 The `Build Python release` workflow always builds immutable wheel/source artifacts
-for a version tag. PyPI upload occurs only for a manual dispatch on a tag with the
-`publish` input enabled, after approval by the `pypi` environment. Configure that
-environment and its PyPI trusted-publisher identity before the first release.
+for a version tag. Every host-compatible wheel and the source distribution is
+installed into a fresh virtual environment and must pass scalar, vector-batch,
+reconstruction, and coefficient-persistence smoke tests before upload is
+eligible. The cross-built Linux AArch64 wheel is retained as an artifact but
+cannot be executed on the x86-64 runner.
+
+Upload occurs only for a manual dispatch on a tag with an explicit
+`publish_target` of `testpypi` or `pypi`. Each target has a separate protected
+environment and trusted-publisher identity. Stage the first release through
+TestPyPI, install that exact version from TestPyPI in a clean environment, then
+rerun the same tagged workflow with the PyPI target after approval. The default
+`none` target only builds and verifies artifacts.
 
 Python wheels target Linux x86-64/AArch64, macOS x86-64/Apple Silicon, and Windows
 x86-64 with the CPython 3.9 stable ABI. Adding another target requires a tested
@@ -45,4 +54,7 @@ wheel job; it must not be inferred from a source distribution alone.
 
 Install each artifact into a clean environment, run `rutide --version`, import
 `rutide`, execute the packaged smoke tests, and confirm the tag, changelog, Cargo
-metadata, Python metadata, and embedded `__version__` all agree.
+metadata, Python metadata, embedded `__version__`, and coefficient schema all
+agree. The Python release workflow automates this for installable distributions;
+the CLI archives and cross-built Linux AArch64 wheel still require matching-host
+verification before their first public release.

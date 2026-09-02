@@ -186,9 +186,7 @@ def main() -> None:
 
     with threadpool_limits(limits=1):
         context = multiprocessing.get_context("fork")
-        pool_context = (
-            context.Pool(processes=args.workers) if args.workers > 1 else _SerialPool()
-        )
+        pool_context = context.Pool(processes=args.workers) if args.workers > 1 else _SerialPool()
         with pool_context as pool:
 
             def run() -> float:
@@ -211,8 +209,7 @@ def main() -> None:
                 samples.append(elapsed)
                 checksums.append(checksum)
                 print(
-                    f"repetition={repetition} seconds={elapsed:.9f} "
-                    f"checksum={checksum:.12e}",
+                    f"repetition={repetition} seconds={elapsed:.9f} checksum={checksum:.12e}",
                     flush=True,
                 )
     median = float(np.median(samples))
@@ -221,9 +218,7 @@ def main() -> None:
             {
                 "field": args.field,
                 "confidence": args.confidence,
-                "monte_carlo_realizations": (
-                    200 if args.confidence == "monte-carlo" else 0
-                ),
+                "monte_carlo_realizations": (200 if args.confidence == "monte-carlo" else 0),
                 "series_count": args.series_count,
                 "workers": args.workers,
                 "chunk_size": args.chunk_size,

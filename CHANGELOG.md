@@ -26,6 +26,8 @@ published API and file-schema contracts.
 - A locked public-binding benchmark that compares Python UTide loops, RUTide
   one-series loops, and RUTide native batches for solve and reconstruction while
   enforcing numerical parity.
+- Clean-environment wheel/source install smoke tests and separate protected
+  TestPyPI/PyPI trusted-publishing gates.
 - Irregular colored-confidence estimation through Lomb–Scargle residual spectra.
 - Bounded and incremental FVCOM scalar, depth-averaged, sigma-layer, and
   fixed-physical-depth application workflows.
