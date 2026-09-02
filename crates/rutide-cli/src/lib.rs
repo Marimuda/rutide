@@ -14,9 +14,10 @@ use netcdf::{FileMut, Variable, VariableMut};
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
     AnalysisError, Constituent, FitOptions, GreenwichNodalBatch, GreenwichNodalReconstructor,
-    InferenceMode, LinearConfidence, MonteCarloOptions, RayleighSelection, ReconstructionFilter,
-    RobustOptions, RobustTermination, ScalarInferenceBatch, ScalarInferenceRelation,
-    ScalarSolution, TidalConstituent, VectorInferenceRelation, select_constituents_by_rayleigh,
+    InferenceMode, LinearConfidence, MonteCarloOptions, PhaseReference, RayleighSelection,
+    ReconstructionFilter, RobustOptions, RobustTermination, ScalarInferenceBatch,
+    ScalarInferenceRelation, ScalarSolution, SolverOptions, TidalConstituent,
+    VectorInferenceRelation, select_constituents_by_rayleigh,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -26,7 +27,7 @@ mod vector;
 pub use vector::{VectorAnalyzeConfig, VectorRunReport, VectorSampleResult, analyze_vector};
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
-const OUTPUT_SCHEMA_VERSION: u32 = 9;
+const OUTPUT_SCHEMA_VERSION: u32 = 10;
 /// Backward-compatible benchmark constituent set used when none is specified.
 pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -161,6 +162,8 @@ pub struct AnalyzeConfig {
     pub inference: Option<ScalarInferenceConfig>,
     /// Mean/trend terms included in the harmonic fit.
     pub fit_options: FitOptions,
+    /// Astronomical argument used to reference reported phases.
+    pub phase_reference: PhaseReference,
     /// Optional linearized or Monte Carlo confidence and its noise model.
     pub confidence_interval: ConfidenceInterval,
     /// Ordinary or Cauchy robust least squares.
@@ -341,7 +344,7 @@ pub struct RunReport {
     /// `RUTide` package version.
     pub rutide_version: &'static str,
     /// Frozen solver profile name.
-    pub profile: &'static str,
+    pub profile: String,
     /// Source path as supplied to the application.
     pub input_path: String,
     /// Source container size, not bytes physically read.
@@ -364,6 +367,8 @@ pub struct RunReport {
     pub analysis_method: &'static str,
     /// Whether a linear trend was included alongside the fitted mean.
     pub trend_enabled: bool,
+    /// Astronomical phase reference: `greenwich`, `linear-time`, or `raw`.
+    pub phase_reference: &'static str,
     /// Robust options when robust fitting is enabled.
     pub robust_options: Option<RobustOptionsReport>,
     /// Auditable constituent-selection method and threshold.
@@ -518,20 +523,24 @@ impl ScalarAnalysisBatch {
         constituents: &[TidalConstituent],
         inference: Option<&ScalarInferenceConfig>,
         fit_options: FitOptions,
+        phase_reference: PhaseReference,
     ) -> Result<Self, AnalysisError> {
+        let solver_options = SolverOptions::new(fit_options, phase_reference);
         match inference {
-            Some(inference) => ScalarInferenceBatch::prepare_modified_julian_days_with_options(
+            Some(inference) => {
+                ScalarInferenceBatch::prepare_modified_julian_days_with_solver_options(
+                    modified_julian_days,
+                    constituents,
+                    &inference.relationships,
+                    inference.mode,
+                    solver_options,
+                )
+                .map(Self::Inferred)
+            }
+            None => GreenwichNodalBatch::prepare_modified_julian_days_with_solver_options(
                 modified_julian_days,
                 constituents,
-                &inference.relationships,
-                inference.mode,
-                fit_options,
-            )
-            .map(Self::Inferred),
-            None => GreenwichNodalBatch::prepare_modified_julian_days_with_options(
-                modified_julian_days,
-                constituents,
-                fit_options,
+                solver_options,
             )
             .map(Self::Standard),
         }
@@ -594,58 +603,20 @@ impl ResolvedConstituentSelection {
         analysis_method: AnalysisMethod,
         inferred: bool,
         fit_options: FitOptions,
-    ) -> &'static str {
-        if !fit_options.trend {
-            return match (self.report.method, analysis_method, inferred) {
-                ("explicit", AnalysisMethod::Ols, false) => {
-                    "fixed-constituents-greenwich-nodal-ols-no-trend"
-                }
-                ("rayleigh", AnalysisMethod::Ols, false) => {
-                    "rayleigh-auto-greenwich-nodal-ols-no-trend"
-                }
-                ("explicit", AnalysisMethod::Robust(_), false) => {
-                    "fixed-constituents-greenwich-nodal-robust-no-trend"
-                }
-                ("rayleigh", AnalysisMethod::Robust(_), false) => {
-                    "rayleigh-auto-greenwich-nodal-robust-no-trend"
-                }
-                ("explicit", AnalysisMethod::Ols, true) => {
-                    "fixed-constituents-greenwich-nodal-inference-ols-no-trend"
-                }
-                ("rayleigh", AnalysisMethod::Ols, true) => {
-                    "rayleigh-auto-greenwich-nodal-inference-ols-no-trend"
-                }
-                ("explicit", AnalysisMethod::Robust(_), true) => {
-                    "fixed-constituents-greenwich-nodal-inference-robust-no-trend"
-                }
-                ("rayleigh", AnalysisMethod::Robust(_), true) => {
-                    "rayleigh-auto-greenwich-nodal-inference-robust-no-trend"
-                }
-                _ => unreachable!("selection methods are constructed internally"),
-            };
-        }
-        if inferred {
-            return match (self.report.method, analysis_method) {
-                ("explicit", AnalysisMethod::Ols) => {
-                    "fixed-constituents-greenwich-nodal-inference-ols"
-                }
-                ("rayleigh", AnalysisMethod::Ols) => "rayleigh-auto-greenwich-nodal-inference-ols",
-                ("explicit", AnalysisMethod::Robust(_)) => {
-                    "fixed-constituents-greenwich-nodal-inference-robust"
-                }
-                ("rayleigh", AnalysisMethod::Robust(_)) => {
-                    "rayleigh-auto-greenwich-nodal-inference-robust"
-                }
-                _ => unreachable!("selection methods are constructed internally"),
-            };
-        }
-        match (self.report.method, analysis_method) {
-            ("explicit", AnalysisMethod::Ols) => "fixed-constituents-greenwich-nodal-ols",
-            ("rayleigh", AnalysisMethod::Ols) => "rayleigh-auto-greenwich-nodal-ols",
-            ("explicit", AnalysisMethod::Robust(_)) => "fixed-constituents-greenwich-nodal-robust",
-            ("rayleigh", AnalysisMethod::Robust(_)) => "rayleigh-auto-greenwich-nodal-robust",
+        phase_reference: PhaseReference,
+    ) -> String {
+        let selection = match self.report.method {
+            "explicit" => "fixed-constituents",
+            "rayleigh" => "rayleigh-auto",
             _ => unreachable!("selection methods are constructed internally"),
-        }
+        };
+        let inference = if inferred { "inference-" } else { "" };
+        let trend = if fit_options.trend { "" } else { "-no-trend" };
+        format!(
+            "{selection}-{}-nodal-{inference}{}{trend}",
+            phase_reference.name(),
+            analysis_method.name(),
+        )
     }
 }
 
@@ -676,6 +647,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         &selection.constituents,
         config.inference.as_ref(),
         config.fit_options,
+        config.phase_reference,
     )?;
     if let Some(filter) = &config.reconstruction {
         validate_reconstruction_filter(filter, batch.tidal_constituents())?;
@@ -714,6 +686,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         &series_frequency_cph,
         &solutions,
         config.fit_options,
+        config.phase_reference,
         config.analysis_method,
         config.confidence_interval,
         config
@@ -749,6 +722,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             selection: &selection,
             inference: config.inference.as_ref(),
             fit_options: config.fit_options,
+            phase_reference: config.phase_reference,
             analysis_method: config.analysis_method,
             confidence_interval: config.confidence_interval,
             modified_julian_days: &input.modified_julian_days,
@@ -775,6 +749,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             config.analysis_method,
             config.inference.is_some(),
             config.fit_options,
+            config.phase_reference,
         ),
         input_path: config.input.to_string_lossy().into_owned(),
         input_file_bytes: input.input_file_bytes,
@@ -791,6 +766,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         workers: config.workers,
         analysis_method: config.analysis_method.name(),
         trend_enabled: config.fit_options.trend,
+        phase_reference: config.phase_reference.name(),
         robust_options: match config.analysis_method {
             AnalysisMethod::Ols => None,
             AnalysisMethod::Robust(options) => Some(options.into()),
@@ -1487,6 +1463,7 @@ fn normalize_source_observation(
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "the canonical digest keeps every result-shaping input explicit"
 )]
 fn result_digest(
@@ -1496,14 +1473,17 @@ fn result_digest(
     series_frequency_cph: &[Vec<f64>],
     solutions: &[ScalarSolution],
     fit_options: FitOptions,
+    phase_reference: PhaseReference,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     inference: Option<&InferenceReport>,
     reconstruction: Option<(&ReconstructionFilter, &[Vec<f64>])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-scalar-greenwich-nodal-v9\0");
+    digest.update(b"rutide-scalar-nodal-v10\0");
     digest.update([u8::from(fit_options.trend)]);
+    digest.update(phase_reference.name().as_bytes());
+    digest.update([0]);
     digest.update(analysis_method.name().as_bytes());
     if let AnalysisMethod::Robust(options) = analysis_method {
         digest.update(options.tuning_constant.to_bits().to_le_bytes());
@@ -1745,6 +1725,7 @@ struct OutputData<'data> {
     selection: &'data ResolvedConstituentSelection,
     inference: Option<&'data ScalarInferenceConfig>,
     fit_options: FitOptions,
+    phase_reference: PhaseReference,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     modified_julian_days: &'data [f64],
@@ -1783,6 +1764,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         selection,
         inference,
         fit_options,
+        phase_reference,
         analysis_method,
         confidence_interval,
         modified_julian_days,
@@ -1798,12 +1780,16 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
     output.add_attribute("title", "RUTide scalar harmonic coefficients")?;
     output.add_attribute("rutide_schema_version", i64::from(OUTPUT_SCHEMA_VERSION))?;
     output.add_attribute("rutide_version", rutide_core::VERSION)?;
-    output.add_attribute(
-        "profile",
-        selection.profile(analysis_method, inference.is_some(), fit_options),
-    )?;
+    let profile = selection.profile(
+        analysis_method,
+        inference.is_some(),
+        fit_options,
+        phase_reference,
+    );
+    output.add_attribute("profile", profile.as_str())?;
     output.add_attribute("analysis_method", analysis_method.name())?;
     output.add_attribute("trend_enabled", i64::from(fit_options.trend))?;
+    output.add_attribute("phase_reference", phase_reference.name())?;
     if let AnalysisMethod::Robust(options) = analysis_method {
         output.add_attribute("robust_tuning_constant", options.tuning_constant)?;
         output.add_attribute("robust_tolerance", options.tolerance)?;

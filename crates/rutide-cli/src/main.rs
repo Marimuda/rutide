@@ -13,8 +13,9 @@ use rutide_cli::{
     analyze_scalar, analyze_vector,
 };
 use rutide_core::{
-    FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, ReconstructionFilter,
-    RobustOptions, ScalarInferenceRelation, TidalConstituent, VectorInferenceRelation,
+    FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, PhaseReference,
+    ReconstructionFilter, RobustOptions, ScalarInferenceRelation, TidalConstituent,
+    VectorInferenceRelation,
 };
 
 // The application repeatedly allocates short-lived QR storage across worker
@@ -41,6 +42,7 @@ Options:
                       scalar I:R:AMP:PHASE; vector I:R:AMP+:PHASE+:AMP-:PHASE-
   --infer-approximate Use Python-compatible reference-only approximate inference
   --no-trend         Fit a mean without a linear trend (default: mean and trend)
+  --phase MODE        Phase reference: greenwich, linear-time, or raw (default: greenwich)
   --method MODE       Least squares: ols or robust (default: ols)
   --robust-tuning X   Cauchy tuning constant (default: 2.385)
   --robust-tolerance X
@@ -150,6 +152,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let mut vector_inference_relationships = Vec::new();
     let mut inference_approximate = false;
     let mut trend_disabled = false;
+    let mut phase_reference = None;
     let mut robust_requested = None;
     let mut robust_tuning = None;
     let mut robust_tolerance = None;
@@ -241,6 +244,15 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                     return Err("--no-trend may only be supplied once".to_owned());
                 }
                 trend_disabled = true;
+            }
+            "--phase" => {
+                if phase_reference.is_some() {
+                    return Err("--phase may only be supplied once".to_owned());
+                }
+                phase_reference = Some(parse_phase_reference(&required_value(
+                    &mut arguments,
+                    option,
+                )?)?);
             }
             "--method" => {
                 if robust_requested.is_some() {
@@ -370,6 +382,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let fit_options = FitOptions {
         trend: !trend_disabled,
     };
+    let phase_reference = phase_reference.unwrap_or_default();
     let reconstruction = resolve_reconstruction(
         reconstruct,
         reconstruction_constituents,
@@ -400,6 +413,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             constituent_selection,
             inference,
             fit_options,
+            phase_reference,
             confidence_interval,
             analysis_method,
             reconstruction,
@@ -420,6 +434,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             constituent_selection,
             inference,
             fit_options,
+            phase_reference,
             confidence_interval,
             analysis_method,
             reconstruction,
@@ -693,6 +708,18 @@ fn parse_confidence(value: &OsStr) -> Result<ParsedConfidence, String> {
     }
 }
 
+fn parse_phase_reference(value: &OsStr) -> Result<PhaseReference, String> {
+    match value.to_str() {
+        Some("greenwich") => Ok(PhaseReference::Greenwich),
+        Some("linear-time") => Ok(PhaseReference::LinearTime),
+        Some("raw") => Ok(PhaseReference::Raw),
+        Some(value) => Err(format!(
+            "--phase must be greenwich, linear-time, or raw, got {value}"
+        )),
+        None => Err("--phase must be valid UTF-8".to_owned()),
+    }
+}
+
 fn parse_analysis_method(value: &OsStr) -> Result<bool, String> {
     match value.to_str() {
         Some("ols") => Ok(false),
@@ -783,8 +810,9 @@ mod tests {
         NodeSelection, ScalarInferenceConfig, VectorInferenceConfig,
     };
     use rutide_core::{
-        FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, ReconstructionFilter,
-        RobustOptions, ScalarInferenceRelation, TidalConstituent, VectorInferenceRelation,
+        FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, PhaseReference,
+        ReconstructionFilter, RobustOptions, ScalarInferenceRelation, TidalConstituent,
+        VectorInferenceRelation,
     };
 
     fn args<'a>(values: &'a [&'a str]) -> impl Iterator<Item = OsString> + 'a {
@@ -874,6 +902,8 @@ mod tests {
             "4,1,3",
             "--confidence",
             "linear",
+            "--phase",
+            "linear-time",
             "--reconstruct",
         ]))
         .expect("valid vector arguments");
@@ -886,6 +916,7 @@ mod tests {
             ConfidenceInterval::Linear(LinearConfidence::Colored)
         );
         assert_eq!(config.reconstruction, Some(ReconstructionFilter::All));
+        assert_eq!(config.phase_reference, PhaseReference::LinearTime);
         assert!(
             parse_arguments(args(&[
                 "analyze-vector",
@@ -901,6 +932,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers shared scalar/vector inference and solver-option parsing"
+    )]
     fn parses_scalar_and_vector_inference_and_rejects_invalid_combinations() {
         let scalar = parse_arguments(args(&[
             "analyze-scalar",
@@ -912,6 +947,8 @@ mod tests {
             "S2:M2:0.35:20",
             "--infer-approximate",
             "--no-trend",
+            "--phase",
+            "raw",
             "--confidence",
             "monte-carlo",
             "--mc-realizations",
@@ -936,6 +973,7 @@ mod tests {
             })
         );
         assert_eq!(config.fit_options, FitOptions { trend: false });
+        assert_eq!(config.phase_reference, PhaseReference::Raw);
         assert_eq!(
             config.confidence_interval,
             ConfidenceInterval::MonteCarlo {
@@ -980,6 +1018,7 @@ mod tests {
         );
         assert!(matches!(config.analysis_method, AnalysisMethod::Robust(_)));
         assert_eq!(config.fit_options, FitOptions::default());
+        assert_eq!(config.phase_reference, PhaseReference::Greenwich);
         assert!(matches!(
             config.confidence_interval,
             ConfidenceInterval::MonteCarlo { .. }
@@ -988,6 +1027,8 @@ mod tests {
         for invalid in [
             &["--infer-approximate"][..],
             &["--no-trend", "--no-trend"][..],
+            &["--phase", "raw", "--phase", "greenwich"][..],
+            &["--phase", "linear_time"][..],
             &["--infer", "S2:M2:-0.1:20"][..],
             &["--infer", "S2:M2:0.3"][..],
         ] {
