@@ -196,6 +196,12 @@ plans, and a dedicated worker pool inside Rust. Coefficients use stable
 xarray conversion; a working-memory limit bounds native solve chunks. Single and
 batch coefficient objects can be atomically saved to a versioned, pickle-free
 NPZ archive and restored without refitting or storing source observations.
+Packed typed-array blobs keep large batch archives compact and fast to restore;
+the retained 4,096-series profile improved load time by 72.28x while continuing
+to read original schema-1 archives. The
+[real-data acceptance](benchmarks/results/real-data-acceptance-2026-09-03.md) and
+[persistence profile](benchmarks/results/python-batch-persistence-2026-09-03.md)
+record the installed-wheel ADCP/FVCOM evidence.
 
 See the [Python API guide](PYTHON_API.md) for installation, examples, time
 epochs, supported options, intentional compatibility differences, and the

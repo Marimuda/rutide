@@ -7,6 +7,21 @@ published API and file-schema contracts.
 
 ## Unreleased
 
+### Added
+
+- An installed-wheel acceptance harness for a public NOAA/NDBC ADCP profile and
+  a domain-spanning selection from the 25.78 GB FVCOM fixture, including
+  reconstruction and coefficient-persistence validation.
+- A matched Rust/Python benchmark profile for robust coupled-vector inference
+  with irregular sampling, colored confidence, joint missing values, and
+  isolated outliers.
+
+### Changed
+
+- Coalesced schema-1 coefficient snapshot arrays into bounded typed NPZ blobs.
+  Existing schema-1 archives remain readable while large batch archives save
+  and load with far fewer ZIP entries.
+
 ## 0.2.0 - 2026-09-02
 
 ### Added

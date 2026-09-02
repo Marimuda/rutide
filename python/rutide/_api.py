@@ -23,6 +23,7 @@ _MJD_EPOCH = np.datetime64("1858-11-17T00:00:00", "ms")
 _COEFFICIENT_FILE_SCHEMA = 1
 _METADATA_KEY = "__rutide_metadata__"
 _ARRAY_MARKER = "__rutide_array__"
+_ARRAY_BLOB_BYTES = 64 * 1024 * 1024
 
 
 class Bunch(dict[str, Any]):
@@ -405,8 +406,9 @@ def save(
 
     if not isinstance(coef, (Coefficient, CoefficientBatch)):
         raise TypeError("coef must be returned by rutide.solve or rutide.solve_many")
-    arrays: dict[str, npt.NDArray[Any]] = {}
-    snapshot = _pack_snapshot(coef._fit.snapshot(), arrays)
+    packer = _ArrayPacker()
+    snapshot = _pack_snapshot(coef._fit.snapshot(), packer)
+    arrays = packer.finish()
     document = {
         "format": "rutide-coefficients",
         "schema_version": _COEFFICIENT_FILE_SCHEMA,
@@ -711,22 +713,79 @@ def _restore_missing_matrix(
     return output
 
 
-def _pack_snapshot(value: Any, arrays: dict[str, npt.NDArray[Any]]) -> Any:
+class _ArrayPacker:
+    """Coalesce native snapshot arrays into bounded blobs with cheap random views."""
+
+    def __init__(self) -> None:
+        self.arrays: dict[str, npt.NDArray[Any]] = {}
+        self.buffer = bytearray()
+        self.buffer_key: str | None = None
+        self.next_key = 0
+
+    def _key(self) -> str:
+        key = f"array_blob_{self.next_key:06d}"
+        self.next_key += 1
+        return key
+
+    def _flush(self) -> None:
+        if self.buffer_key is not None:
+            self.arrays[self.buffer_key] = np.frombuffer(self.buffer, dtype=np.uint8)
+            self.buffer = bytearray()
+            self.buffer_key = None
+
+    def add(self, value: npt.NDArray[Any]) -> dict[str, Any]:
+        """Return a typed slice marker for one contiguous numeric array."""
+        array = np.ascontiguousarray(value)
+        if array.dtype.hasobject or array.dtype.fields is not None:
+            raise TypeError("native coefficient snapshots require plain numeric arrays")
+        byte_view = array.view(np.uint8).reshape(-1)
+        if byte_view.size > _ARRAY_BLOB_BYTES:
+            self._flush()
+            key = self._key()
+            self.arrays[key] = byte_view
+            offset = 0
+        else:
+            if self.buffer_key is None:
+                self.buffer_key = self._key()
+            padding = (-len(self.buffer)) % max(1, array.dtype.alignment)
+            if len(self.buffer) + padding + byte_view.size > _ARRAY_BLOB_BYTES:
+                self._flush()
+                self.buffer_key = self._key()
+                padding = 0
+            key = self.buffer_key
+            self.buffer.extend(bytes(padding))
+            offset = len(self.buffer)
+            self.buffer.extend(memoryview(byte_view))
+        return {
+            _ARRAY_MARKER: {
+                "blob": key,
+                "offset": offset,
+                "nbytes": int(byte_view.size),
+                "dtype": array.dtype.str,
+                "shape": list(array.shape),
+            }
+        }
+
+    def finish(self) -> dict[str, npt.NDArray[Any]]:
+        """Flush the final blob and return arrays ready for NPZ serialization."""
+        self._flush()
+        return self.arrays
+
+
+def _pack_snapshot(value: Any, packer: _ArrayPacker) -> Any:
     if isinstance(value, np.ndarray):
         if value.dtype.hasobject:
             raise TypeError("native coefficient snapshots cannot contain object arrays")
-        key = f"array_{len(arrays):06d}"
-        arrays[key] = np.ascontiguousarray(value)
-        return {_ARRAY_MARKER: key}
+        return packer.add(value)
     if isinstance(value, Mapping):
         packed: dict[str, Any] = {}
         for key, item in value.items():
             if not isinstance(key, str):
                 raise TypeError("native coefficient snapshot keys must be strings")
-            packed[key] = _pack_snapshot(item, arrays)
+            packed[key] = _pack_snapshot(item, packer)
         return packed
     if isinstance(value, (list, tuple)):
-        return [_pack_snapshot(item, arrays) for item in value]
+        return [_pack_snapshot(item, packer) for item in value]
     if isinstance(value, np.generic):
         return value.item()
     if value is None or isinstance(value, (bool, int, float, str)):
@@ -734,20 +793,79 @@ def _pack_snapshot(value: Any, arrays: dict[str, npt.NDArray[Any]]) -> Any:
     raise TypeError(f"unsupported native coefficient snapshot value {type(value).__name__}")
 
 
-def _unpack_snapshot(value: Any, archive: Any, used: set[str]) -> Any:
+def _unpack_snapshot(
+    value: Any,
+    archive: Any,
+    used: set[str],
+    blobs: dict[str, npt.NDArray[np.uint8]] | None = None,
+) -> Any:
+    if blobs is None:
+        blobs = {}
     if isinstance(value, dict):
         if set(value) == {_ARRAY_MARKER}:
-            key = value[_ARRAY_MARKER]
-            if not isinstance(key, str) or key == _METADATA_KEY or key not in archive.files:
-                raise ValueError(f"invalid coefficient array reference {key!r}")
-            array = archive[key]
-            if array.dtype.hasobject:
-                raise ValueError(f"coefficient array {key!r} has forbidden object dtype")
+            marker = value[_ARRAY_MARKER]
+            if isinstance(marker, str):
+                if marker == _METADATA_KEY or marker not in archive.files:
+                    raise ValueError(f"invalid coefficient array reference {marker!r}")
+                array = archive[marker]
+                if array.dtype.hasobject:
+                    raise ValueError(f"coefficient array {marker!r} has forbidden object dtype")
+                used.add(marker)
+                return np.ascontiguousarray(array)
+            if not isinstance(marker, dict) or set(marker) != {
+                "blob",
+                "offset",
+                "nbytes",
+                "dtype",
+                "shape",
+            }:
+                raise ValueError("invalid packed coefficient array marker")
+            key = marker["blob"]
+            offset = marker["offset"]
+            nbytes = marker["nbytes"]
+            shape = marker["shape"]
+            if (
+                not isinstance(key, str)
+                or key == _METADATA_KEY
+                or key not in archive.files
+                or not isinstance(offset, int)
+                or isinstance(offset, bool)
+                or offset < 0
+                or not isinstance(nbytes, int)
+                or isinstance(nbytes, bool)
+                or nbytes < 0
+                or not isinstance(shape, list)
+                or any(
+                    not isinstance(size, int) or isinstance(size, bool) or size < 0
+                    for size in shape
+                )
+            ):
+                raise ValueError("invalid packed coefficient array bounds")
+            try:
+                dtype = np.dtype(marker["dtype"])
+            except TypeError as error:
+                raise ValueError("invalid packed coefficient array dtype") from error
+            if dtype.hasobject or dtype.fields is not None:
+                raise ValueError("packed coefficient arrays require plain numeric dtypes")
+            expected_items = 1
+            for size in shape:
+                expected_items *= size
+            expected_bytes = expected_items * dtype.itemsize
+            if expected_bytes != nbytes:
+                raise ValueError("packed coefficient array shape and byte length disagree")
+            if key not in blobs:
+                blob = archive[key]
+                if blob.dtype != np.uint8 or blob.ndim != 1:
+                    raise ValueError(f"coefficient blob {key!r} must be one-dimensional uint8")
+                blobs[key] = np.ascontiguousarray(blob)
+            blob = blobs[key]
+            if offset + nbytes > blob.size:
+                raise ValueError("packed coefficient array exceeds its blob")
             used.add(key)
-            return np.ascontiguousarray(array)
-        return {key: _unpack_snapshot(item, archive, used) for key, item in value.items()}
+            return blob[offset : offset + nbytes].view(dtype).reshape(shape)
+        return {key: _unpack_snapshot(item, archive, used, blobs) for key, item in value.items()}
     if isinstance(value, list):
-        return [_unpack_snapshot(item, archive, used) for item in value]
+        return [_unpack_snapshot(item, archive, used, blobs) for item in value]
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     raise ValueError(f"invalid coefficient metadata value {type(value).__name__}")

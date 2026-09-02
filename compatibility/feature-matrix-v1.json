@@ -271,7 +271,8 @@
         "PYTHON_API.md",
         "python/tests/test_api.py",
         "crates/rutide-python/src/lib.rs",
-        "benchmarks/results/python-bindings-2026-09-02.md"
+        "benchmarks/results/python-bindings-2026-09-02.md",
+        "benchmarks/results/real-data-acceptance-2026-09-03.md"
       ],
       "limitations": [
         "The Python interface is UTide-inspired rather than a strict drop-in replacement",
@@ -287,7 +288,8 @@
       "evidence": [
         "PYTHON_API.md",
         "python/tests/test_api.py",
-        "crates/rutide-python/src/persistence.rs"
+        "crates/rutide-python/src/persistence.rs",
+        "benchmarks/results/python-batch-persistence-2026-09-03.md"
       ],
       "limitations": [
         "Schema-1 archives are supported within the matching RUTide major/minor release line"

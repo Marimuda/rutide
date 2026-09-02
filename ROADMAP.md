@@ -168,13 +168,15 @@ and colored intervals, leverage, weights, iteration count, residual diagnostics,
 and reconstruction; the CLI writes the same ragged diagnostics for complete or
 gappy batches.
 
-The comparative measurements are now retained in
+The OLS comparative measurements are retained in
 `benchmarks/results/inferred-constituents-2026-09-01.md`. Across controlled
 100-series exact-inference runs, RUTide is 48.97–228.45x faster than pinned
 Python; retained 1,000-series comparisons are 71.93–140.44x faster. Approximate
-mode is 69.30–86.55x faster at 16 workers. These measurements predate the robust
-coupled-vector implementation; robust inference performance has not yet been
-benchmarked separately.
+mode is 69.30–86.55x faster at 16 workers. The subsequent matched irregular
+robust coupled-vector profile is retained in
+`benchmarks/results/robust-vector-inference-2026-09-03.md`: RUTide is 84.12x
+faster on one worker and 58.15x faster on 16 workers, while robust IRLS costs
+approximately 2.04x the corresponding Rust OLS path.
 
 ## 4. Monte Carlo confidence intervals — complete
 
@@ -321,7 +323,11 @@ validation rather than partially applied.
   persistence. Archives preserve fitted solutions, uncertainty and robust
   diagnostics, inference/options, and retained model time without retaining
   source observations; load recreates the native reconstruction model and may
-  retune the batch worker count for the destination machine.
+  retune the batch worker count for the destination machine. Bounded typed-array
+  blobs keep the format backward-compatible while reducing the retained
+  4,096-series FVCOM archive load time from 47.59 s to 0.66 s and archive size
+  from 16.59 MB to 2.18 MB; see
+  `benchmarks/results/python-batch-persistence-2026-09-03.md`.
 - The public-binding benchmark directly compares Python UTide loops, RUTide
   one-series loops, and RUTide batches. On retained 100-series profiles the
   native batch is 111.37–186.12x faster for fitting and 124.68–262.74x faster

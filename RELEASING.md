@@ -15,7 +15,9 @@ same package version through maturin.
 4. Update `compatibility/feature-matrix-v1.json` and verify any NetCDF/JSON schema
    changes have incremented their independent schema constants.
 5. Run the full Rust, Python, documentation, package, and wheel checks documented
-   in the repository README.
+   in the repository README. Inspect `cargo package --workspace --locked` and
+   install both the wheel and source distribution into clean environments; a
+   successful in-tree test run alone is not a release check.
 6. Commit the release, create the signed `vX.Y.Z` tag, and push both commit and
    tag. Tags must point at a clean commit whose reported package versions agree.
 

@@ -603,6 +603,14 @@ class PersistenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "vector-batch.rutide.npz"
             rutide.save(coefficients, path, compressed=False)
+            with np.load(path, allow_pickle=False) as archive:
+                self.assertLessEqual(len(archive.files), 3)
+                self.assertTrue(
+                    all(
+                        name == "__rutide_metadata__" or name.startswith("array_blob_")
+                        for name in archive.files
+                    )
+                )
             restored = rutide.load(path, workers=1)
 
         self.assertIsInstance(restored, rutide.CoefficientBatch)
@@ -660,6 +668,16 @@ class PersistenceTests(unittest.TestCase):
             invalid = directory / "future.npz"
             np.savez(invalid, **arrays)
             with self.assertRaisesRegex(ValueError, "unsupported coefficient archive schema"):
+                rutide.load(invalid)
+
+            with np.load(valid, allow_pickle=False) as archive:
+                arrays = {name: archive[name] for name in archive.files}
+            document = json.loads(arrays[metadata_name].tobytes().decode("utf-8"))
+            document["snapshot"]["time_mjd"]["__rutide_array__"]["offset"] = 10**12
+            arrays[metadata_name] = np.frombuffer(json.dumps(document).encode(), dtype=np.uint8)
+            invalid = directory / "invalid-bounds.npz"
+            np.savez(invalid, **arrays)
+            with self.assertRaisesRegex(ValueError, "exceeds its blob"):
                 rutide.load(invalid)
 
     def test_single_fit_rejects_worker_override(self) -> None:

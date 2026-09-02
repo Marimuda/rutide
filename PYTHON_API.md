@@ -206,13 +206,17 @@ tide = rutide.reconstruct_many(target_time, restored)
 `rutide.save(coef, path)` is the equivalent function form. It writes atomically
 and uses compressed NPZ by default; pass `compressed=False` when write speed is
 more important than storage. The archive is pickle-free and stores schema-1
-JSON metadata plus typed NumPy arrays. It contains the normalized retained
+JSON metadata plus typed NumPy arrays. Arrays are coalesced into bounded typed
+blobs instead of creating one ZIP entry for every field of every batch member;
+loading exposes validated zero-copy views of those blobs to the native restore
+path. It contains the normalized retained
 timestamps, fitted solution, uncertainty and robust diagnostics, constituent
 selection, inference graph, and every option needed to rebuild the immutable
 native reconstruction model. Original observation values are deliberately not
 stored.
 
-RUTide `0.2.x` loads schema-1 archives written by another `0.2.x` release and
+RUTide `0.2.x` loads both the original per-array and packed-blob schema-1
+archives written by another `0.2.x` release and
 rejects incompatible release lines or unknown schemas rather than guessing.
 Loading a batch recreates its dedicated native worker pool; `workers=` may
 override the saved worker count for the current machine. A loaded object has the
