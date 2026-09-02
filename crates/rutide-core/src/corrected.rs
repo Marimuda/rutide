@@ -139,6 +139,39 @@ fn solve_vector_with_batch_confidence(
     }
 }
 
+fn solve_vector_inference_with_batch_confidence(
+    model: &VectorInferenceOls,
+    eastward: &[f64],
+    northward: &[f64],
+    robust: Option<RobustOptions>,
+    confidence: Option<BatchConfidence>,
+    stream: u64,
+) -> Result<VectorSolution, AnalysisError> {
+    match (robust, confidence) {
+        (Some(options), Some(BatchConfidence::Linear(noise))) => {
+            model.solve_vector_robust_with_linear_confidence(eastward, northward, options, noise)
+        }
+        (Some(robust_options), Some(BatchConfidence::MonteCarlo { options, noise })) => model
+            .solve_vector_robust_with_monte_carlo_confidence_from_stream(
+                eastward,
+                northward,
+                robust_options,
+                options,
+                noise,
+                stream,
+            ),
+        (Some(options), None) => model.solve_vector_robust(eastward, northward, options),
+        (None, Some(BatchConfidence::Linear(noise))) => {
+            model.solve_vector_with_linear_confidence(eastward, northward, noise)
+        }
+        (None, Some(BatchConfidence::MonteCarlo { options, noise })) => model
+            .solve_vector_with_monte_carlo_confidence_from_stream(
+                eastward, northward, options, noise, stream,
+            ),
+        (None, None) => model.solve_vector(eastward, northward),
+    }
+}
+
 fn shared_lomb_plan_groups(record_use_count: &[usize]) -> Vec<bool> {
     let mut candidates = record_use_count
         .iter()
@@ -2626,7 +2659,35 @@ impl ScalarInferenceBatch {
         latitudes: &[f64],
         noise: LinearConfidence,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_impl(observations, latitudes, Some(noise), None, false)
+        self.solve_time_major_impl(
+            observations,
+            latitudes,
+            Some(BatchConfidence::Linear(noise)),
+            None,
+            false,
+        )
+    }
+
+    /// Fit complete inferred scalar series with deterministic Monte Carlo
+    /// confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input, options, or covariance.
+    pub fn solve_time_major_with_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_impl(
+            observations,
+            latitudes,
+            Some(BatchConfidence::MonteCarlo { options, noise }),
+            None,
+            false,
+        )
     }
 
     /// Robustly fit complete scalar series.
@@ -2655,7 +2716,40 @@ impl ScalarInferenceBatch {
         options: RobustOptions,
         noise: LinearConfidence,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_impl(observations, latitudes, Some(noise), Some(options), false)
+        self.solve_time_major_impl(
+            observations,
+            latitudes,
+            Some(BatchConfidence::Linear(noise)),
+            Some(options),
+            false,
+        )
+    }
+
+    /// Robustly fit complete inferred scalar series with deterministic Monte
+    /// Carlo confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or options, robust fitting failure,
+    /// or covariance failure.
+    pub fn solve_time_major_robust_with_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_impl(
+            observations,
+            latitudes,
+            Some(BatchConfidence::MonteCarlo {
+                options: monte_carlo_options,
+                noise,
+            }),
+            Some(robust_options),
+            false,
+        )
     }
 
     /// Fit scalar series while treating `NaN` observations as missing.
@@ -2683,7 +2777,36 @@ impl ScalarInferenceBatch {
         latitudes: &[f64],
         noise: LinearConfidence,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_impl(observations, latitudes, Some(noise), None, true)
+        self.solve_time_major_impl(
+            observations,
+            latitudes,
+            Some(BatchConfidence::Linear(noise)),
+            None,
+            true,
+        )
+    }
+
+    /// Fit gappy inferred scalar series with deterministic Monte Carlo
+    /// confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input, options, underdetermined retained
+    /// records, or covariance failure.
+    pub fn solve_time_major_with_missing_and_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_impl(
+            observations,
+            latitudes,
+            Some(BatchConfidence::MonteCarlo { options, noise }),
+            None,
+            true,
+        )
     }
 
     /// Robustly fit scalar series while treating `NaN` as missing.
@@ -2712,14 +2835,47 @@ impl ScalarInferenceBatch {
         options: RobustOptions,
         noise: LinearConfidence,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_impl(observations, latitudes, Some(noise), Some(options), true)
+        self.solve_time_major_impl(
+            observations,
+            latitudes,
+            Some(BatchConfidence::Linear(noise)),
+            Some(options),
+            true,
+        )
+    }
+
+    /// Robustly fit gappy inferred scalar series with deterministic Monte Carlo
+    /// confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or options, robust fitting failure,
+    /// underdetermined records, or covariance failure.
+    pub fn solve_time_major_with_missing_robust_and_monte_carlo_confidence(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_impl(
+            observations,
+            latitudes,
+            Some(BatchConfidence::MonteCarlo {
+                options: monte_carlo_options,
+                noise,
+            }),
+            Some(robust_options),
+            true,
+        )
     }
 
     fn solve_time_major_impl(
         &self,
         observations: &[f64],
         latitudes: &[f64],
-        confidence: Option<LinearConfidence>,
+        confidence: Option<BatchConfidence>,
         robust: Option<RobustOptions>,
         allow_missing: bool,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
@@ -2758,7 +2914,7 @@ impl ScalarInferenceBatch {
             .zip(shared_lomb_plan_groups(&record_use_count))
             .map(|(positions, share_plan)| self.basis.record_subset(positions, share_plan))
             .collect::<Result<Vec<_>, _>>()?;
-        if confidence == Some(LinearConfidence::Colored) {
+        if confidence.map(BatchConfidence::noise) == Some(LinearConfidence::Colored) {
             for record in &records {
                 record
                     .confidence_sampling
@@ -2784,12 +2940,29 @@ impl ScalarInferenceBatch {
                     .copied()
                     .map(|time| observations[time * series_count + series])
                     .collect::<Vec<_>>();
+                let stream = u64::try_from(series).expect("series index is representable as u64");
                 match (robust, confidence) {
-                    (Some(options), Some(noise)) => {
+                    (Some(options), Some(BatchConfidence::Linear(noise))) => {
                         model.solve_robust_with_linear_confidence(&values, options, noise)
                     }
+                    (
+                        Some(robust_options),
+                        Some(BatchConfidence::MonteCarlo { options, noise }),
+                    ) => model.solve_with_monte_carlo_confidence_impl(
+                        &values,
+                        Some(robust_options),
+                        options,
+                        noise,
+                        stream,
+                    ),
                     (Some(options), None) => model.solve_robust(&values, options),
-                    (None, Some(noise)) => model.solve_with_linear_confidence(&values, noise),
+                    (None, Some(BatchConfidence::Linear(noise))) => {
+                        model.solve_with_linear_confidence(&values, noise)
+                    }
+                    (None, Some(BatchConfidence::MonteCarlo { options, noise })) => model
+                        .solve_with_monte_carlo_confidence_impl(
+                            &values, None, options, noise, stream,
+                        ),
                     (None, None) => model.solve(&values),
                 }
             })
@@ -2916,7 +3089,38 @@ impl VectorInferenceBatch {
         latitudes: &[f64],
         noise: LinearConfidence,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
-        self.solve_vector_time_major_impl(eastward, northward, latitudes, Some(noise), None, false)
+        self.solve_vector_time_major_impl(
+            eastward,
+            northward,
+            latitudes,
+            Some(BatchConfidence::Linear(noise)),
+            None,
+            false,
+        )
+    }
+
+    /// Fit complete inferred currents with deterministic Monte Carlo ellipse
+    /// confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input, options, or covariance.
+    pub fn solve_vector_time_major_with_monte_carlo_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_impl(
+            eastward,
+            northward,
+            latitudes,
+            Some(BatchConfidence::MonteCarlo { options, noise }),
+            None,
+            false,
+        )
     }
 
     /// Robustly fit complete inferred current series.
@@ -2958,8 +3162,37 @@ impl VectorInferenceBatch {
             eastward,
             northward,
             latitudes,
-            Some(noise),
+            Some(BatchConfidence::Linear(noise)),
             Some(options),
+            false,
+        )
+    }
+
+    /// Robustly fit complete inferred currents with deterministic Monte Carlo
+    /// ellipse confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or options, robust fitting failure,
+    /// or covariance failure.
+    pub fn solve_vector_time_major_robust_with_monte_carlo_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_impl(
+            eastward,
+            northward,
+            latitudes,
+            Some(BatchConfidence::MonteCarlo {
+                options: monte_carlo_options,
+                noise,
+            }),
+            Some(robust_options),
             false,
         )
     }
@@ -2992,7 +3225,39 @@ impl VectorInferenceBatch {
         latitudes: &[f64],
         noise: LinearConfidence,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
-        self.solve_vector_time_major_impl(eastward, northward, latitudes, Some(noise), None, true)
+        self.solve_vector_time_major_impl(
+            eastward,
+            northward,
+            latitudes,
+            Some(BatchConfidence::Linear(noise)),
+            None,
+            true,
+        )
+    }
+
+    /// Fit gappy inferred currents with deterministic Monte Carlo ellipse
+    /// confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input, options, underdetermined retained
+    /// records, or covariance failure.
+    pub fn solve_vector_time_major_with_missing_and_monte_carlo_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_impl(
+            eastward,
+            northward,
+            latitudes,
+            Some(BatchConfidence::MonteCarlo { options, noise }),
+            None,
+            true,
+        )
     }
 
     /// Robustly fit inferred currents while jointly omitting `NaN` samples.
@@ -3027,8 +3292,37 @@ impl VectorInferenceBatch {
             eastward,
             northward,
             latitudes,
-            Some(noise),
+            Some(BatchConfidence::Linear(noise)),
             Some(options),
+            true,
+        )
+    }
+
+    /// Robustly fit gappy inferred currents with deterministic Monte Carlo
+    /// ellipse confidence intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or options, robust fitting failure,
+    /// underdetermined records, or covariance failure.
+    pub fn solve_vector_time_major_with_missing_robust_and_monte_carlo_confidence(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_impl(
+            eastward,
+            northward,
+            latitudes,
+            Some(BatchConfidence::MonteCarlo {
+                options: monte_carlo_options,
+                noise,
+            }),
+            Some(robust_options),
             true,
         )
     }
@@ -3038,7 +3332,7 @@ impl VectorInferenceBatch {
         eastward: &[f64],
         northward: &[f64],
         latitudes: &[f64],
-        confidence: Option<LinearConfidence>,
+        confidence: Option<BatchConfidence>,
         robust: Option<RobustOptions>,
         allow_missing: bool,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
@@ -3086,7 +3380,7 @@ impl VectorInferenceBatch {
             .zip(shared_lomb_plan_groups(&record_use_count))
             .map(|(positions, share_plan)| self.basis.record_subset(positions, share_plan))
             .collect::<Result<Vec<_>, _>>()?;
-        if confidence == Some(LinearConfidence::Colored) {
+        if confidence.map(BatchConfidence::noise) == Some(LinearConfidence::Colored) {
             for record in &records {
                 record
                     .confidence_sampling
@@ -3118,24 +3412,15 @@ impl VectorInferenceBatch {
                     .copied()
                     .map(|time| northward[time * series_count + series])
                     .collect::<Vec<_>>();
-                match (robust, confidence) {
-                    (Some(options), Some(noise)) => model
-                        .solve_vector_robust_with_linear_confidence(
-                            &eastward_values,
-                            &northward_values,
-                            options,
-                            noise,
-                        ),
-                    (Some(options), None) => {
-                        model.solve_vector_robust(&eastward_values, &northward_values, options)
-                    }
-                    (None, Some(noise)) => model.solve_vector_with_linear_confidence(
-                        &eastward_values,
-                        &northward_values,
-                        noise,
-                    ),
-                    (None, None) => model.solve_vector(&eastward_values, &northward_values),
-                }
+                let stream = u64::try_from(series).expect("series index is representable as u64");
+                solve_vector_inference_with_batch_confidence(
+                    &model,
+                    &eastward_values,
+                    &northward_values,
+                    robust,
+                    confidence,
+                    stream,
+                )
             })
             .collect()
     }

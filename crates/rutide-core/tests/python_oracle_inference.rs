@@ -1,5 +1,6 @@
 //! Scalar inferred-constituent parity against the pinned Python `UTide` oracle.
 
+use rayon::ThreadPoolBuilder;
 use rutide_core::{
     AnalysisError, GreenwichNodalOls, InferenceMode, LinearConfidence, MonteCarloOptions,
     ReconstructionFilter, RobustOptions, ScalarInferenceBatch, ScalarInferenceOls,
@@ -681,6 +682,135 @@ fn vector_monte_carlo_propagates_shared_rotary_reference_draws() {
         major_ci[4],
         0.35 * major_ci[3],
         2e-14,
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "covers scalar/vector irregular masks, worker invariance, and robust batch dispatch together"
+)]
+fn irregular_gappy_inference_monte_carlo_batches_are_reproducible() {
+    faer::set_global_parallelism(faer::Par::Seq);
+    let mut time = oracle_times(745);
+    let final_index = time.len() - 1;
+    for (index, value) in time.iter_mut().enumerate().take(final_index).skip(1) {
+        let index = f64::from(u32::try_from(index).expect("fixture index fits u32"));
+        *value += 0.002 * (index * 0.37).sin() + 0.0007 * (index * 0.11).cos();
+    }
+    let series_count = 4;
+    let latitudes = (0..series_count)
+        .map(|series| {
+            LATITUDE + f64::from(u32::try_from(series).expect("series count fits u32")) * 1e-5
+        })
+        .collect::<Vec<_>>();
+    let scalar_source = oracle_observations(745);
+    let mut scalar = Vec::with_capacity(time.len() * series_count);
+    for value in scalar_source {
+        for series in 0..series_count {
+            scalar.push(
+                value + f64::from(u32::try_from(series).expect("series count fits u32")) * 1e-4,
+            );
+        }
+    }
+    for series in 0..series_count {
+        scalar[(137 + series * 11) * series_count + series] = f64::NAN;
+        scalar[(411 + series * 7) * series_count + series] = f64::NAN;
+    }
+    let (eastward_source, northward_source) = synthetic_vector_observations(&time);
+    let mut eastward = Vec::with_capacity(time.len() * series_count);
+    let mut northward = Vec::with_capacity(time.len() * series_count);
+    for (east, north) in eastward_source.into_iter().zip(northward_source) {
+        for series in 0..series_count {
+            let offset = f64::from(u32::try_from(series).expect("series count fits u32")) * 1e-4;
+            eastward.push(east + offset);
+            northward.push(north - offset);
+        }
+    }
+    for series in 0..series_count {
+        eastward[(101 + series * 13) * series_count + series] = f64::NAN;
+        northward[(379 + series * 9) * series_count + series] = f64::NAN;
+    }
+    let scalar_batch = ScalarInferenceBatch::prepare_modified_julian_days(
+        &time,
+        &requested(),
+        &RELATIONSHIPS,
+        InferenceMode::Exact,
+    )
+    .expect("valid scalar inference batch");
+    let vector_batch = VectorInferenceBatch::prepare_modified_julian_days(
+        &time,
+        &requested(),
+        &VECTOR_RELATIONSHIPS,
+        InferenceMode::Exact,
+    )
+    .expect("valid vector inference batch");
+    let options = MonteCarloOptions {
+        realizations: 97,
+        seed: 20_260_904,
+    };
+    let solve = |workers| {
+        ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .expect("valid thread pool")
+            .install(|| {
+                let scalar = scalar_batch
+                    .solve_time_major_with_missing_and_monte_carlo_confidence(
+                        &scalar,
+                        &latitudes,
+                        options,
+                        LinearConfidence::Colored,
+                    )
+                    .expect("valid scalar batch solution");
+                let vector = vector_batch
+                    .solve_vector_time_major_with_missing_and_monte_carlo_confidence(
+                        &eastward,
+                        &northward,
+                        &latitudes,
+                        options,
+                        LinearConfidence::Colored,
+                    )
+                    .expect("valid vector batch solution");
+                (scalar, vector)
+            })
+    };
+    let sequential = solve(1);
+    let parallel = solve(4);
+    assert_eq!(sequential, parallel);
+    assert_ne!(
+        sequential.0[0].amplitude_ci, sequential.0[1].amplitude_ci,
+        "series must receive distinct derived random streams"
+    );
+
+    let robust_scalar = scalar_batch
+        .solve_time_major_with_missing_robust_and_monte_carlo_confidence(
+            &scalar,
+            &latitudes,
+            RobustOptions::default(),
+            options,
+            LinearConfidence::Colored,
+        )
+        .expect("valid robust scalar batch");
+    let robust_vector = vector_batch
+        .solve_vector_time_major_with_missing_robust_and_monte_carlo_confidence(
+            &eastward,
+            &northward,
+            &latitudes,
+            RobustOptions::default(),
+            options,
+            LinearConfidence::Colored,
+        )
+        .expect("valid robust vector batch");
+    assert!(
+        robust_scalar
+            .iter()
+            .all(|solution| solution.robust.is_some())
+    );
+    assert!(
+        robust_vector
+            .iter()
+            .all(|solution| solution.robust.is_some())
     );
 }
 
