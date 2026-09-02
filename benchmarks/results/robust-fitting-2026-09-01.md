@@ -131,3 +131,29 @@ speedups while exposing richer convergence diagnostics than the public Python
 coefficient surface. Further gains should be sought through batched small-matrix
 work or reducing per-latitude preparation, and must retain the current oracle and
 conditioning guarantees.
+
+## 2026-09-02 robust-weight extension check
+
+The implementation based on parent `96dceeb` adds Andrews, bisquare, Fair,
+Huber, logistic, OLS, Talwar, and Welsch without changing the Cauchy default.
+Bisquare, Cauchy, Fair, OLS, Talwar, and Welsch match pinned Python scalar and
+vector solutions, weight sums, and iteration counts. Welsch additionally passes
+the exact inferred-vector oracle and the application integration path with
+Monte Carlo confidence and reconstruction. Pinned Python UTide raises an
+ambiguous-array truth-value exception for Andrews, Huber, and logistic; their
+standard scalar formulas are therefore covered as explicit Rust extensions.
+
+The original one-worker, 100-series Cauchy probe was repeated after adding the
+enum dispatch. Thin LTO and `-C target-cpu=native` were retained, as were the
+fixture, five repetitions, one warm-up, checksums, and iteration counts.
+
+| Field | Historical median (s) | Extension median (s) | Extension series/s | Checksum | Iterations/series |
+|---|---:|---:|---:|---:|---:|
+| Scalar | 0.173373 | 0.138518 | 721.93 | 1.038511490236e0 | 5 |
+| Vector | 0.172838 | 0.120023 | 833.17 | 1.902186175256e0 | 2 |
+
+The extension does not regress the default profile. These unisolated runs are a
+regression check rather than evidence that the enum caused the apparent
+historical improvement; compiler, host, and background-state differences can
+easily move sub-second measurements. The unchanged checksums and iteration
+counts are the relevant work-equivalence gate.

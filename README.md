@@ -98,14 +98,14 @@ nearby elements and traverse classic NetCDF record variables in file order;
 requested layer and element order is still preserved. Chunk-local masks are
 grouped exactly as before, and global Monte Carlo stream offsets make results
 independent of chunk size and worker scheduling. JSON reports and scalar/vector
-NetCDF schemas v15/v13 record the actual chunk count, series count, and maximum
+NetCDF schemas v16/v14 record the actual chunk count, series count, and maximum
 logical observation-buffer bytes.
 
-Cauchy robust fitting is available for scalar and vector analyses, including
-missing and irregular records, colored confidence intervals, and reconstruction.
-It returns auditable weights, leverage, iteration/stopping diagnostics, robust
-scale, and OLS/final RMS residuals. Pinned-Python oracle tests cover coefficients,
-ellipses, weights, confidence intervals, and SNR.
+Robust fitting is available for scalar and vector analyses with Andrews,
+bisquare, Cauchy, Fair, Huber, logistic, OLS, Talwar, or Welsch residual
+weights, including missing and irregular records, confidence, inference, and
+reconstruction. It returns auditable weights, leverage, iteration/stopping
+diagnostics, robust scale, and OLS/final RMS residuals.
 
 Monte Carlo confidence uses complete 2×2 scalar or 4×4 current coefficient
 covariances, including eastward/northward cross-covariance. Colored current
@@ -215,13 +215,31 @@ and truly irregular scalar/current records, including inferred constituents.
 Inferred estimates reuse the reference's sampled realization so their
 constraint and correlation are retained exactly.
 
-Add `--method robust` for Python-compatible Cauchy iteratively reweighted least
-squares. Defaults are tuning constant `2.385`, fractional tolerance `0.001`, and
-50 iterations; override them with `--robust-tuning`, `--robust-tolerance`, and
-`--robust-max-iterations`. Robust NetCDF outputs include per-series convergence
-diagnostics and ragged `robust_weight` / `robust_leverage` arrays. For a series
-with missing values, each ragged row follows the finite observations in original
-timestamp order.
+Add `--method robust` for iteratively reweighted least squares. Cauchy remains
+the Python UTide analysis default; select another function with
+`--robust-weight`, and override its conventional tuning constant with
+`--robust-tuning`. Fractional tolerance defaults to `0.001` and the iteration
+limit to 50; override them with `--robust-tolerance` and
+`--robust-max-iterations`.
+
+| Weight | Default tuning | Pinned Python status |
+|---|---:|---|
+| Andrews | 1.339 | Rust extension; upstream array implementation raises |
+| Bisquare | 4.685 | Oracle matched |
+| Cauchy | 2.385 | Oracle matched; analysis default |
+| Fair | 1.400 | Oracle matched |
+| Huber | 1.345 | Rust extension; upstream array implementation raises |
+| Logistic | 1.205 | Rust extension; upstream array implementation raises |
+| OLS | 1.000 | Oracle matched |
+| Talwar | 2.795 | Oracle matched |
+| Welsch | 2.985 | Oracle matched |
+
+Robust NetCDF outputs record the selected weight function and include per-series
+convergence diagnostics plus ragged `robust_weight` / `robust_leverage` arrays.
+For a series with missing values, each ragged row follows the finite observations
+in original timestamp order. The three Rust-extension functions use their
+standard scalar definitions; pinned Python UTide applies Python's scalar `max`
+to residual arrays and fails before fitting them.
 
 Add `--no-trend` to match Python UTide's `trend=False` model. The mean remains
 fitted, but the linear-time column is omitted from the solve. This option works
@@ -466,7 +484,7 @@ Vector inference uses separate positive- and negative-rotary constraints:
 `--infer INFERRED:REFERENCE:AMP+:PHASE+:AMP-:PHASE-`. It supports exact or
 approximate OLS or robust fitting, missing values, white/colored linear or Monte
 Carlo confidence, PE/SNR, and reconstruction. Robust inference solves the coupled
-complex rotary model with one Cauchy weight per retained timestamp; NetCDF
+complex rotary model with one shared configured weight per retained timestamp; NetCDF
 outputs retain those shared weights, complex-model leverage, convergence
 diagnostics, and reconstruction metadata. Add `--method robust` alongside the
 vector `--infer` relationships to enable it.

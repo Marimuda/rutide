@@ -9,10 +9,114 @@ use crate::AnalysisError;
 
 const MAD_NORMALIZATION: f64 = 0.6745;
 
-/// Configuration for Python-UTide-compatible Cauchy robust fitting.
+/// Residual weighting function used by iteratively reweighted least squares.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RobustWeightFunction {
+    /// Andrews' sine weight, redescending to zero at pi normalized residuals.
+    Andrews,
+    /// Tukey's bisquare weight, redescending to zero at one normalized residual.
+    Bisquare,
+    /// Cauchy weight used by Python `UTide`'s default tidal-analysis profile.
+    Cauchy,
+    /// Fair weight with inverse-linear tail decay.
+    Fair,
+    /// Huber weight with inverse-linear decay beyond one normalized residual.
+    Huber,
+    /// Logistic weight using the hyperbolic-tangent influence function.
+    Logistic,
+    /// Uniform weights, equivalent to ordinary least squares.
+    Ols,
+    /// Talwar hard rejection beyond one normalized residual.
+    Talwar,
+    /// Welsch Gaussian weight.
+    Welsch,
+}
+
+impl RobustWeightFunction {
+    /// Stable lowercase name used by application interfaces and metadata.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Andrews => "andrews",
+            Self::Bisquare => "bisquare",
+            Self::Cauchy => "cauchy",
+            Self::Fair => "fair",
+            Self::Huber => "huber",
+            Self::Logistic => "logistic",
+            Self::Ols => "ols",
+            Self::Talwar => "talwar",
+            Self::Welsch => "welsch",
+        }
+    }
+
+    /// Python `UTide`'s conventional tuning constant for this function.
+    #[must_use]
+    pub const fn default_tuning_constant(self) -> f64 {
+        match self {
+            Self::Andrews => 1.339,
+            Self::Bisquare => 4.685,
+            Self::Cauchy => 2.385,
+            Self::Fair => 1.400,
+            Self::Huber => 1.345,
+            Self::Logistic => 1.205,
+            Self::Ols => 1.0,
+            Self::Talwar => 2.795,
+            Self::Welsch => 2.985,
+        }
+    }
+
+    fn weight(self, normalized_residual: f64) -> f64 {
+        let residual = normalized_residual.abs();
+        match self {
+            Self::Andrews => {
+                if residual >= std::f64::consts::PI {
+                    0.0
+                } else if residual <= f64::EPSILON.sqrt() {
+                    1.0
+                } else {
+                    residual.sin() / residual
+                }
+            }
+            Self::Bisquare => {
+                if residual >= 1.0 {
+                    0.0
+                } else {
+                    let complement = 1.0 - residual * residual;
+                    complement * complement
+                }
+            }
+            Self::Cauchy => 1.0 / residual.mul_add(residual, 1.0),
+            Self::Fair => 1.0 / (1.0 + residual),
+            Self::Huber => {
+                if residual <= 1.0 {
+                    1.0
+                } else {
+                    1.0 / residual
+                }
+            }
+            Self::Logistic => {
+                if residual <= f64::EPSILON.sqrt() {
+                    1.0
+                } else {
+                    residual.tanh() / residual
+                }
+            }
+            Self::Ols => 1.0,
+            Self::Talwar => f64::from(residual < 1.0),
+            Self::Welsch => (-residual * residual).exp(),
+        }
+    }
+}
+
+/// Configuration for Python-UTide-compatible robust fitting.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RobustOptions {
-    /// Cauchy tuning constant. Larger values reduce outlier sensitivity.
+    /// Residual weighting function.
+    ///
+    /// Use [`Self::for_weight_function`] to select this together with its
+    /// conventional tuning constant.
+    pub weight_function: RobustWeightFunction,
+    /// Weight-function tuning constant. Larger values reduce outlier sensitivity.
     pub tuning_constant: f64,
     /// Stop when fractional weighted-mean-square improvement falls below this.
     pub tolerance: f64,
@@ -23,7 +127,8 @@ pub struct RobustOptions {
 impl Default for RobustOptions {
     fn default() -> Self {
         Self {
-            tuning_constant: 2.385,
+            weight_function: RobustWeightFunction::Cauchy,
+            tuning_constant: RobustWeightFunction::Cauchy.default_tuning_constant(),
             tolerance: 0.001,
             max_iterations: 50,
         }
@@ -31,6 +136,17 @@ impl Default for RobustOptions {
 }
 
 impl RobustOptions {
+    /// Construct options with the conventional tuning constant for `weight_function`.
+    #[must_use]
+    pub const fn for_weight_function(weight_function: RobustWeightFunction) -> Self {
+        Self {
+            weight_function,
+            tuning_constant: weight_function.default_tuning_constant(),
+            tolerance: 0.001,
+            max_iterations: 50,
+        }
+    }
+
     pub(crate) fn validate(self) -> Result<(), AnalysisError> {
         if !self.tuning_constant.is_finite() || self.tuning_constant <= 0.0 {
             return Err(AnalysisError::InvalidRobustTuningConstant);
@@ -189,7 +305,7 @@ pub(crate) fn fit_with_initial(
             .zip(&residual_factor)
             .map(|(residual, factor)| {
                 let normalized = factor * residual[0].hypot(residual[1]) / scale;
-                1.0 / normalized.mul_add(normalized, 1.0)
+                options.weight_function.weight(normalized)
             })
             .collect();
         weight_scale = Some(scale);
@@ -288,7 +404,7 @@ pub(crate) fn fit_complex_with_initial(
             .zip(&residual_factor)
             .map(|(residual, factor)| {
                 let normalized = factor * residual.re.hypot(residual.im) / scale;
-                1.0 / normalized.mul_add(normalized, 1.0)
+                options.weight_function.weight(normalized)
             })
             .collect();
         weight_scale = Some(scale);
@@ -617,9 +733,62 @@ fn usize_to_f64(value: usize) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{RobustOptions, RobustTermination, fit, usize_to_f64};
+    use super::{RobustOptions, RobustTermination, RobustWeightFunction, fit, usize_to_f64};
     use crate::AnalysisError;
     use faer::Mat;
+
+    #[test]
+    fn weight_functions_have_conventional_defaults_and_stable_limits() {
+        let functions: [(RobustWeightFunction, &str, f64); 9] = [
+            (RobustWeightFunction::Andrews, "andrews", 1.339),
+            (RobustWeightFunction::Bisquare, "bisquare", 4.685),
+            (RobustWeightFunction::Cauchy, "cauchy", 2.385),
+            (RobustWeightFunction::Fair, "fair", 1.400),
+            (RobustWeightFunction::Huber, "huber", 1.345),
+            (RobustWeightFunction::Logistic, "logistic", 1.205),
+            (RobustWeightFunction::Ols, "ols", 1.0),
+            (RobustWeightFunction::Talwar, "talwar", 2.795),
+            (RobustWeightFunction::Welsch, "welsch", 2.985),
+        ];
+        for (function, name, tuning) in functions {
+            assert_eq!(function.name(), name);
+            assert_eq!(
+                function.default_tuning_constant().to_bits(),
+                tuning.to_bits()
+            );
+            let options = RobustOptions::for_weight_function(function);
+            assert_eq!(options.weight_function, function);
+            assert_eq!(options.tuning_constant.to_bits(), tuning.to_bits());
+            assert_eq!(function.weight(0.0).to_bits(), 1.0_f64.to_bits());
+            assert_eq!(
+                function.weight(-0.5).to_bits(),
+                function.weight(0.5).to_bits()
+            );
+            assert!((0.0..=1.0).contains(&function.weight(0.5)));
+        }
+        assert_eq!(
+            RobustWeightFunction::Bisquare.weight(1.0).to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            RobustWeightFunction::Talwar.weight(1.0).to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            RobustWeightFunction::Andrews
+                .weight(std::f64::consts::PI)
+                .to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            RobustWeightFunction::Huber.weight(2.0).to_bits(),
+            0.5_f64.to_bits()
+        );
+        assert_eq!(
+            RobustWeightFunction::Ols.weight(f64::INFINITY).to_bits(),
+            1.0_f64.to_bits()
+        );
+    }
 
     #[test]
     fn exact_fit_returns_ols_with_uniform_weights() {

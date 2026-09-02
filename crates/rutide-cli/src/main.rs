@@ -14,8 +14,8 @@ use rutide_cli::{
 };
 use rutide_core::{
     FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections,
-    PhaseReference, ReconstructionFilter, RobustOptions, ScalarInferenceRelation, TidalConstituent,
-    VectorInferenceRelation,
+    PhaseReference, ReconstructionFilter, RobustOptions, RobustWeightFunction,
+    ScalarInferenceRelation, TidalConstituent, VectorInferenceRelation,
 };
 
 // The application repeatedly allocates short-lived QR storage across worker
@@ -50,7 +50,9 @@ Options:
   --phase MODE        Phase reference: greenwich, linear-time, or raw (default: greenwich)
   --nodal MODE        Nodal corrections: exact, linear-time, or disabled (default: exact)
   --method MODE       Least squares: ols or robust (default: ols)
-  --robust-tuning X   Cauchy tuning constant (default: 2.385)
+  --robust-weight W   IRLS weight: andrews, bisquare, cauchy, fair, huber,
+                      logistic, ols, talwar, or welsch (default: cauchy)
+  --robust-tuning X   Weight-function tuning constant (default: conventional)
   --robust-tolerance X
                       Fractional IRLS tolerance (default: 0.001)
   --robust-max-iterations N
@@ -165,6 +167,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let mut phase_reference = None;
     let mut nodal_corrections = None;
     let mut robust_requested = None;
+    let mut robust_weight_function = None;
     let mut robust_tuning = None;
     let mut robust_tolerance = None;
     let mut robust_max_iterations = None;
@@ -355,6 +358,15 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                     option,
                 )?);
             }
+            "--robust-weight" => {
+                if robust_weight_function.is_some() {
+                    return Err("--robust-weight may only be supplied once".to_owned());
+                }
+                robust_weight_function = Some(parse_robust_weight_function(&required_value(
+                    &mut arguments,
+                    option,
+                )?)?);
+            }
             "--robust-tolerance" => {
                 if robust_tolerance.is_some() {
                     return Err("--robust-tolerance may only be supplied once".to_owned());
@@ -441,6 +453,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let constituent_selection = resolve_constituent_selection(constituents, rayleigh_minimum)?;
     let analysis_method = resolve_analysis_method(
         robust_requested,
+        robust_weight_function,
         robust_tuning,
         robust_tolerance,
         robust_max_iterations,
@@ -544,18 +557,25 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
 
 fn resolve_analysis_method(
     robust_requested: Option<bool>,
+    weight_function: Option<RobustWeightFunction>,
     tuning_constant: Option<f64>,
     tolerance: Option<f64>,
     max_iterations: Option<usize>,
 ) -> Result<AnalysisMethod, String> {
     if !robust_requested.unwrap_or(false) {
-        if tuning_constant.is_some() || tolerance.is_some() || max_iterations.is_some() {
+        if weight_function.is_some()
+            || tuning_constant.is_some()
+            || tolerance.is_some()
+            || max_iterations.is_some()
+        {
             return Err("robust options require --method robust".to_owned());
         }
         return Ok(AnalysisMethod::Ols);
     }
-    let defaults = RobustOptions::default();
+    let defaults =
+        RobustOptions::for_weight_function(weight_function.unwrap_or(RobustWeightFunction::Cauchy));
     Ok(AnalysisMethod::Robust(RobustOptions {
+        weight_function: defaults.weight_function,
         tuning_constant: tuning_constant.unwrap_or(defaults.tuning_constant),
         tolerance: tolerance.unwrap_or(defaults.tolerance),
         max_iterations: max_iterations.unwrap_or(defaults.max_iterations),
@@ -862,6 +882,24 @@ fn parse_analysis_method(value: &OsStr) -> Result<bool, String> {
     }
 }
 
+fn parse_robust_weight_function(value: &OsStr) -> Result<RobustWeightFunction, String> {
+    match value.to_str() {
+        Some("andrews") => Ok(RobustWeightFunction::Andrews),
+        Some("bisquare") => Ok(RobustWeightFunction::Bisquare),
+        Some("cauchy") => Ok(RobustWeightFunction::Cauchy),
+        Some("fair") => Ok(RobustWeightFunction::Fair),
+        Some("huber") => Ok(RobustWeightFunction::Huber),
+        Some("logistic") => Ok(RobustWeightFunction::Logistic),
+        Some("ols") => Ok(RobustWeightFunction::Ols),
+        Some("talwar") => Ok(RobustWeightFunction::Talwar),
+        Some("welsch") => Ok(RobustWeightFunction::Welsch),
+        Some(value) => Err(format!(
+            "--robust-weight must be andrews, bisquare, cauchy, fair, huber, logistic, ols, talwar, or welsch; received {value:?}"
+        )),
+        None => Err("--robust-weight value must be valid UTF-8".to_owned()),
+    }
+}
+
 fn ensure_selection_is_unset(selection: Option<&NodeSelection>) -> Result<(), String> {
     if selection.is_some() {
         return Err("--nodes and --node-count are mutually exclusive".to_owned());
@@ -970,8 +1008,8 @@ mod tests {
     };
     use rutide_core::{
         FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections,
-        PhaseReference, ReconstructionFilter, RobustOptions, ScalarInferenceRelation,
-        TidalConstituent, VectorInferenceRelation,
+        PhaseReference, ReconstructionFilter, RobustOptions, RobustWeightFunction,
+        ScalarInferenceRelation, TidalConstituent, VectorInferenceRelation,
     };
 
     fn args<'a>(values: &'a [&'a str]) -> impl Iterator<Item = OsString> + 'a {
@@ -1021,6 +1059,8 @@ mod tests {
             "output.nc",
             "--method",
             "robust",
+            "--robust-weight",
+            "welsch",
             "--robust-tuning",
             "2.5",
             "--robust-tolerance",
@@ -1035,6 +1075,7 @@ mod tests {
         assert_eq!(
             config.analysis_method,
             AnalysisMethod::Robust(RobustOptions {
+                weight_function: RobustWeightFunction::Welsch,
                 tuning_constant: 2.5,
                 tolerance: 0.0005,
                 max_iterations: 75,
@@ -1051,6 +1092,27 @@ mod tests {
                 "2.5",
             ]))
             .is_err()
+        );
+        let command = parse_arguments(args(&[
+            "analyze-vector",
+            "--input",
+            "input.nc",
+            "--output",
+            "output.nc",
+            "--method",
+            "robust",
+            "--robust-weight",
+            "bisquare",
+        ]))
+        .expect("valid conventional robust tuning");
+        let Command::AnalyzeVector(config) = command else {
+            panic!("expected vector analyze command");
+        };
+        assert_eq!(
+            config.analysis_method,
+            AnalysisMethod::Robust(RobustOptions::for_weight_function(
+                RobustWeightFunction::Bisquare,
+            ))
         );
     }
 

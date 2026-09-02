@@ -17,7 +17,7 @@ use rutide_core::{
     AnalysisError, COLORED_NOISE_FREQUENCY_BANDS_CPH, Constituent, FitOptions, GreenwichNodalBatch,
     GreenwichNodalReconstructor, InferenceMode, LinearConfidence, MonteCarloOptions,
     NodalCorrections, NormalizedTimeAxis, PhaseReference, RayleighSelection, ReconstructionFilter,
-    ResidualSpectrumMethod, RobustOptions, RobustTermination,
+    ResidualSpectrumMethod, RobustOptions, RobustTermination, RobustWeightFunction,
     SamplingDiagnostics as CoreSamplingDiagnostics, SamplingDiagnosticsPlan, ScalarInferenceBatch,
     ScalarInferenceRelation, ScalarSolution, SolverOptions, TidalConstituent, TimeEpoch,
     VectorInferenceRelation, VectorSolution, normalize_numeric_time,
@@ -35,7 +35,7 @@ pub use vector::{
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
 /// `NetCDF` and JSON report schema emitted by scalar analyses.
-pub const SCALAR_OUTPUT_SCHEMA_VERSION: u32 = 15;
+pub const SCALAR_OUTPUT_SCHEMA_VERSION: u32 = 16;
 /// Schema version of the embedded machine-readable compatibility matrix.
 pub const FEATURE_MATRIX_SCHEMA_VERSION: u32 = 1;
 /// Machine-readable feature and Python-oracle compatibility status.
@@ -160,7 +160,7 @@ pub enum ConfidenceInterval {
 pub enum AnalysisMethod {
     /// Ordinary least squares.
     Ols,
-    /// Cauchy iteratively reweighted least squares.
+    /// Iteratively reweighted least squares with the configured weight function.
     Robust(RobustOptions),
 }
 
@@ -473,7 +473,7 @@ pub struct AnalyzeConfig {
     pub nodal_corrections: NodalCorrections,
     /// Optional linearized or Monte Carlo confidence and its noise model.
     pub confidence_interval: ConfidenceInterval,
-    /// Ordinary or Cauchy robust least squares.
+    /// Ordinary or configured robust least squares.
     pub analysis_method: AnalysisMethod,
     /// Optional complete-series reconstruction and its constituent filter.
     pub reconstruction: Option<ReconstructionFilter>,
@@ -810,7 +810,9 @@ pub struct RunReport {
 /// Serializable robust fitting options retained in application reports.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct RobustOptionsReport {
-    /// Cauchy tuning constant.
+    /// Stable lowercase residual-weight function name.
+    pub weight_function: &'static str,
+    /// Weight-function tuning constant.
     pub tuning_constant: f64,
     /// Fractional objective-improvement tolerance.
     pub tolerance: f64,
@@ -821,6 +823,7 @@ pub struct RobustOptionsReport {
 impl From<RobustOptions> for RobustOptionsReport {
     fn from(options: RobustOptions) -> Self {
         Self {
+            weight_function: options.weight_function.name(),
             tuning_constant: options.tuning_constant,
             tolerance: options.tolerance,
             max_iterations: options.max_iterations,
@@ -2340,6 +2343,27 @@ fn normalize_source_observation(
     Ok(value)
 }
 
+fn update_robust_options_digest(
+    digest: &mut Sha256,
+    options: RobustOptions,
+) -> Result<(), AppError> {
+    // Preserve every existing Cauchy digest while distinguishing the new
+    // non-default functions from each other and from Cauchy.
+    if options.weight_function != RobustWeightFunction::Cauchy {
+        digest.update(b"weight-function\0");
+        digest.update(options.weight_function.name().as_bytes());
+        digest.update([0]);
+    }
+    digest.update(options.tuning_constant.to_bits().to_le_bytes());
+    digest.update(options.tolerance.to_bits().to_le_bytes());
+    digest.update(
+        u64::try_from(options.max_iterations)
+            .map_err(|_| AppError::Invalid("robust iteration limit exceeds u64".to_owned()))?
+            .to_le_bytes(),
+    );
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -2373,13 +2397,7 @@ fn result_digest(
     update_sampling_digest(&mut digest, sampling_diagnostics)?;
     digest.update(analysis_method.name().as_bytes());
     if let AnalysisMethod::Robust(options) = analysis_method {
-        digest.update(options.tuning_constant.to_bits().to_le_bytes());
-        digest.update(options.tolerance.to_bits().to_le_bytes());
-        digest.update(
-            u64::try_from(options.max_iterations)
-                .map_err(|_| AppError::Invalid("robust iteration limit exceeds u64".to_owned()))?
-                .to_le_bytes(),
-        );
+        update_robust_options_digest(&mut digest, options)?;
     }
     digest.update([0]);
     digest.update(confidence_interval.method().as_bytes());
@@ -2801,6 +2819,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         output.add_attribute("explicit_constituent_order", names.join(","))?;
     }
     if let AnalysisMethod::Robust(options) = analysis_method {
+        output.add_attribute("robust_weight_function", options.weight_function.name())?;
         output.add_attribute("robust_tuning_constant", options.tuning_constant)?;
         output.add_attribute("robust_tolerance", options.tolerance)?;
         output.add_attribute(
@@ -3415,15 +3434,45 @@ mod tests {
         FEATURE_MATRIX_SCHEMA_VERSION, NodeSelection, SCALAR_OUTPUT_SCHEMA_VERSION,
         ScalarInferenceConfig, VECTOR_OUTPUT_SCHEMA_VERSION, constituent_order_indices, encode_hex,
         normalize_source_observation, read_fvcom_scalar, resolve_node_selection,
-        spatial_chunk_plan, summarize_sampling, temporary_sibling, write_inference_metadata,
-        write_reconstruction_variables, write_sampling_diagnostics,
+        spatial_chunk_plan, summarize_sampling, temporary_sibling, update_robust_options_digest,
+        write_inference_metadata, write_reconstruction_variables, write_sampling_diagnostics,
     };
     use rutide_core::{
         CATALOG_ORACLE_REVISION, Constituent, GreenwichNodalOls, InferenceMode, LinearConfidence,
-        ReconstructionFilter, SamplingDiagnosticsPlan, ScalarInferenceRelation, ScalarSolution,
-        TidalConstituent,
+        ReconstructionFilter, RobustOptions, RobustWeightFunction, SamplingDiagnosticsPlan,
+        ScalarInferenceRelation, ScalarSolution, TidalConstituent,
     };
     use serde_json::Value;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn robust_digest_preserves_cauchy_and_distinguishes_weight_functions() {
+        let options = RobustOptions::default();
+        let mut legacy = Sha256::new();
+        legacy.update(options.tuning_constant.to_bits().to_le_bytes());
+        legacy.update(options.tolerance.to_bits().to_le_bytes());
+        legacy.update(
+            u64::try_from(options.max_iterations)
+                .expect("small iteration limit")
+                .to_le_bytes(),
+        );
+        let mut current = Sha256::new();
+        update_robust_options_digest(&mut current, options).expect("hash Cauchy options");
+        assert_eq!(current.finalize(), legacy.finalize());
+
+        let mut cauchy = Sha256::new();
+        update_robust_options_digest(&mut cauchy, options).expect("hash Cauchy options");
+        let mut welsch = Sha256::new();
+        update_robust_options_digest(
+            &mut welsch,
+            RobustOptions {
+                weight_function: RobustWeightFunction::Welsch,
+                ..options
+            },
+        )
+        .expect("hash Welsch options");
+        assert_ne!(cauchy.finalize(), welsch.finalize());
+    }
 
     #[test]
     fn embedded_feature_matrix_matches_compiled_contracts() {

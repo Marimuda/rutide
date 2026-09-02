@@ -32,14 +32,14 @@ use super::{
     required_dimension_length, required_variable, resolve_constituent_selection,
     retain_time_major_rows, robust_termination_code, spatial_chunk_plan, summarize_sampling,
     temporary_sibling, update_constituent_order_digest, update_inference_digest,
-    update_reconstruction_filter_digest, update_sampling_digest, validate_config,
-    validate_dimensions, validate_reconstruction_filter, validate_source_value,
+    update_reconstruction_filter_digest, update_robust_options_digest, update_sampling_digest,
+    validate_config, validate_dimensions, validate_reconstruction_filter, validate_source_value,
     write_constituent_order_indices, write_inference_metadata, write_json_report,
     write_robust_schema_metadata, write_sampling_diagnostics, write_variable,
 };
 
 /// `NetCDF` and JSON report schema emitted by vector-current analyses.
-pub const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 13;
+pub const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 14;
 const FIXED_DEPTH_ZETA_SPAN_AMPLIFICATION: usize = 6;
 
 /// Configuration for one FVCOM current analysis.
@@ -74,7 +74,7 @@ pub struct VectorAnalyzeConfig {
     pub nodal_corrections: NodalCorrections,
     /// Optional linearized or Monte Carlo ellipse intervals and noise model.
     pub confidence_interval: ConfidenceInterval,
-    /// Ordinary or Cauchy robust least squares.
+    /// Ordinary or configured robust least squares.
     pub analysis_method: AnalysisMethod,
     /// Optional complete-series reconstruction and constituent filter.
     pub reconstruction: Option<ReconstructionFilter>,
@@ -3119,13 +3119,7 @@ fn vector_result_digest(
     update_sampling_digest(&mut digest, sampling_diagnostics)?;
     digest.update(analysis_method.name().as_bytes());
     if let AnalysisMethod::Robust(options) = analysis_method {
-        digest.update(options.tuning_constant.to_bits().to_le_bytes());
-        digest.update(options.tolerance.to_bits().to_le_bytes());
-        digest.update(
-            u64::try_from(options.max_iterations)
-                .map_err(|_| AppError::Invalid("robust iteration limit exceeds u64".to_owned()))?
-                .to_le_bytes(),
-        );
+        update_robust_options_digest(&mut digest, options)?;
     }
     digest.update([0]);
     digest.update(confidence_interval.method().as_bytes());
@@ -3484,13 +3478,7 @@ fn vector_result_digest_from_incremental_output(
 
     digest.update(analysis_method.name().as_bytes());
     if let AnalysisMethod::Robust(options) = analysis_method {
-        digest.update(options.tuning_constant.to_bits().to_le_bytes());
-        digest.update(options.tolerance.to_bits().to_le_bytes());
-        digest.update(
-            u64::try_from(options.max_iterations)
-                .map_err(|_| AppError::Invalid("robust iteration limit exceeds u64".to_owned()))?
-                .to_le_bytes(),
-        );
+        update_robust_options_digest(&mut digest, options)?;
     }
     digest.update([0]);
     digest.update(confidence_interval.method().as_bytes());
@@ -4073,6 +4061,7 @@ fn create_vector_output_base(
         output.add_attribute("explicit_constituent_order", names.join(","))?;
     }
     if let AnalysisMethod::Robust(options) = data.analysis_method {
+        output.add_attribute("robust_weight_function", options.weight_function.name())?;
         output.add_attribute("robust_tuning_constant", options.tuning_constant)?;
         output.add_attribute("robust_tolerance", options.tolerance)?;
         output.add_attribute(
@@ -5465,8 +5454,8 @@ mod tests {
     use rayon::ThreadPoolBuilder;
     use rutide_core::{
         FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections,
-        PhaseReference, ReconstructionFilter, RobustOptions, TidalConstituent,
-        VectorInferenceRelation,
+        PhaseReference, ReconstructionFilter, RobustOptions, RobustWeightFunction,
+        TidalConstituent, VectorInferenceRelation,
     };
 
     use super::{
@@ -5711,6 +5700,7 @@ mod tests {
                 noise: LinearConfidence::White,
             },
             analysis_method: AnalysisMethod::Robust(RobustOptions {
+                weight_function: RobustWeightFunction::Welsch,
                 tolerance: 0.01,
                 ..RobustOptions::default()
             }),
@@ -6357,6 +6347,7 @@ mod tests {
                 noise: LinearConfidence::Colored,
             },
             analysis_method: AnalysisMethod::Robust(RobustOptions {
+                weight_function: RobustWeightFunction::Welsch,
                 tolerance: 0.01,
                 ..RobustOptions::default()
             }),
@@ -6376,6 +6367,14 @@ mod tests {
             "exact"
         );
         assert_eq!(inference_report.analysis_method, "robust");
+        assert_eq!(
+            inference_report
+                .robust_options
+                .as_ref()
+                .expect("robust options")
+                .weight_function,
+            "welsch"
+        );
         assert!(!inference_report.trend_enabled);
         assert_eq!(inference_report.phase_reference, "raw");
         assert_eq!(inference_report.nodal_corrections, "linear-time");
@@ -6421,6 +6420,14 @@ mod tests {
                 .value()
                 .expect("read phase-reference metadata"),
             netcdf::AttributeValue::Str("raw".to_owned())
+        );
+        assert_eq!(
+            inference_output
+                .attribute("robust_weight_function")
+                .expect("robust weight metadata")
+                .value()
+                .expect("read robust weight metadata"),
+            netcdf::AttributeValue::Str("welsch".to_owned())
         );
         assert_eq!(
             inference_output

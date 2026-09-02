@@ -140,7 +140,7 @@ pub enum AnalysisError {
         /// Time position of the invalid value.
         time: usize,
     },
-    /// The robust Cauchy tuning constant is not finite and positive.
+    /// The robust weight-function tuning constant is not finite and positive.
     InvalidRobustTuningConstant,
     /// The robust convergence tolerance is not finite and positive.
     InvalidRobustTolerance,

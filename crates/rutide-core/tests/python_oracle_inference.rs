@@ -4,8 +4,9 @@ use rayon::ThreadPoolBuilder;
 use rutide_core::{
     AnalysisError, FitOptions, GreenwichNodalOls, InferenceMode, LinearConfidence,
     MonteCarloOptions, NodalCorrections, PhaseReference, ReconstructionFilter, RobustOptions,
-    ScalarInferenceBatch, ScalarInferenceOls, ScalarInferenceRelation, SolverOptions,
-    TidalConstituent, VectorInferenceBatch, VectorInferenceOls, VectorInferenceRelation,
+    RobustWeightFunction, ScalarInferenceBatch, ScalarInferenceOls, ScalarInferenceRelation,
+    SolverOptions, TidalConstituent, VectorInferenceBatch, VectorInferenceOls,
+    VectorInferenceRelation,
 };
 
 const LATITUDE: f64 = 60.957_717_895_507_81;
@@ -1887,6 +1888,53 @@ fn matches_resolved_exact_robust_vector_inference_oracle() {
             assert_close(&format!("{field}[{index}]"), *actual, *expected, 5e-9);
         }
     }
+
+    let welsch = model
+        .solve_vector_robust(
+            &eastward,
+            &northward,
+            RobustOptions::for_weight_function(RobustWeightFunction::Welsch),
+        )
+        .expect("valid Welsch robust vector inference solution");
+    for (index, (actual, expected)) in welsch
+        .semi_major
+        .iter()
+        .zip([
+            0.002_972_946_316_915_557,
+            0.002_772_344_867_128_758,
+            0.010_626_181_125_860_269,
+            0.000_753_943_246_730_781_2,
+            0.004_945_998_011_845_077,
+        ])
+        .enumerate()
+    {
+        assert_close(
+            &format!("Welsch inferred semi_major[{index}]"),
+            *actual,
+            expected,
+            5e-10,
+        );
+    }
+    assert_close(
+        "Welsch inferred eastward mean",
+        welsch.eastward_mean,
+        0.164_157_619_360_420_5,
+        5e-10,
+    );
+    assert_close(
+        "Welsch inferred northward mean",
+        welsch.northward_mean,
+        -0.073_994_772_257_901_38,
+        5e-10,
+    );
+    let welsch_diagnostics = welsch.robust.as_ref().expect("Welsch robust diagnostics");
+    assert_eq!(welsch_diagnostics.iterations, 2);
+    assert_close(
+        "Welsch inferred weight sum",
+        welsch_diagnostics.weights.iter().sum(),
+        699.109_432_929_291_2,
+        5e-7,
+    );
 
     let colored = model
         .solve_vector_robust_with_linear_confidence(

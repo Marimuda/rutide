@@ -13,8 +13,8 @@
       "rust_version": "1.98"
     },
     "netcdf": {
-      "scalar_schema_version": 15,
-      "vector_schema_version": 13
+      "scalar_schema_version": 16,
+      "vector_schema_version": 14
     },
     "json_report": {
       "version_source": "matching-netcdf-schema"
@@ -123,11 +123,18 @@
     },
     {
       "id": "robust-fitting",
-      "title": "Cauchy iteratively reweighted least squares",
+      "title": "Configurable robust iteratively reweighted least squares",
       "support": "supported",
       "scopes": ["core", "fvcom-scalar", "fvcom-vector"],
       "parity": "python-oracle",
-      "evidence": ["benchmarks/results/robust-fitting-2026-09-01.md"]
+      "evidence": [
+        "crates/rutide-core/tests/python_oracle_greenwich_nodal.rs",
+        "crates/rutide-core/tests/python_oracle_inference.rs",
+        "benchmarks/results/robust-fitting-2026-09-01.md"
+      ],
+      "limitations": [
+        "Pinned Python UTide raises for Andrews, Huber, and logistic residual arrays; RUTide implements their standard definitions as tested extensions"
+      ]
     },
     {
       "id": "scalar-inference",

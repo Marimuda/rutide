@@ -363,7 +363,7 @@ impl FixedRawOls {
         solutions.pop().ok_or(AnalysisError::EmptySeries)
     }
 
-    /// Fit one series with Cauchy iteratively reweighted least squares.
+    /// Fit one series with configured iteratively reweighted least squares.
     ///
     /// # Errors
     ///

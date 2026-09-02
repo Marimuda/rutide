@@ -4,7 +4,8 @@ use rayon::ThreadPoolBuilder;
 use rutide_core::{
     AnalysisError, FitOptions, GreenwichNodalBatch, GreenwichNodalOls, GreenwichNodalReconstructor,
     LinearConfidence, MonteCarloOptions, NodalCorrections, PhaseReference, ReconstructionFilter,
-    RobustOptions, SolverOptions, TidalConstituent, TimeEpoch, normalize_numeric_time,
+    RobustOptions, RobustWeightFunction, SolverOptions, TidalConstituent, TimeEpoch,
+    normalize_numeric_time,
 };
 
 const CONSTITUENTS: [TidalConstituent; 5] = [
@@ -1041,6 +1042,232 @@ fn matches_python_utide_cauchy_robust_scalar_fit() {
         for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
             assert_close(&format!("{label}[{index}]"), *actual, *expected, tolerance);
         }
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the frozen scalar and vector oracle table is intentionally kept with its assertions"
+)]
+fn executable_python_robust_weight_family_matches_scalar_and_vector_oracles() {
+    struct Oracle {
+        function: RobustWeightFunction,
+        scalar_amplitude: f64,
+        scalar_mean: f64,
+        scalar_slope: f64,
+        scalar_iterations: usize,
+        scalar_weight_sum: f64,
+        vector_major: f64,
+        eastward_mean: f64,
+        northward_mean: f64,
+        vector_iterations: usize,
+        vector_weight_sum: f64,
+    }
+
+    let oracles = [
+        Oracle {
+            function: RobustWeightFunction::Bisquare,
+            scalar_amplitude: 0.658_206_061_853_109_4,
+            scalar_mean: 0.090_273_612_178_444_18,
+            scalar_slope: 0.001_161_404_205_091_351_4,
+            scalar_iterations: 6,
+            scalar_weight_sum: 670.203_328_646_929_2,
+            vector_major: 0.002_435_949_416_461_871,
+            eastward_mean: 0.164_116_805_610_412_34,
+            northward_mean: -0.075_976_527_989_504_72,
+            vector_iterations: 2,
+            vector_weight_sum: 712.839_540_883_681_1,
+        },
+        Oracle {
+            function: RobustWeightFunction::Cauchy,
+            scalar_amplitude: 0.658_145_852_459_635_5,
+            scalar_mean: 0.089_398_869_808_239_88,
+            scalar_slope: 0.001_264_652_294_300_096_9,
+            scalar_iterations: 5,
+            scalar_weight_sum: 640.463_424_939_137,
+            vector_major: 0.001_713_330_656_679_418_2,
+            eastward_mean: 0.165_074_288_673_386_08,
+            northward_mean: -0.075_146_691_017_529_74,
+            vector_iterations: 2,
+            vector_weight_sum: 690.821_363_451_973_6,
+        },
+        Oracle {
+            function: RobustWeightFunction::Fair,
+            scalar_amplitude: 0.657_930_391_203_074_3,
+            scalar_mean: 0.088_104_244_960_156_06,
+            scalar_slope: 0.001_475_392_074_517_609,
+            scalar_iterations: 8,
+            scalar_weight_sum: 502.952_101_985_281_4,
+            vector_major: 0.003_255_665_335_217_705_6,
+            eastward_mean: 0.162_214_071_954_012_77,
+            northward_mean: -0.069_983_714_631_922_53,
+            vector_iterations: 3,
+            vector_weight_sum: 511.329_329_563_459_4,
+        },
+        Oracle {
+            function: RobustWeightFunction::Ols,
+            scalar_amplitude: 0.643_885_344_853_981_6,
+            scalar_mean: 0.100_373_799_180_151_07,
+            scalar_slope: 0.001_553_235_076_029_680_8,
+            scalar_iterations: 2,
+            scalar_weight_sum: 745.0,
+            vector_major: 0.016_129_755_916_509_406,
+            eastward_mean: 0.175_488_074_563_013_85,
+            northward_mean: -0.078_126_975_849_882_86,
+            vector_iterations: 2,
+            vector_weight_sum: 745.0,
+        },
+        Oracle {
+            function: RobustWeightFunction::Talwar,
+            scalar_amplitude: 0.656_297_380_912_504_2,
+            scalar_mean: 0.091_846_275_427_503_95,
+            scalar_slope: 0.001_463_076_428_835_207_4,
+            scalar_iterations: 2,
+            scalar_weight_sum: 736.0,
+            vector_major: 0.004_239_607_901_491_553_6,
+            eastward_mean: 0.162_167_561_828_881_6,
+            northward_mean: -0.077_070_901_841_539_03,
+            vector_iterations: 3,
+            vector_weight_sum: 742.0,
+        },
+        Oracle {
+            function: RobustWeightFunction::Welsch,
+            scalar_amplitude: 0.658_093_332_039_841_4,
+            scalar_mean: 0.089_868_624_857_311_26,
+            scalar_slope: 0.001_185_279_745_458_741_8,
+            scalar_iterations: 5,
+            scalar_weight_sum: 660.796_568_555_973_4,
+            vector_major: 0.002_149_918_195_677_173_5,
+            eastward_mean: 0.164_408_433_786_396_2,
+            northward_mean: -0.075_740_364_579_492_63,
+            vector_iterations: 2,
+            vector_weight_sum: 706.831_365_249_573_5,
+        },
+    ];
+
+    let time = oracle_times();
+    let mut scalar_observations = oracle_observations();
+    for (index, offset) in [(71, 5.0), (218, -4.0), (503, 6.0)] {
+        scalar_observations[index] += offset;
+    }
+    let (mut eastward, mut northward) = synthetic_vector_observations(&time);
+    eastward[71] += 5.0;
+    northward[218] -= 4.0;
+    eastward[503] += 4.0;
+    northward[503] += 3.0;
+    let model = GreenwichNodalOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE_DEGREES_NORTH,
+        &CONSTITUENTS,
+    )
+    .expect("valid robust-weight oracle model");
+
+    for oracle in oracles {
+        let options = RobustOptions::for_weight_function(oracle.function);
+        let scalar = model
+            .solve_robust(&scalar_observations, options)
+            .expect("converged scalar robust-weight solution");
+        let vector = model
+            .solve_vector_robust(&eastward, &northward, options)
+            .expect("converged vector robust-weight solution");
+        let label = oracle.function.name();
+        assert_close(
+            &format!("{label} scalar amplitude"),
+            scalar.amplitude[0],
+            oracle.scalar_amplitude,
+            1e-10,
+        );
+        assert_close(
+            &format!("{label} scalar mean"),
+            scalar.mean,
+            oracle.scalar_mean,
+            1e-10,
+        );
+        assert_close(
+            &format!("{label} scalar slope"),
+            scalar.slope_per_day,
+            oracle.scalar_slope,
+            1e-11,
+        );
+        let scalar_diagnostics = scalar.robust.as_ref().expect("scalar robust diagnostics");
+        assert_eq!(
+            scalar_diagnostics.iterations, oracle.scalar_iterations,
+            "{label}"
+        );
+        assert_close(
+            &format!("{label} scalar weight sum"),
+            scalar_diagnostics.weights.iter().sum(),
+            oracle.scalar_weight_sum,
+            1e-7,
+        );
+        assert_close(
+            &format!("{label} vector major"),
+            vector.semi_major[0],
+            oracle.vector_major,
+            1e-10,
+        );
+        assert_close(
+            &format!("{label} eastward mean"),
+            vector.eastward_mean,
+            oracle.eastward_mean,
+            1e-10,
+        );
+        assert_close(
+            &format!("{label} northward mean"),
+            vector.northward_mean,
+            oracle.northward_mean,
+            1e-10,
+        );
+        let vector_diagnostics = vector.robust.as_ref().expect("vector robust diagnostics");
+        assert_eq!(
+            vector_diagnostics.iterations, oracle.vector_iterations,
+            "{label}"
+        );
+        assert_close(
+            &format!("{label} vector weight sum"),
+            vector_diagnostics.weights.iter().sum(),
+            oracle.vector_weight_sum,
+            1e-7,
+        );
+    }
+
+    // The pinned Python functions use scalar `max` on arrays and raise before
+    // fitting for these three names. Exercise their standard scalar formulas
+    // end to end as explicitly tested Rust extensions.
+    for function in [
+        RobustWeightFunction::Andrews,
+        RobustWeightFunction::Huber,
+        RobustWeightFunction::Logistic,
+    ] {
+        let options = RobustOptions::for_weight_function(function);
+        let scalar = model
+            .solve_robust(&scalar_observations, options)
+            .expect("converged scalar extension solution");
+        let vector = model
+            .solve_vector_robust(&eastward, &northward, options)
+            .expect("converged vector extension solution");
+        for diagnostics in [
+            scalar.robust.as_ref().expect("scalar robust diagnostics"),
+            vector.robust.as_ref().expect("vector robust diagnostics"),
+        ] {
+            assert!(
+                diagnostics
+                    .weights
+                    .iter()
+                    .all(|weight| { weight.is_finite() && (0.0..=1.0).contains(weight) })
+            );
+        }
+        assert!(scalar.amplitude.iter().all(|value| value.is_finite()));
+        assert!(vector.semi_major.iter().all(|value| value.is_finite()));
+        assert!(
+            [71, 218, 503].into_iter().any(|index| scalar
+                .robust
+                .as_ref()
+                .expect("diagnostics")
+                .weights[index]
+                < 0.2)
+        );
     }
 }
 

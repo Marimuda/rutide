@@ -28,7 +28,7 @@ pub use corrected::{
 };
 pub use error::AnalysisError;
 pub use monte_carlo::MonteCarloOptions;
-pub use robust::{RobustDiagnostics, RobustOptions, RobustTermination};
+pub use robust::{RobustDiagnostics, RobustOptions, RobustTermination, RobustWeightFunction};
 pub use sampling::{
     COLORED_NOISE_FREQUENCY_BANDS_CPH, ResidualSpectrumMethod, SamplingDiagnostics,
     SamplingDiagnosticsPlan,

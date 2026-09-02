@@ -639,7 +639,7 @@ impl GreenwichNodalOls {
             .solve_with_monte_carlo_confidence(observations, options, noise)
     }
 
-    /// Fit one scalar series with Cauchy iteratively reweighted least squares.
+    /// Fit one scalar series with configured iteratively reweighted least squares.
     ///
     /// # Errors
     ///
@@ -792,7 +792,7 @@ impl GreenwichNodalOls {
             .solve_vector_with_monte_carlo_confidence(&time_major, options, noise, 0)
     }
 
-    /// Jointly fit one current series with shared Cauchy robust weights.
+    /// Jointly fit one current series with shared configured robust weights.
     ///
     /// # Errors
     ///
@@ -1190,7 +1190,7 @@ impl ScalarInferenceOls {
             .map(|solution| self.expand_solution(solution))
     }
 
-    /// Fit one scalar series with Cauchy IRLS.
+    /// Fit one scalar series with configured IRLS.
     ///
     /// # Errors
     ///
@@ -1802,7 +1802,7 @@ impl VectorInferenceOls {
         )
     }
 
-    /// Robustly fit one inferred current series with shared Cauchy weights.
+    /// Robustly fit one inferred current series with shared configured weights.
     ///
     /// # Errors
     ///

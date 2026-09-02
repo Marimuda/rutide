@@ -98,8 +98,10 @@ record length or spectral information.
 
 ## 2. Robust fitting — complete
 
-- Cauchy IRLS reproduces the pinned Python default (`tune=2.385`,
-  `tol=0.001`, `maxit=50`) and permits explicit validated overrides.
+- Andrews, bisquare, Cauchy, Fair, Huber, logistic, OLS, Talwar, and Welsch
+  IRLS use their conventional Python UTide tuning defaults and permit explicit
+  validated overrides. Cauchy remains the tidal-analysis default
+  (`tune=2.385`, `tol=0.001`, `maxit=50`).
 - Convergence, objective-increase rollback, exact fits, degenerate MAD scale,
   leverage validation, and iteration exhaustion have defined outcomes.
 - Scalar fits and complex vector fits return the final shared per-time weights,
@@ -107,15 +109,20 @@ record length or spectral information.
 - Complete, missing, and irregular records support exact corrections, white or
   colored linear confidence intervals, SNR, PE, and reconstruction from the
   robust coefficients.
-- Scalar and vector FVCOM commands expose `--method robust` plus tuning,
-  tolerance, and iteration-limit options. NetCDF outputs retain robust settings
-  and ragged per-observation diagnostics for gappy series.
+- Scalar and vector FVCOM commands expose `--method robust`,
+  `--robust-weight`, plus tuning, tolerance, and iteration-limit options.
+  NetCDF outputs retain the function and robust settings plus ragged
+  per-observation diagnostics for gappy series.
 
 The acceptance suite covers exact clean data, injected spikes, a sustained
 outlier block, non-convergence, near-zero non-exact scale, missing irregular
 scalar/vector records, and pinned Python comparisons of coefficients, ellipses,
-weights, confidence intervals, and SNR. The dedicated performance snapshot
-records all iteration counts in
+weights, confidence intervals, and SNR. Bisquare, Cauchy, Fair, OLS, Talwar,
+and Welsch pass scalar/vector output, weight-sum, and iteration-count oracles.
+The pinned Andrews, Huber, and logistic implementations raise on residual
+arrays; RUTide uses their standard definitions with bounded-weight and
+end-to-end invariants instead of reproducing that defect. The dedicated
+performance snapshot records all iteration counts in
 `benchmarks/results/robust-fitting-2026-09-01.md`; RUTide is 7.66–19.46x faster
 on the 100-series worker matrix and 13.39–17.66x faster on 1,000 series at 16/32
 workers.
@@ -153,7 +160,7 @@ exact/approximate switch; JSON reports and versioned NetCDF schemas retain every
 ratio, phase offset, convention, and mode, while the canonical digest includes
 the complete inference configuration. End-to-end vector coverage combines
 inference with joint missing-value masks, Lomb–Scargle colored confidence,
-reconstruction, and Cauchy robust fitting. The robust vector path solves one
+reconstruction, and configurable robust fitting. The robust vector path solves one
 coupled complex IRLS problem, preserves one shared weight per timestamp, and
 propagates UTide-compatible weighted covariance and colored residuals into
 linear intervals. Pinned-oracle coverage freezes ellipse coefficients, white
@@ -172,7 +179,7 @@ benchmarked separately.
 ## 4. Monte Carlo confidence intervals — complete
 
 - Complete 2×2 scalar and 4×4 vector coefficient covariances are sampled for OLS
-  and final-weight Cauchy robust fits.
+  and final-weight configured robust fits.
 - Regular FFT and irregular Lomb–Scargle residual paths now include the
   UTide-compatible real eastward/northward co-spectrum. Direct and cached Lomb
   kernels pass the same pinned-Python band-power fixtures.
