@@ -227,8 +227,14 @@ reported because the Python implementation rejects the combination.
   the exact default path retains its prior behavior. Pinned Python fixtures cover
   scalar coefficients, rotary ellipses, exact/approximate inference, batching,
   missing irregular records, and held-out reconstruction.
-- Support result presentation by PE, SNR, frequency, or explicit order without
-  losing stable constituent identity in bulk results.
+- **Complete:** support result presentation by descending PE, descending SNR,
+  ascending fitted frequency, stable selection order, or an explicit complete
+  permutation. Bulk coefficient arrays retain one stable constituent axis;
+  versioned scalar/vector NetCDF schemas and retained JSON samples expose a
+  per-series rank-to-index mapping. SNR ordering requires confidence, ties are
+  deterministic, and focused fixtures freeze the pinned Python UTide PE/SNR/
+  frequency views. Shared maps avoid per-series allocation, while diagnostic
+  maps use one contiguous buffer.
 - Define missing/non-finite timestamp handling and datetime/epoch conversion at
   application or binding boundaries.
 

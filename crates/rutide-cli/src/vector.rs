@@ -18,18 +18,20 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    AnalysisMethod, AnalyzeConfig, AppError, ConfidenceInterval, ConstituentSelection,
-    ConstituentSelectionReport, InferenceReport, MILLISECONDS_PER_DAY, NodeSelection,
-    ReconstructionReport, ResolvedConstituentSelection, RobustOptionsReport, StageTimings,
-    VectorInferenceConfig, encode_hex, nodal_profile_component, normalize_source_observation,
+    AnalysisMethod, AnalyzeConfig, AppError, ConfidenceInterval, ConstituentOrder,
+    ConstituentOrderMap, ConstituentSelection, ConstituentSelectionReport, InferenceReport,
+    MILLISECONDS_PER_DAY, NodeSelection, ReconstructionReport, ResolvedConstituentSelection,
+    RobustOptionsReport, StageTimings, VectorInferenceConfig, constituent_order_indices,
+    encode_hex, nodal_profile_component, normalize_source_observation, order_profile_suffix,
     reconstruction_report, required_dimension_length, required_variable,
     resolve_constituent_selection, robust_termination_code, temporary_sibling,
-    update_inference_digest, update_reconstruction_filter_digest, validate_config,
-    validate_dimensions, validate_reconstruction_filter, validate_source_value,
-    write_inference_metadata, write_json_report, write_robust_schema_metadata, write_variable,
+    update_constituent_order_digest, update_inference_digest, update_reconstruction_filter_digest,
+    validate_config, validate_dimensions, validate_reconstruction_filter, validate_source_value,
+    write_constituent_order_indices, write_inference_metadata, write_json_report,
+    write_robust_schema_metadata, write_variable,
 };
 
-const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 7;
+const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 8;
 
 /// Configuration for one depth-averaged FVCOM current analysis.
 #[derive(Clone, Debug, PartialEq)]
@@ -44,6 +46,8 @@ pub struct VectorAnalyzeConfig {
     pub elements: NodeSelection,
     /// Explicit or record-length-based constituent selection.
     pub constituent_selection: ConstituentSelection,
+    /// Per-series constituent presentation ranking.
+    pub constituent_order: ConstituentOrder,
     /// Optional constrained positive/negative rotary inferred constituents.
     pub inference: Option<VectorInferenceConfig>,
     /// Mean/trend terms included in the harmonic fit.
@@ -81,6 +85,8 @@ pub struct VectorSampleResult {
     pub phase_degrees: Vec<f64>,
     /// Percent ellipse energy in constituent order.
     pub percent_energy: Vec<f64>,
+    /// Stable constituent indices in requested presentation-rank order.
+    pub constituent_index_by_rank: Vec<usize>,
     /// Semi-major 95% confidence half-widths.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semi_major_ci: Option<Vec<f64>>,
@@ -151,6 +157,13 @@ pub struct VectorRunReport {
     pub robust_options: Option<RobustOptionsReport>,
     /// Auditable constituent-selection method and threshold.
     pub constituent_selection: ConstituentSelectionReport,
+    /// Requested presentation ranking: selection, PE, SNR, frequency, or explicit.
+    pub constituent_order: &'static str,
+    /// Complete explicit presentation permutation, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explicit_constituent_order: Option<Vec<&'static str>>,
+    /// Whether presentation permutations differ between fitted spatial series.
+    pub constituent_order_varies_by_series: bool,
     /// Inference configuration when inferred constituents are enabled.
     pub inference: Option<InferenceReport>,
     /// Confidence method: `none`, `linear`, or `monte-carlo`.
@@ -305,6 +318,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         config.phase_reference,
         config.nodal_corrections,
     )?;
+    super::shared_constituent_order_indices(&config.constituent_order, batch.constituents())?;
     if let Some(filter) = &config.reconstruction {
         validate_reconstruction_filter(filter, batch.tidal_constituents())?;
     }
@@ -444,6 +458,12 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
 
     let result_start = Instant::now();
     let series_frequency_cph = vector_solution_frequencies(&batch, &solutions)?;
+    let constituent_index_by_rank = constituent_order_indices(
+        &config.constituent_order,
+        batch.constituents(),
+        &series_frequency_cph,
+        &solutions,
+    )?;
     let result_sha256 = vector_result_digest(
         &input.element_indices,
         &input.latitudes,
@@ -453,6 +473,8 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         config.fit_options,
         config.phase_reference,
         config.nodal_corrections,
+        &config.constituent_order,
+        &constituent_index_by_rank,
         config.analysis_method,
         config.confidence_interval,
         config
@@ -465,7 +487,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             .as_ref()
             .zip(reconstruction.as_deref()),
     )?;
-    let sample_results = retained_vector_samples(&input, &solutions);
+    let sample_results = retained_vector_samples(&input, &solutions, &constituent_index_by_rank);
     let result_processing_seconds = result_start.elapsed().as_secs_f64();
 
     let output_start = Instant::now();
@@ -477,6 +499,8 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             constituents: batch.constituents(),
             series_frequency_cph: &series_frequency_cph,
             solutions: &solutions,
+            constituent_order: &config.constituent_order,
+            constituent_index_by_rank: &constituent_index_by_rank,
             result_sha256: &result_sha256,
             selection: &selection,
             inference: config.inference.as_ref(),
@@ -510,6 +534,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             config.fit_options,
             config.phase_reference,
             config.nodal_corrections,
+            &config.constituent_order,
         ),
         input_path: config.input.to_string_lossy().into_owned(),
         input_file_bytes: input.input_file_bytes,
@@ -533,6 +558,9 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             AnalysisMethod::Robust(options) => Some(options.into()),
         },
         constituent_selection: selection.report,
+        constituent_order: config.constituent_order.name(),
+        explicit_constituent_order: config.constituent_order.explicit_names(),
+        constituent_order_varies_by_series: constituent_index_by_rank.varies_by_series(),
         inference: config.inference.as_ref().map(VectorInferenceConfig::report),
         confidence_interval: config.confidence_interval.method(),
         confidence_noise: config.confidence_interval.noise(),
@@ -586,6 +614,7 @@ fn validate_vector_config(config: &VectorAnalyzeConfig) -> Result<(), AppError> 
         report: config.report.clone(),
         nodes: config.elements.clone(),
         constituent_selection: config.constituent_selection.clone(),
+        constituent_order: config.constituent_order.clone(),
         inference: None,
         fit_options: config.fit_options,
         phase_reference: config.phase_reference,
@@ -615,6 +644,7 @@ fn vector_profile(
     fit_options: FitOptions,
     phase_reference: PhaseReference,
     nodal_corrections: NodalCorrections,
+    constituent_order: &ConstituentOrder,
 ) -> String {
     let selection = match selection.report.method {
         "explicit" => "fixed-constituents",
@@ -622,9 +652,10 @@ fn vector_profile(
         _ => unreachable!("selection methods are constructed internally"),
     };
     let inference = if inferred { "inference-" } else { "" };
+    let ordering = order_profile_suffix(constituent_order);
     let trend = if fit_options.trend { "" } else { "-no-trend" };
     format!(
-        "{selection}-{}-{}-vector-{inference}{}{trend}",
+        "{selection}-{}-{}-vector-{inference}{}{ordering}{trend}",
         phase_reference.name(),
         nodal_profile_component(nodal_corrections),
         analysis_method.name(),
@@ -864,18 +895,21 @@ fn vector_result_digest(
     fit_options: FitOptions,
     phase_reference: PhaseReference,
     nodal_corrections: NodalCorrections,
+    constituent_order: &ConstituentOrder,
+    constituent_index_by_rank: &ConstituentOrderMap,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     inference: Option<&InferenceReport>,
     reconstruction: Option<(&ReconstructionFilter, &[VectorReconstruction])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-vector-nodal-v7\0");
+    digest.update(b"rutide-vector-nodal-v8\0");
     digest.update([u8::from(fit_options.trend)]);
     digest.update(phase_reference.name().as_bytes());
     digest.update([0]);
     digest.update(nodal_corrections.name().as_bytes());
     digest.update([0]);
+    update_constituent_order_digest(&mut digest, constituent_order, constituent_index_by_rank);
     digest.update(analysis_method.name().as_bytes());
     if let AnalysisMethod::Robust(options) = analysis_method {
         digest.update(options.tuning_constant.to_bits().to_le_bytes());
@@ -984,6 +1018,7 @@ fn vector_result_digest(
 fn retained_vector_samples(
     input: &VectorInputData,
     solutions: &[VectorSolution],
+    constituent_index_by_rank: &ConstituentOrderMap,
 ) -> Vec<VectorSampleResult> {
     input
         .element_indices
@@ -992,9 +1027,10 @@ fn retained_vector_samples(
         .zip(input.latitudes.iter().copied())
         .zip(input.observation_counts.iter().copied())
         .zip(solutions)
+        .enumerate()
         .take(3)
         .map(
-            |(((element_index, latitude_degrees_north), observation_count), solution)| {
+            |(series, (((element_index, latitude_degrees_north), observation_count), solution))| {
                 VectorSampleResult {
                     element_index,
                     latitude_degrees_north,
@@ -1003,6 +1039,12 @@ fn retained_vector_samples(
                     inclination_degrees: solution.inclination_degrees.clone(),
                     phase_degrees: solution.phase_degrees.clone(),
                     percent_energy: solution.percent_energy.clone(),
+                    constituent_index_by_rank: constituent_index_by_rank
+                        .row(series)
+                        .iter()
+                        .copied()
+                        .map(usize::from)
+                        .collect(),
                     semi_major_ci: solution.semi_major_ci.clone(),
                     semi_minor_ci: solution.semi_minor_ci.clone(),
                     inclination_ci_degrees: solution.inclination_ci_degrees.clone(),
@@ -1025,6 +1067,8 @@ struct VectorOutputData<'data> {
     constituents: &'data [Constituent],
     series_frequency_cph: &'data [Vec<f64>],
     solutions: &'data [VectorSolution],
+    constituent_order: &'data ConstituentOrder,
+    constituent_index_by_rank: &'data ConstituentOrderMap,
     result_sha256: &'data str,
     selection: &'data ResolvedConstituentSelection,
     inference: Option<&'data VectorInferenceConfig>,
@@ -1064,6 +1108,7 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
     let mut output = netcdf::create(path)?;
     output.add_dimension("series", input.element_indices.len())?;
     output.add_dimension("constituent", data.constituents.len())?;
+    output.add_dimension("presentation_rank", data.constituents.len())?;
     if data.reconstruction.is_some() {
         output.add_dimension("time", input.modified_julian_days.len())?;
     }
@@ -1080,12 +1125,17 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
         data.fit_options,
         data.phase_reference,
         data.nodal_corrections,
+        data.constituent_order,
     );
     output.add_attribute("profile", profile.as_str())?;
     output.add_attribute("analysis_method", data.analysis_method.name())?;
     output.add_attribute("trend_enabled", i64::from(data.fit_options.trend))?;
     output.add_attribute("phase_reference", data.phase_reference.name())?;
     output.add_attribute("nodal_corrections", data.nodal_corrections.name())?;
+    output.add_attribute("constituent_order", data.constituent_order.name())?;
+    if let Some(names) = data.constituent_order.explicit_names() {
+        output.add_attribute("explicit_constituent_order", names.join(","))?;
+    }
     if let AnalysisMethod::Robust(options) = data.analysis_method {
         output.add_attribute("robust_tuning_constant", options.tuning_constant)?;
         output.add_attribute("robust_tolerance", options.tolerance)?;
@@ -1201,6 +1251,12 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
             .copied()
             .collect::<Vec<_>>(),
         "cycles per hour",
+    )?;
+    write_constituent_order_indices(
+        &mut output,
+        data.solutions.len(),
+        data.constituents.len(),
+        data.constituent_index_by_rank,
     )?;
     write_vector_solution_variables(
         &mut output,
@@ -1477,7 +1533,7 @@ mod tests {
     };
 
     use super::{
-        AnalysisMethod, ConfidenceInterval, ConstituentSelection, NodeSelection,
+        AnalysisMethod, ConfidenceInterval, ConstituentOrder, ConstituentSelection, NodeSelection,
         VectorAnalyzeConfig, VectorInferenceConfig, analyze_vector, read_fvcom_vector,
         temporary_sibling,
     };
@@ -1571,6 +1627,7 @@ mod tests {
                 TidalConstituent::M2,
                 TidalConstituent::K1,
             ]),
+            constituent_order: ConstituentOrder::Frequency,
             inference: None,
             fit_options: FitOptions::default(),
             phase_reference: PhaseReference::Greenwich,
@@ -1594,6 +1651,9 @@ mod tests {
         assert_eq!(report.series_count, 2);
         assert_eq!(report.series_with_missing_observations, 2);
         assert_eq!(report.analysis_method, "robust");
+        assert_eq!(report.constituent_order, "frequency");
+        assert!(!report.constituent_order_varies_by_series);
+        assert_eq!(report.sample_results[0].constituent_index_by_rank, [1, 0]);
         assert_eq!(report.confidence_interval, "monte-carlo");
         assert_eq!(report.monte_carlo_realizations, Some(64));
         assert_eq!(report.monte_carlo_seed, Some(42));
@@ -1613,6 +1673,14 @@ mod tests {
                 .value()
                 .expect("read seed metadata"),
             netcdf::AttributeValue::Ulonglong(42)
+        );
+        assert_eq!(
+            output
+                .variable("constituent_index_by_rank")
+                .expect("frequency presentation order")
+                .get_values::<i64, _>(..)
+                .expect("read frequency presentation order"),
+            [1, 0, 1, 0]
         );
         assert_eq!(
             output
@@ -1666,6 +1734,7 @@ mod tests {
                 TidalConstituent::M2,
                 TidalConstituent::K1,
             ]),
+            constituent_order: ConstituentOrder::SignalToNoise,
             inference: Some(VectorInferenceConfig {
                 mode: InferenceMode::Exact,
                 relationships: vec![
@@ -1719,12 +1788,13 @@ mod tests {
         assert!(!inference_report.trend_enabled);
         assert_eq!(inference_report.phase_reference, "raw");
         assert_eq!(inference_report.nodal_corrections, "linear-time");
+        assert_eq!(inference_report.constituent_order, "signal-to-noise");
         assert_eq!(inference_report.confidence_interval, "monte-carlo");
         assert_eq!(inference_report.monte_carlo_realizations, Some(64));
         assert_eq!(inference_report.monte_carlo_seed, Some(99));
         assert_eq!(
             inference_report.profile,
-            "fixed-constituents-raw-nodal-linear-time-vector-inference-robust-no-trend"
+            "fixed-constituents-raw-nodal-linear-time-vector-inference-robust-order-snr-no-trend"
         );
         let inference_output =
             netcdf::open(&inference_output_path).expect("open inferred vector output");
@@ -1768,6 +1838,32 @@ mod tests {
                 .expect("read nodal-correction metadata"),
             netcdf::AttributeValue::Str("linear-time".to_owned())
         );
+        assert_eq!(
+            inference_output
+                .attribute("constituent_order")
+                .expect("constituent-order metadata")
+                .value()
+                .expect("read constituent-order metadata"),
+            netcdf::AttributeValue::Str("signal-to-noise".to_owned())
+        );
+        let constituent_index_by_rank = inference_output
+            .variable("constituent_index_by_rank")
+            .expect("SNR presentation order")
+            .get_values::<i64, _>(..)
+            .expect("read SNR presentation order");
+        let signal_to_noise = inference_output
+            .variable("signal_to_noise")
+            .expect("SNR values")
+            .get_values::<f64, _>(..)
+            .expect("read SNR values");
+        for series in 0..2 {
+            let order = &constituent_index_by_rank[series * 4..(series + 1) * 4];
+            let snr = &signal_to_noise[series * 4..(series + 1) * 4];
+            assert!(order.windows(2).all(|pair| {
+                snr[usize::try_from(pair[0]).expect("non-negative index")]
+                    >= snr[usize::try_from(pair[1]).expect("non-negative index")]
+            }));
+        }
         assert_eq!(
             inference_output
                 .attribute("confidence_interval")

@@ -226,6 +226,24 @@ metadata, result digests, profile names, and reconstruction. Existing default
 profile names keep their `nodal` component; alternatives use
 `nodal-linear-time` or `no-nodal`.
 
+Use `--order selection`, `--order pe`, `--order snr`, or `--order frequency`
+to choose a constituent presentation view. The default `selection` view retains
+the fitted-model order; PE and SNR rank from largest to smallest, while frequency
+ranks from smallest to largest. Ties retain the fitted-model order. SNR ordering
+requires either linear or Monte Carlo confidence. An explicit comma-separated
+list, such as `--order K1,M2,O1,S2,N2`, is also accepted, but it must be a
+complete permutation of every fitted (including inferred) constituent. Use
+`--constituents` or inference options to change which constituents are fitted.
+
+Presentation never changes coefficient-array identity or reconstruction. NetCDF
+coefficient and diagnostic arrays always retain their stable `constituent` axis;
+`constituent_index_by_rank(series,presentation_rank)` maps each requested rank to
+its zero-based stable index. The mapping is per series because PE, SNR, and even
+the fitted reference-time frequency can vary between records. Retained JSON
+samples carry the same mapping, and reports state the requested order and whether
+it actually varies by series. Shared selection/explicit maps are stored compactly
+in memory and expanded in bounded chunks only while writing NetCDF output.
+
 Add one repeatable `--infer INFERRED:REFERENCE:AMPLITUDE_RATIO:PHASE_OFFSET`
 for each constrained scalar constituent. Exact astronomical inference is the
 default; `--infer-approximate` selects Python UTide's reference-only approximate

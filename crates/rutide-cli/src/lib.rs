@@ -17,7 +17,7 @@ use rutide_core::{
     InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections, PhaseReference,
     RayleighSelection, ReconstructionFilter, RobustOptions, RobustTermination,
     ScalarInferenceBatch, ScalarInferenceRelation, ScalarSolution, SolverOptions, TidalConstituent,
-    VectorInferenceRelation, select_constituents_by_rayleigh,
+    VectorInferenceRelation, VectorSolution, select_constituents_by_rayleigh,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -27,7 +27,7 @@ mod vector;
 pub use vector::{VectorAnalyzeConfig, VectorRunReport, VectorSampleResult, analyze_vector};
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
-const OUTPUT_SCHEMA_VERSION: u32 = 11;
+const OUTPUT_SCHEMA_VERSION: u32 = 12;
 /// Backward-compatible benchmark constituent set used when none is specified.
 pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -58,6 +58,51 @@ pub enum ConstituentSelection {
         /// Dimensionless minimum Rayleigh criterion.
         minimum: f64,
     },
+}
+
+/// Presentation order for fitted constituents.
+///
+/// Bulk coefficient arrays always retain stable fitted-model order. This option
+/// controls a per-series rank-to-model-index mapping carried beside those arrays.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ConstituentOrder {
+    /// Preserve the selected fitted-model order.
+    #[default]
+    Selection,
+    /// Rank each series by descending percent energy.
+    PercentEnergy,
+    /// Rank each series by descending signal-to-noise ratio.
+    SignalToNoise,
+    /// Rank each series by ascending fitted reference-time frequency.
+    Frequency,
+    /// Use this complete permutation of the fitted constituent names.
+    Explicit(Vec<TidalConstituent>),
+}
+
+impl ConstituentOrder {
+    /// Stable machine-readable name used in reports and `NetCDF` metadata.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Selection => "selection",
+            Self::PercentEnergy => "percent-energy",
+            Self::SignalToNoise => "signal-to-noise",
+            Self::Frequency => "frequency",
+            Self::Explicit(_) => "explicit",
+        }
+    }
+
+    fn explicit_names(&self) -> Option<Vec<&'static str>> {
+        match self {
+            Self::Explicit(constituents) => Some(
+                constituents
+                    .iter()
+                    .map(|constituent| constituent.name())
+                    .collect(),
+            ),
+            Self::Selection | Self::PercentEnergy | Self::SignalToNoise | Self::Frequency => None,
+        }
+    }
 }
 
 /// Scalar inferred-constituent relationships for one application run.
@@ -145,6 +190,248 @@ impl ConfidenceInterval {
     }
 }
 
+trait PresentationDiagnostics {
+    fn percent_energy(&self) -> &[f64];
+    fn signal_to_noise(&self) -> Option<&[f64]>;
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ConstituentOrderMap {
+    indices: Vec<u16>,
+    series_count: usize,
+    constituent_count: usize,
+    shared: bool,
+}
+
+impl ConstituentOrderMap {
+    fn shared(indices: Vec<usize>, series_count: usize) -> Result<Self, AppError> {
+        let constituent_count = indices.len();
+        Ok(Self {
+            indices: encode_constituent_indices(indices)?,
+            series_count,
+            constituent_count,
+            shared: true,
+        })
+    }
+
+    const fn per_series(indices: Vec<u16>, series_count: usize, constituent_count: usize) -> Self {
+        Self {
+            indices,
+            series_count,
+            constituent_count,
+            shared: false,
+        }
+    }
+
+    fn row(&self, series: usize) -> &[u16] {
+        assert!(series < self.series_count, "series index is in range");
+        if self.shared {
+            &self.indices
+        } else {
+            let start = series * self.constituent_count;
+            &self.indices[start..start + self.constituent_count]
+        }
+    }
+
+    fn varies_by_series(&self) -> bool {
+        if self.shared || self.series_count < 2 || self.constituent_count == 0 {
+            return false;
+        }
+        let first = &self.indices[..self.constituent_count];
+        self.indices
+            .chunks_exact(self.constituent_count)
+            .skip(1)
+            .any(|indices| indices != first)
+    }
+
+    fn is_valid_for(&self, series_count: usize, constituent_count: usize) -> bool {
+        let expected_len = if self.shared {
+            constituent_count
+        } else {
+            let Some(expected_len) = series_count.checked_mul(constituent_count) else {
+                return false;
+            };
+            expected_len
+        };
+        if self.series_count != series_count
+            || self.constituent_count != constituent_count
+            || self.indices.len() != expected_len
+        {
+            return false;
+        }
+        if constituent_count == 0 {
+            return true;
+        }
+
+        let mut seen = vec![false; constituent_count];
+        let rows_to_validate = if self.shared { 1 } else { series_count };
+        for indices in self
+            .indices
+            .chunks(constituent_count)
+            .take(rows_to_validate)
+        {
+            seen.fill(false);
+            for &index in indices {
+                let index = usize::from(index);
+                if index >= constituent_count || std::mem::replace(&mut seen[index], true) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+fn encode_constituent_indices(
+    indices: impl IntoIterator<Item = usize>,
+) -> Result<Vec<u16>, AppError> {
+    indices
+        .into_iter()
+        .map(|index| {
+            u16::try_from(index)
+                .map_err(|_| AppError::Invalid("constituent index exceeds u16".to_owned()))
+        })
+        .collect()
+}
+
+impl PresentationDiagnostics for ScalarSolution {
+    fn percent_energy(&self) -> &[f64] {
+        &self.percent_energy
+    }
+
+    fn signal_to_noise(&self) -> Option<&[f64]> {
+        self.signal_to_noise.as_deref()
+    }
+}
+
+impl PresentationDiagnostics for VectorSolution {
+    fn percent_energy(&self) -> &[f64] {
+        &self.percent_energy
+    }
+
+    fn signal_to_noise(&self) -> Option<&[f64]> {
+        self.signal_to_noise.as_deref()
+    }
+}
+
+fn shared_constituent_order_indices(
+    order: &ConstituentOrder,
+    constituents: &[Constituent],
+) -> Result<Option<Vec<usize>>, AppError> {
+    let constituent_count = constituents.len();
+    match order {
+        ConstituentOrder::Selection => Ok(Some((0..constituent_count).collect())),
+        ConstituentOrder::Explicit(requested) => {
+            if requested.len() != constituent_count {
+                return Err(AppError::Invalid(format!(
+                    "explicit constituent order contains {} names; expected a complete {constituent_count}-name permutation",
+                    requested.len()
+                )));
+            }
+            let mut indices = Vec::with_capacity(constituent_count);
+            for (rank, requested) in requested.iter().enumerate() {
+                let Some(index) = constituents
+                    .iter()
+                    .position(|constituent| constituent.name == requested.name())
+                else {
+                    return Err(AppError::Invalid(format!(
+                        "explicit constituent order name {} at rank {rank} was not fitted",
+                        requested.name()
+                    )));
+                };
+                if indices.contains(&index) {
+                    return Err(AppError::Invalid(format!(
+                        "explicit constituent order name {} at rank {rank} is duplicated",
+                        requested.name()
+                    )));
+                }
+                indices.push(index);
+            }
+            Ok(Some(indices))
+        }
+        ConstituentOrder::PercentEnergy
+        | ConstituentOrder::SignalToNoise
+        | ConstituentOrder::Frequency => Ok(None),
+    }
+}
+
+fn constituent_order_indices<S: PresentationDiagnostics>(
+    order: &ConstituentOrder,
+    constituents: &[Constituent],
+    series_frequency_cph: &[Vec<f64>],
+    solutions: &[S],
+) -> Result<ConstituentOrderMap, AppError> {
+    if series_frequency_cph.len() != solutions.len() {
+        return Err(AppError::Invalid(
+            "frequency and solution series counts differ".to_owned(),
+        ));
+    }
+    let constituent_count = constituents.len();
+    let shared = shared_constituent_order_indices(order, constituents)?;
+
+    for (series, frequency) in series_frequency_cph.iter().enumerate() {
+        if frequency.len() != constituent_count {
+            return Err(AppError::Invalid(format!(
+                "frequency series {series} contains {} values; expected {constituent_count}",
+                frequency.len()
+            )));
+        }
+    }
+    if let Some(indices) = shared {
+        return ConstituentOrderMap::shared(indices, solutions.len());
+    }
+
+    let capacity = solutions
+        .len()
+        .checked_mul(constituent_count)
+        .ok_or_else(|| AppError::Invalid("constituent order size exceeds usize".to_owned()))?;
+    let mut ordered = Vec::with_capacity(capacity);
+    for (series, (solution, frequency)) in solutions.iter().zip(series_frequency_cph).enumerate() {
+        let values = match order {
+            ConstituentOrder::PercentEnergy => solution.percent_energy(),
+            ConstituentOrder::SignalToNoise => solution.signal_to_noise().ok_or_else(|| {
+                AppError::Invalid(
+                    "SNR constituent ordering requires confidence intervals".to_owned(),
+                )
+            })?,
+            ConstituentOrder::Frequency => frequency,
+            ConstituentOrder::Selection | ConstituentOrder::Explicit(_) => {
+                unreachable!("shared presentation orders returned above")
+            }
+        };
+        if values.len() != constituent_count {
+            return Err(AppError::Invalid(format!(
+                "ordering diagnostic for series {series} contains {} values; expected {constituent_count}",
+                values.len()
+            )));
+        }
+        let mut indices = (0..constituent_count).collect::<Vec<_>>();
+        match order {
+            ConstituentOrder::Frequency => indices.sort_by(|left, right| {
+                values[*left]
+                    .total_cmp(&values[*right])
+                    .then_with(|| left.cmp(right))
+            }),
+            ConstituentOrder::PercentEnergy | ConstituentOrder::SignalToNoise => {
+                indices.sort_by(|left, right| {
+                    values[*right]
+                        .total_cmp(&values[*left])
+                        .then_with(|| left.cmp(right))
+                });
+            }
+            ConstituentOrder::Selection | ConstituentOrder::Explicit(_) => {
+                unreachable!("shared presentation orders returned above")
+            }
+        }
+        ordered.extend(encode_constituent_indices(indices)?);
+    }
+    Ok(ConstituentOrderMap::per_series(
+        ordered,
+        solutions.len(),
+        constituent_count,
+    ))
+}
+
 /// Configuration for one scalar FVCOM analysis run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnalyzeConfig {
@@ -158,6 +445,8 @@ pub struct AnalyzeConfig {
     pub nodes: NodeSelection,
     /// Explicit or record-length-based constituent selection.
     pub constituent_selection: ConstituentSelection,
+    /// Per-series constituent presentation ranking.
+    pub constituent_order: ConstituentOrder,
     /// Optional constrained inferred constituents.
     pub inference: Option<ScalarInferenceConfig>,
     /// Mean/trend terms included in the harmonic fit.
@@ -210,6 +499,8 @@ pub struct SampleResult {
     pub phase_degrees: Vec<f64>,
     /// Percent energy in the report's constituent order.
     pub percent_energy: Vec<f64>,
+    /// Stable constituent indices in requested presentation-rank order.
+    pub constituent_index_by_rank: Vec<usize>,
     /// 95% amplitude CI half-widths, when enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub amplitude_ci: Option<Vec<f64>>,
@@ -377,6 +668,13 @@ pub struct RunReport {
     pub robust_options: Option<RobustOptionsReport>,
     /// Auditable constituent-selection method and threshold.
     pub constituent_selection: ConstituentSelectionReport,
+    /// Requested presentation ranking: selection, PE, SNR, frequency, or explicit.
+    pub constituent_order: &'static str,
+    /// Complete explicit presentation permutation, when supplied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explicit_constituent_order: Option<Vec<&'static str>>,
+    /// Whether presentation permutations differ between fitted spatial series.
+    pub constituent_order_varies_by_series: bool,
     /// Inference configuration when inferred constituents are enabled.
     pub inference: Option<InferenceReport>,
     /// Confidence method: `none`, `linear`, or `monte-carlo`.
@@ -611,6 +909,7 @@ impl ResolvedConstituentSelection {
         fit_options: FitOptions,
         phase_reference: PhaseReference,
         nodal_corrections: NodalCorrections,
+        constituent_order: &ConstituentOrder,
     ) -> String {
         let selection = match self.report.method {
             "explicit" => "fixed-constituents",
@@ -618,13 +917,24 @@ impl ResolvedConstituentSelection {
             _ => unreachable!("selection methods are constructed internally"),
         };
         let inference = if inferred { "inference-" } else { "" };
+        let ordering = order_profile_suffix(constituent_order);
         let trend = if fit_options.trend { "" } else { "-no-trend" };
         format!(
-            "{selection}-{}-{}-{inference}{}{trend}",
+            "{selection}-{}-{}-{inference}{}{ordering}{trend}",
             phase_reference.name(),
             nodal_profile_component(nodal_corrections),
             analysis_method.name(),
         )
+    }
+}
+
+const fn order_profile_suffix(order: &ConstituentOrder) -> &'static str {
+    match order {
+        ConstituentOrder::Selection => "",
+        ConstituentOrder::PercentEnergy => "-order-pe",
+        ConstituentOrder::SignalToNoise => "-order-snr",
+        ConstituentOrder::Frequency => "-order-frequency",
+        ConstituentOrder::Explicit(_) => "-order-explicit",
     }
 }
 
@@ -666,6 +976,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         config.phase_reference,
         config.nodal_corrections,
     )?;
+    shared_constituent_order_indices(&config.constituent_order, batch.constituents())?;
     if let Some(filter) = &config.reconstruction {
         validate_reconstruction_filter(filter, batch.tidal_constituents())?;
     }
@@ -696,6 +1007,12 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
 
     let result_start = Instant::now();
     let series_frequency_cph = solution_frequencies(&batch, &solutions)?;
+    let constituent_index_by_rank = constituent_order_indices(
+        &config.constituent_order,
+        batch.constituents(),
+        &series_frequency_cph,
+        &solutions,
+    )?;
     let result_sha256 = result_digest(
         &input.node_indices,
         &input.latitudes,
@@ -705,6 +1022,8 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         config.fit_options,
         config.phase_reference,
         config.nodal_corrections,
+        &config.constituent_order,
+        &constituent_index_by_rank,
         config.analysis_method,
         config.confidence_interval,
         config
@@ -722,6 +1041,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         &input.latitudes,
         &input.observation_counts,
         &solutions,
+        &constituent_index_by_rank,
     );
     let result_processing_seconds = result_start.elapsed().as_secs_f64();
 
@@ -736,6 +1056,8 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             constituents: batch.constituents(),
             series_frequency_cph: &series_frequency_cph,
             solutions: &solutions,
+            constituent_order: &config.constituent_order,
+            constituent_index_by_rank: &constituent_index_by_rank,
             result_sha256: &result_sha256,
             selection: &selection,
             inference: config.inference.as_ref(),
@@ -770,6 +1092,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             config.fit_options,
             config.phase_reference,
             config.nodal_corrections,
+            &config.constituent_order,
         ),
         input_path: config.input.to_string_lossy().into_owned(),
         input_file_bytes: input.input_file_bytes,
@@ -793,6 +1116,9 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             AnalysisMethod::Robust(options) => Some(options.into()),
         },
         constituent_selection: selection.report,
+        constituent_order: config.constituent_order.name(),
+        explicit_constituent_order: config.constituent_order.explicit_names(),
+        constituent_order_varies_by_series: constituent_index_by_rank.varies_by_series(),
         inference: config.inference.as_ref().map(ScalarInferenceConfig::report),
         confidence_interval: config.confidence_interval.method(),
         confidence_noise: config.confidence_interval.noise(),
@@ -986,6 +1312,28 @@ fn validate_config(config: &AnalyzeConfig) -> Result<(), AppError> {
         return Err(AppError::Invalid(
             "input and output paths must differ".to_owned(),
         ));
+    }
+    if config.constituent_order == ConstituentOrder::SignalToNoise
+        && config.confidence_interval == ConfidenceInterval::None
+    {
+        return Err(AppError::Invalid(
+            "SNR constituent ordering requires confidence intervals".to_owned(),
+        ));
+    }
+    if let ConstituentOrder::Explicit(constituents) = &config.constituent_order {
+        if constituents.is_empty() {
+            return Err(AppError::Invalid(
+                "explicit constituent order must not be empty".to_owned(),
+            ));
+        }
+        let mut unique = BTreeSet::new();
+        for constituent in constituents.iter().copied() {
+            if !unique.insert(constituent) {
+                return Err(AppError::Invalid(format!(
+                    "explicit constituent order contains {constituent} more than once"
+                )));
+            }
+        }
     }
     if let ConfidenceInterval::MonteCarlo { options, .. } = config.confidence_interval
         && options.realizations < 2
@@ -1496,18 +1844,21 @@ fn result_digest(
     fit_options: FitOptions,
     phase_reference: PhaseReference,
     nodal_corrections: NodalCorrections,
+    constituent_order: &ConstituentOrder,
+    constituent_index_by_rank: &ConstituentOrderMap,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     inference: Option<&InferenceReport>,
     reconstruction: Option<(&ReconstructionFilter, &[Vec<f64>])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-scalar-nodal-v11\0");
+    digest.update(b"rutide-scalar-nodal-v12\0");
     digest.update([u8::from(fit_options.trend)]);
     digest.update(phase_reference.name().as_bytes());
     digest.update([0]);
     digest.update(nodal_corrections.name().as_bytes());
     digest.update([0]);
+    update_constituent_order_digest(&mut digest, constituent_order, constituent_index_by_rank);
     digest.update(analysis_method.name().as_bytes());
     if let AnalysisMethod::Robust(options) = analysis_method {
         digest.update(options.tuning_constant.to_bits().to_le_bytes());
@@ -1604,6 +1955,27 @@ fn result_digest(
         None => digest.update(b"no-reconstruction\0"),
     }
     Ok(encode_hex(&digest.finalize()))
+}
+
+fn update_constituent_order_digest(
+    digest: &mut Sha256,
+    order: &ConstituentOrder,
+    constituent_index_by_rank: &ConstituentOrderMap,
+) {
+    digest.update(order.name().as_bytes());
+    digest.update([0]);
+    if let Some(names) = order.explicit_names() {
+        for name in names {
+            digest.update(name.as_bytes());
+            digest.update([0]);
+        }
+    }
+    for series in 0..constituent_index_by_rank.series_count {
+        let indices = constituent_index_by_rank.row(series);
+        for &index in indices {
+            digest.update(u64::from(index).to_le_bytes());
+        }
+    }
 }
 
 fn update_inference_digest(digest: &mut Sha256, inference: Option<&InferenceReport>) {
@@ -1711,6 +2083,7 @@ fn retained_samples(
     latitudes: &[f64],
     observation_counts: &[usize],
     solutions: &[ScalarSolution],
+    constituent_index_by_rank: &ConstituentOrderMap,
 ) -> Vec<SampleResult> {
     node_indices
         .iter()
@@ -1718,21 +2091,30 @@ fn retained_samples(
         .zip(latitudes.iter().copied())
         .zip(observation_counts.iter().copied())
         .zip(solutions)
+        .enumerate()
         .take(3)
         .map(
-            |(((node_index, latitude_degrees_north), observation_count), solution)| SampleResult {
-                node_index,
-                latitude_degrees_north,
-                amplitude: solution.amplitude.clone(),
-                phase_degrees: solution.phase_degrees.clone(),
-                percent_energy: solution.percent_energy.clone(),
-                amplitude_ci: solution.amplitude_ci.clone(),
-                phase_ci_degrees: solution.phase_ci_degrees.clone(),
-                signal_to_noise: solution.signal_to_noise.clone(),
-                mean: solution.mean,
-                slope_per_day: solution.slope_per_day,
-                observation_count,
-                reference_time_modified_julian_day: solution.reference_time_days,
+            |(series, (((node_index, latitude_degrees_north), observation_count), solution))| {
+                SampleResult {
+                    node_index,
+                    latitude_degrees_north,
+                    amplitude: solution.amplitude.clone(),
+                    phase_degrees: solution.phase_degrees.clone(),
+                    percent_energy: solution.percent_energy.clone(),
+                    constituent_index_by_rank: constituent_index_by_rank
+                        .row(series)
+                        .iter()
+                        .copied()
+                        .map(usize::from)
+                        .collect(),
+                    amplitude_ci: solution.amplitude_ci.clone(),
+                    phase_ci_degrees: solution.phase_ci_degrees.clone(),
+                    signal_to_noise: solution.signal_to_noise.clone(),
+                    mean: solution.mean,
+                    slope_per_day: solution.slope_per_day,
+                    observation_count,
+                    reference_time_modified_julian_day: solution.reference_time_days,
+                }
             },
         )
         .collect()
@@ -1745,6 +2127,8 @@ struct OutputData<'data> {
     constituents: &'data [Constituent],
     series_frequency_cph: &'data [Vec<f64>],
     solutions: &'data [ScalarSolution],
+    constituent_order: &'data ConstituentOrder,
+    constituent_index_by_rank: &'data ConstituentOrderMap,
     result_sha256: &'data str,
     selection: &'data ResolvedConstituentSelection,
     inference: Option<&'data ScalarInferenceConfig>,
@@ -1785,6 +2169,8 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         constituents,
         series_frequency_cph,
         solutions,
+        constituent_order,
+        constituent_index_by_rank,
         result_sha256,
         selection,
         inference,
@@ -1800,6 +2186,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
     let mut output = netcdf::create(path)?;
     output.add_dimension("series", node_indices.len())?;
     output.add_dimension("constituent", constituents.len())?;
+    output.add_dimension("presentation_rank", constituents.len())?;
     if reconstruction.is_some() {
         output.add_dimension("time", modified_julian_days.len())?;
     }
@@ -1812,12 +2199,17 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         fit_options,
         phase_reference,
         nodal_corrections,
+        constituent_order,
     );
     output.add_attribute("profile", profile.as_str())?;
     output.add_attribute("analysis_method", analysis_method.name())?;
     output.add_attribute("trend_enabled", i64::from(fit_options.trend))?;
     output.add_attribute("phase_reference", phase_reference.name())?;
     output.add_attribute("nodal_corrections", nodal_corrections.name())?;
+    output.add_attribute("constituent_order", constituent_order.name())?;
+    if let Some(names) = constituent_order.explicit_names() {
+        output.add_attribute("explicit_constituent_order", names.join(","))?;
+    }
     if let AnalysisMethod::Robust(options) = analysis_method {
         output.add_attribute("robust_tuning_constant", options.tuning_constant)?;
         output.add_attribute("robust_tolerance", options.tolerance)?;
@@ -1925,6 +2317,12 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         &frequency,
         "cycles per hour",
     )?;
+    write_constituent_order_indices(
+        &mut output,
+        solutions.len(),
+        constituents.len(),
+        constituent_index_by_rank,
+    )?;
 
     write_solution_variables(
         &mut output,
@@ -1943,6 +2341,43 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         )?;
     }
     output.close()?;
+    Ok(())
+}
+
+fn write_constituent_order_indices(
+    output: &mut FileMut,
+    series_count: usize,
+    constituent_count: usize,
+    constituent_index_by_rank: &ConstituentOrderMap,
+) -> Result<(), AppError> {
+    const TARGET_CHUNK_INDICES: usize = 1 << 20;
+
+    if !constituent_index_by_rank.is_valid_for(series_count, constituent_count) {
+        return Err(AppError::Invalid(
+            "constituent presentation order is not a complete per-series permutation".to_owned(),
+        ));
+    }
+    let mut variable = output.add_variable::<i64>(
+        "constituent_index_by_rank",
+        &["series", "presentation_rank"],
+    )?;
+    variable.put_attribute(
+        "long_name",
+        "stable constituent index at each requested presentation rank",
+    )?;
+    variable.put_attribute("start_index", 0_i64)?;
+    let rows_per_chunk = (TARGET_CHUNK_INDICES / constituent_count.max(1)).max(1);
+    let mut indices = Vec::with_capacity(rows_per_chunk.saturating_mul(constituent_count));
+    for first_series in (0..series_count).step_by(rows_per_chunk) {
+        let end_series = (first_series + rows_per_chunk).min(series_count);
+        indices.clear();
+        for series in first_series..end_series {
+            for &index in constituent_index_by_rank.row(series) {
+                indices.push(i64::from(index));
+            }
+        }
+        variable.put_values(&indices, (first_series..end_series, ..))?;
+    }
     Ok(())
 }
 
@@ -2245,12 +2680,13 @@ mod tests {
     use std::fs;
 
     use super::{
-        NodeSelection, ScalarInferenceConfig, encode_hex, normalize_source_observation,
-        read_fvcom_scalar, resolve_node_selection, temporary_sibling, write_inference_metadata,
-        write_reconstruction_variables,
+        ConstituentOrder, NodeSelection, ScalarInferenceConfig, constituent_order_indices,
+        encode_hex, normalize_source_observation, read_fvcom_scalar, resolve_node_selection,
+        temporary_sibling, write_inference_metadata, write_reconstruction_variables,
     };
     use rutide_core::{
-        InferenceMode, ReconstructionFilter, ScalarInferenceRelation, TidalConstituent,
+        Constituent, GreenwichNodalOls, InferenceMode, LinearConfidence, ReconstructionFilter,
+        ScalarInferenceRelation, ScalarSolution, TidalConstituent,
     };
 
     #[test]
@@ -2275,6 +2711,157 @@ mod tests {
     #[test]
     fn hex_encoding_is_lowercase_and_zero_padded() {
         assert_eq!(encode_hex(&[0, 15, 16, 255]), "000f10ff");
+    }
+
+    #[test]
+    fn bulk_presentation_orders_preserve_stable_constituent_indices() {
+        let constituents = [
+            Constituent::new("M2", 0.3),
+            Constituent::new("K1", 0.1),
+            Constituent::new("S2", 0.2),
+        ];
+        let frequencies = vec![vec![0.3, 0.1, 0.2], vec![0.2, 0.3, 0.1]];
+        let solution =
+            |percent_energy: [f64; 3], signal_to_noise: Option<[f64; 3]>| ScalarSolution {
+                cosine_coefficient: vec![0.0; 3],
+                sine_coefficient: vec![0.0; 3],
+                amplitude: vec![0.0; 3],
+                phase_degrees: vec![0.0; 3],
+                percent_energy: percent_energy.to_vec(),
+                amplitude_ci: signal_to_noise.map(|_| vec![0.0; 3]),
+                phase_ci_degrees: signal_to_noise.map(|_| vec![0.0; 3]),
+                signal_to_noise: signal_to_noise.map(|values| values.to_vec()),
+                cosine_coefficient_variance: None,
+                sine_coefficient_variance: None,
+                mean: 0.0,
+                slope_per_day: 0.0,
+                reference_time_days: 0.0,
+                robust: None,
+            };
+        let solutions = [
+            solution([20.0, 70.0, 10.0], Some([2.0, 1.0, 3.0])),
+            solution([50.0, 10.0, 40.0], Some([4.0, 6.0, 5.0])),
+        ];
+        for (order, expected) in [
+            (
+                ConstituentOrder::Selection,
+                vec![vec![0, 1, 2], vec![0, 1, 2]],
+            ),
+            (
+                ConstituentOrder::PercentEnergy,
+                vec![vec![1, 0, 2], vec![0, 2, 1]],
+            ),
+            (
+                ConstituentOrder::SignalToNoise,
+                vec![vec![2, 0, 1], vec![1, 2, 0]],
+            ),
+            (
+                ConstituentOrder::Frequency,
+                vec![vec![1, 2, 0], vec![2, 0, 1]],
+            ),
+            (
+                ConstituentOrder::Explicit(vec![
+                    TidalConstituent::S2,
+                    TidalConstituent::M2,
+                    TidalConstituent::K1,
+                ]),
+                vec![vec![2, 0, 1], vec![2, 0, 1]],
+            ),
+        ] {
+            let order_map =
+                constituent_order_indices(&order, &constituents, &frequencies, &solutions)
+                    .expect("valid presentation order");
+            assert_eq!(
+                (0..solutions.len())
+                    .map(|series| order_map.row(series).to_vec())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+
+        assert!(
+            constituent_order_indices(
+                &ConstituentOrder::Explicit(vec![TidalConstituent::M2]),
+                &constituents,
+                &frequencies,
+                &solutions,
+            )
+            .is_err()
+        );
+        let no_confidence = [solution([20.0, 70.0, 10.0], None)];
+        assert!(
+            constituent_order_indices(
+                &ConstituentOrder::SignalToNoise,
+                &constituents,
+                &frequencies[..1],
+                &no_confidence,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn presentation_orders_match_the_pinned_python_utide_oracle() {
+        // Frozen from UTide 8fabe121752bc317931472a10a42e306715106de.
+        let tidal_constituents = [
+            TidalConstituent::M2,
+            TidalConstituent::S2,
+            TidalConstituent::N2,
+            TidalConstituent::K1,
+            TidalConstituent::O1,
+        ];
+        let time = (0_u32..745)
+            .map(|index| 58_113.0 + f64::from(index) / 24.0)
+            .collect::<Vec<_>>();
+        let observations = include_str!("../../rutide-core/tests/data/fvcom_node_0_zeta_f32.hex")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| {
+                f64::from(f32::from_bits(
+                    u32::from_str_radix(line, 16).expect("fixture contains hexadecimal f32 bits"),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let model = GreenwichNodalOls::prepare_modified_julian_days(
+            &time,
+            60.957_717_895_507_81,
+            &tidal_constituents,
+        )
+        .expect("valid pinned-oracle model");
+        let solution = model
+            .solve_with_linear_confidence(&observations, LinearConfidence::Colored)
+            .expect("valid pinned-oracle confidence solution");
+        let frequencies = vec![
+            model
+                .constituents()
+                .iter()
+                .map(|constituent| constituent.frequency_cph)
+                .collect(),
+        ];
+        for (order, expected) in [
+            (ConstituentOrder::PercentEnergy, vec![0, 1, 2, 3, 4]),
+            (ConstituentOrder::SignalToNoise, vec![0, 1, 3, 2, 4]),
+            (ConstituentOrder::Frequency, vec![4, 3, 2, 0, 1]),
+            (
+                ConstituentOrder::Explicit(vec![
+                    TidalConstituent::K1,
+                    TidalConstituent::M2,
+                    TidalConstituent::O1,
+                    TidalConstituent::S2,
+                    TidalConstituent::N2,
+                ]),
+                vec![3, 0, 4, 1, 2],
+            ),
+        ] {
+            let order_map = constituent_order_indices(
+                &order,
+                model.constituents(),
+                &frequencies,
+                std::slice::from_ref(&solution),
+            )
+            .expect("valid Python-compatible presentation order");
+            assert_eq!(order_map.row(0), expected);
+        }
     }
 
     #[test]

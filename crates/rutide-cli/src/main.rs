@@ -8,9 +8,9 @@ use std::{
 };
 
 use rutide_cli::{
-    AnalysisMethod, AnalyzeConfig, ConfidenceInterval, ConstituentSelection, DEFAULT_CONSTITUENTS,
-    NodeSelection, ScalarInferenceConfig, VectorAnalyzeConfig, VectorInferenceConfig,
-    analyze_scalar, analyze_vector,
+    AnalysisMethod, AnalyzeConfig, ConfidenceInterval, ConstituentOrder, ConstituentSelection,
+    DEFAULT_CONSTITUENTS, NodeSelection, ScalarInferenceConfig, VectorAnalyzeConfig,
+    VectorInferenceConfig, analyze_scalar, analyze_vector,
 };
 use rutide_core::{
     FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections,
@@ -38,6 +38,7 @@ Options:
   --elements I,J,...  Analyze explicit zero-based element indices (vector mode)
   --constituents LIST Comma-separated names or 'auto' (default: M2,S2,N2,K1,O1)
   --rayleigh-min X    Automatic selection criterion (default with auto: 1.0)
+  --order ORDER       Presentation: selection, pe, snr, frequency, or a full name list
   --infer SPEC        Repeatable inferred relationship:
                       scalar I:R:AMP:PHASE; vector I:R:AMP+:PHASE+:AMP-:PHASE-
   --infer-approximate Use Python-compatible reference-only approximate inference
@@ -149,6 +150,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let mut selection = None;
     let mut constituents = None;
     let mut rayleigh_minimum = None;
+    let mut constituent_order = None;
     let mut scalar_inference_relationships = Vec::new();
     let mut vector_inference_relationships = Vec::new();
     let mut inference_approximate = false;
@@ -226,6 +228,15 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                     &required_value(&mut arguments, option)?,
                     option,
                 )?);
+            }
+            "--order" => {
+                if constituent_order.is_some() {
+                    return Err("--order may only be supplied once".to_owned());
+                }
+                constituent_order = Some(parse_constituent_order(&required_value(
+                    &mut arguments,
+                    option,
+                )?)?);
             }
             "--infer" => {
                 let value = required_value(&mut arguments, option)?;
@@ -379,6 +390,12 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
         monte_carlo_realizations,
         monte_carlo_seed,
     )?;
+    let constituent_order = constituent_order.unwrap_or_default();
+    if constituent_order == ConstituentOrder::SignalToNoise
+        && confidence_interval == ConfidenceInterval::None
+    {
+        return Err("--order snr requires confidence intervals".to_owned());
+    }
     if inference_approximate
         && scalar_inference_relationships.is_empty()
         && vector_inference_relationships.is_empty()
@@ -423,6 +440,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             report,
             elements: selection,
             constituent_selection,
+            constituent_order,
             inference,
             fit_options,
             phase_reference,
@@ -445,6 +463,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             report,
             nodes: selection,
             constituent_selection,
+            constituent_order,
             inference,
             fit_options,
             phase_reference,
@@ -799,31 +818,49 @@ fn parse_constituents(value: &OsStr) -> Result<ParsedConstituents, String> {
     if text == "auto" {
         return Ok(ParsedConstituents::Auto);
     }
-    let mut constituents = Vec::new();
-    for raw_name in text.split(',') {
-        let name = raw_name.trim();
-        if name.is_empty() {
-            return Err("--constituents contains an empty name".to_owned());
-        }
-        let constituent = name
-            .parse::<TidalConstituent>()
-            .map_err(|error| error.to_string())?;
-        if constituents.contains(&constituent) {
-            return Err(format!("constituent {name} appears more than once"));
-        }
-        constituents.push(constituent);
+    parse_explicit_constituents(value, "--constituents").map(ParsedConstituents::Explicit)
+}
+
+fn parse_constituent_order(value: &OsStr) -> Result<ConstituentOrder, String> {
+    match value.to_str() {
+        Some(text) if text.eq_ignore_ascii_case("selection") => Ok(ConstituentOrder::Selection),
+        Some(text) if text.eq_ignore_ascii_case("pe") => Ok(ConstituentOrder::PercentEnergy),
+        Some(text) if text.eq_ignore_ascii_case("snr") => Ok(ConstituentOrder::SignalToNoise),
+        Some(text) if text.eq_ignore_ascii_case("frequency") => Ok(ConstituentOrder::Frequency),
+        Some(_) => parse_explicit_constituents(value, "--order").map(ConstituentOrder::Explicit),
+        None => Err("--order value must be valid UTF-8".to_owned()),
     }
-    Ok(ParsedConstituents::Explicit(constituents))
 }
 
 fn parse_explicit_constituents(
     value: &OsStr,
     option: &str,
 ) -> Result<Vec<TidalConstituent>, String> {
-    match parse_constituents(value)? {
-        ParsedConstituents::Explicit(constituents) => Ok(constituents),
-        ParsedConstituents::Auto => Err(format!("{option} requires explicit constituent names")),
+    let text = value
+        .to_str()
+        .ok_or_else(|| format!("{option} value must be valid UTF-8"))?;
+    if text.is_empty() || text == "auto" {
+        return Err(format!(
+            "{option} requires a comma-separated explicit constituent list"
+        ));
     }
+    let mut constituents = Vec::new();
+    for raw_name in text.split(',') {
+        let name = raw_name.trim();
+        if name.is_empty() {
+            return Err(format!("{option} contains an empty name"));
+        }
+        let constituent = name
+            .parse::<TidalConstituent>()
+            .map_err(|error| error.to_string())?;
+        if constituents.contains(&constituent) {
+            return Err(format!(
+                "{option} constituent {name} appears more than once"
+            ));
+        }
+        constituents.push(constituent);
+    }
+    Ok(constituents)
 }
 
 #[cfg(test)]
@@ -832,8 +869,8 @@ mod tests {
 
     use super::{Command, parse_arguments};
     use rutide_cli::{
-        AnalysisMethod, ConfidenceInterval, ConstituentSelection, DEFAULT_CONSTITUENTS,
-        NodeSelection, ScalarInferenceConfig, VectorInferenceConfig,
+        AnalysisMethod, ConfidenceInterval, ConstituentOrder, ConstituentSelection,
+        DEFAULT_CONSTITUENTS, NodeSelection, ScalarInferenceConfig, VectorInferenceConfig,
     };
     use rutide_core::{
         FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections,
@@ -871,6 +908,7 @@ mod tests {
         assert_eq!(config.analysis_method, AnalysisMethod::Ols);
         assert_eq!(config.reconstruction, None);
         assert_eq!(config.nodal_corrections, NodalCorrections::Exact);
+        assert_eq!(config.constituent_order, ConstituentOrder::Selection);
         assert_eq!(config.workers, 8);
     }
 
@@ -933,6 +971,8 @@ mod tests {
             "linear-time",
             "--nodal",
             "linear-time",
+            "--order",
+            "frequency",
             "--reconstruct",
         ]))
         .expect("valid vector arguments");
@@ -947,6 +987,7 @@ mod tests {
         assert_eq!(config.reconstruction, Some(ReconstructionFilter::All));
         assert_eq!(config.phase_reference, PhaseReference::LinearTime);
         assert_eq!(config.nodal_corrections, NodalCorrections::LinearTime);
+        assert_eq!(config.constituent_order, ConstituentOrder::Frequency);
         assert!(
             parse_arguments(args(&[
                 "analyze-vector",
@@ -973,8 +1014,12 @@ mod tests {
             "input.nc",
             "--output",
             "output.nc",
+            "--constituents",
+            "M2",
             "--infer",
             "S2:M2:0.35:20",
+            "--order",
+            "S2,M2",
             "--infer-approximate",
             "--no-trend",
             "--phase",
@@ -1008,6 +1053,10 @@ mod tests {
         assert_eq!(config.phase_reference, PhaseReference::Raw);
         assert_eq!(config.nodal_corrections, NodalCorrections::Disabled);
         assert_eq!(
+            config.constituent_order,
+            ConstituentOrder::Explicit(vec![TidalConstituent::S2, TidalConstituent::M2])
+        );
+        assert_eq!(
             config.confidence_interval,
             ConfidenceInterval::MonteCarlo {
                 options: MonteCarloOptions {
@@ -1030,6 +1079,8 @@ mod tests {
             "robust",
             "--confidence",
             "monte-carlo",
+            "--order",
+            "SNR",
         ]))
         .expect("valid vector inference");
         let Command::AnalyzeVector(config) = vector else {
@@ -1053,6 +1104,7 @@ mod tests {
         assert_eq!(config.fit_options, FitOptions::default());
         assert_eq!(config.phase_reference, PhaseReference::Greenwich);
         assert_eq!(config.nodal_corrections, NodalCorrections::Exact);
+        assert_eq!(config.constituent_order, ConstituentOrder::SignalToNoise);
         assert!(matches!(
             config.confidence_interval,
             ConfidenceInterval::MonteCarlo { .. }
@@ -1065,6 +1117,9 @@ mod tests {
             &["--phase", "linear_time"][..],
             &["--nodal", "exact", "--nodal", "disabled"][..],
             &["--nodal", "linear_time"][..],
+            &["--order", "snr"][..],
+            &["--order", "pe", "--order", "frequency"][..],
+            &["--order", "M2,M2"][..],
             &["--infer", "S2:M2:-0.1:20"][..],
             &["--infer", "S2:M2:0.3"][..],
         ] {
