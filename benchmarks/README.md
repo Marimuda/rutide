@@ -9,7 +9,8 @@ outside source control.
 The environment is locked with `uv`. The local `UTide/` checkout is intentionally
 not an environment dependency: the runner verifies its Git revision and clean
 state, puts that exact checkout first on `sys.path`, and rejects an installed copy
-from elsewhere.
+from elsewhere. The repository's RUTide package is an editable local dependency,
+so the same environment can benchmark both public Python interfaces.
 
 ```console
 uv sync --project benchmarks/python --locked
@@ -86,6 +87,31 @@ Record the worker count explicitly for both probes. With `--workers 1`, the
 Python probe is canonical single-process UTide with BLAS limited to one thread.
 Larger worker counts retain a Linux `fork` pool and still call the existing
 one-series API once per series, matching the Rust batch worker-count comparison.
+
+Benchmark the installed public bindings directly—including object construction
+and Python/native boundary costs—with one matched command:
+
+```console
+uv run --project benchmarks/python --locked \
+  python -m rutide_baseline.binding_benchmark \
+  --field scalar --sampling regular --profile ols \
+  --samples 745 --series-count 100 --workers 16 \
+  --output benchmark-results/python-bindings-scalar-ols.json
+
+uv run --project benchmarks/python --locked \
+  python -m rutide_baseline.binding_benchmark \
+  --field vector --sampling irregular --profile linear-colored \
+  --samples 745 --series-count 100 --workers 16 \
+  --output benchmark-results/python-bindings-vector-lomb.json
+```
+
+Each run times UTide's one-series loop, RUTide's one-series loop, and RUTide's
+time-major native batch for both solve and reconstruction. Inputs, options, and
+one-thread BLAS are matched. The JSON report retains every repetition, three
+pairwise speedups, software/hardware identity, output digests, and maximum
+cross-language/batch numerical errors. Profiles `ols`, `linear-colored`, and
+`robust-colored` separate the major computational regimes; irregular colored
+profiles exercise the Lomb–Scargle path.
 
 Benchmark robust Cauchy IRLS plus regular colored confidence on the matched
 outlier fixtures with:

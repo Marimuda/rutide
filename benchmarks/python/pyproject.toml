@@ -6,9 +6,13 @@ requires-python = "==3.10.*"
 dependencies = [
   "netcdf4==1.7.2",
   "numpy==2.2.6",
+  "rutide",
   "scipy==1.13.1",
   "threadpoolctl==3.5.0",
 ]
+
+[tool.uv.sources]
+rutide = { path = "../..", editable = true }
 
 [build-system]
 requires = ["setuptools==80.9.0"]

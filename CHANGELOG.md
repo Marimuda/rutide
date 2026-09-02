@@ -23,6 +23,9 @@ published API and file-schema contracts.
 - Atomic, pickle-free schema-1 coefficient persistence for single and batch
   fits, including uncertainty, robust diagnostics, inference, and reusable
   native reconstruction state without source observations.
+- A locked public-binding benchmark that compares Python UTide loops, RUTide
+  one-series loops, and RUTide native batches for solve and reconstruction while
+  enforcing numerical parity.
 - Irregular colored-confidence estimation through Lomb–Scargle residual spectra.
 - Bounded and incremental FVCOM scalar, depth-averaged, sigma-layer, and
   fixed-physical-depth application workflows.

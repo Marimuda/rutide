@@ -226,6 +226,13 @@ algorithm, not only a language translation. If a batched NumPy/SciPy prototype
 captures most of the same gain, that is evidence against maintaining a full Rust
 rewrite and in favor of a smaller native kernel or improved Python API.
 
+The public-binding harness now makes this distinction explicit. It measures a
+matched Python UTide one-series loop, RUTide one-series loop, and RUTide native
+time-major batch for both fitting and reconstruction. This isolates the gain from
+the Rust scalar kernel from the larger gain due to shared preparation, native
+scheduling, and fewer Python calls. See `benchmarks/README.md` for commands and
+the versioned JSON report contract.
+
 ## Correctness contract
 
 Python UTide at the pinned revision is the initial behavioral oracle. For each

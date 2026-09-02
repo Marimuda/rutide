@@ -104,12 +104,26 @@ wheels = [
 ]
 
 [[package]]
+name = "rutide"
+source = { editable = "../../" }
+dependencies = [
+    { name = "numpy" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "numpy", specifier = ">=1.23.5,<3" }]
+
+[package.metadata.requires-dev]
+dev = [{ name = "ruff", specifier = "==0.16.5" }]
+
+[[package]]
 name = "rutide-python-baseline"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "netcdf4" },
     { name = "numpy" },
+    { name = "rutide" },
     { name = "scipy" },
     { name = "threadpoolctl" },
 ]
@@ -123,6 +137,7 @@ dev = [
 requires-dist = [
     { name = "netcdf4", specifier = "==1.7.2" },
     { name = "numpy", specifier = "==2.2.6" },
+    { name = "rutide", editable = "../../" },
     { name = "scipy", specifier = "==1.13.1" },
     { name = "threadpoolctl", specifier = "==3.5.0" },
 ]
