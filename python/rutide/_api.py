@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any, Literal, Union
 
 import numpy as np
@@ -16,6 +20,9 @@ Epoch = Union[str, date, datetime]
 
 _MILLISECONDS_PER_DAY = 86_400_000.0
 _MJD_EPOCH = np.datetime64("1858-11-17T00:00:00", "ms")
+_COEFFICIENT_FILE_SCHEMA = 1
+_METADATA_KEY = "__rutide_metadata__"
+_ARRAY_MARKER = "__rutide_array__"
 
 
 class Bunch(dict[str, Any]):
@@ -52,6 +59,11 @@ class Coefficient(Bunch):
         else:
             super().__setattr__(key, value)
 
+    def save(self, path: str | os.PathLike[str], *, compressed: bool = True) -> Path:
+        """Persist this fit in RUTide's versioned, pickle-free NPZ format."""
+
+        return save(self, path, compressed=compressed)
+
 
 class CoefficientBatch(Bunch):
     """Time-major multi-series coefficients returned by :func:`solve_many`."""
@@ -78,6 +90,11 @@ class CoefficientBatch(Bunch):
             object.__setattr__(self, key, value)
         else:
             super().__setattr__(key, value)
+
+    def save(self, path: str | os.PathLike[str], *, compressed: bool = True) -> Path:
+        """Persist this batch in RUTide's versioned, pickle-free NPZ format."""
+
+        return save(self, path, compressed=compressed)
 
     def to_xarray(self) -> Any:
         """Return an ``xarray.Dataset`` when the optional xarray package is installed."""
@@ -378,6 +395,97 @@ def reconstruct_many(
     return Tide(h=_restore_missing_matrix(target.size, finite, heights))
 
 
+def save(
+    coef: Coefficient | CoefficientBatch,
+    path: str | os.PathLike[str],
+    *,
+    compressed: bool = True,
+) -> Path:
+    """Atomically save fitted coefficients without serializing original observations."""
+
+    if not isinstance(coef, (Coefficient, CoefficientBatch)):
+        raise TypeError("coef must be returned by rutide.solve or rutide.solve_many")
+    arrays: dict[str, npt.NDArray[Any]] = {}
+    snapshot = _pack_snapshot(coef._fit.snapshot(), arrays)
+    document = {
+        "format": "rutide-coefficients",
+        "schema_version": _COEFFICIENT_FILE_SCHEMA,
+        "snapshot": snapshot,
+    }
+    metadata = np.frombuffer(
+        json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        dtype=np.uint8,
+    )
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            dir=destination.parent,
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            writer = np.savez_compressed if compressed else np.savez
+            writer(temporary, **{_METADATA_KEY: metadata}, **arrays)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, destination)
+    except Exception:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
+    return destination
+
+
+def load(
+    path: str | os.PathLike[str], *, workers: int | None = None
+) -> Coefficient | CoefficientBatch:
+    """Load a versioned RUTide coefficient archive without using pickle."""
+
+    if workers is not None and int(workers) <= 0:
+        raise ValueError("workers must be greater than zero or None")
+    source = Path(path)
+    try:
+        with np.load(source, allow_pickle=False) as archive:
+            if _METADATA_KEY not in archive.files:
+                raise ValueError("missing coefficient metadata")
+            metadata_array = archive[_METADATA_KEY]
+            if metadata_array.dtype != np.uint8 or metadata_array.ndim != 1:
+                raise ValueError("coefficient metadata must be a one-dimensional uint8 array")
+            document = json.loads(metadata_array.tobytes().decode("utf-8"))
+            if not isinstance(document, dict):
+                raise ValueError("coefficient metadata root must be a dictionary")
+            if document.get("format") != "rutide-coefficients":
+                raise ValueError("unrecognized coefficient archive format")
+            if document.get("schema_version") != _COEFFICIENT_FILE_SCHEMA:
+                raise ValueError(
+                    "unsupported coefficient archive schema "
+                    f"{document.get('schema_version')!r}; expected {_COEFFICIENT_FILE_SCHEMA}"
+                )
+            used: set[str] = set()
+            snapshot = _unpack_snapshot(document.get("snapshot"), archive, used)
+            unexpected = set(archive.files) - used - {_METADATA_KEY}
+            if unexpected:
+                raise ValueError(f"unreferenced coefficient arrays: {sorted(unexpected)!r}")
+            if not isinstance(snapshot, dict):
+                raise ValueError("native coefficient snapshot must be a dictionary")
+            kind = snapshot.get("kind")
+            if kind == "single":
+                if workers is not None:
+                    raise ValueError("workers can only be overridden for a coefficient batch")
+                return Coefficient(_native.restore_fit(snapshot))
+            if kind == "batch":
+                return CoefficientBatch(
+                    _native.restore_batch(snapshot, None if workers is None else int(workers))
+                )
+            raise ValueError(f"unknown native coefficient snapshot kind {kind!r}")
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as error:
+        raise ValueError(f"cannot load RUTide coefficient archive {source}: {error}") from error
+
+
 def _as_vector(value: ArrayLike, name: str) -> npt.NDArray[np.float64]:
     masked = np.ma.isMaskedArray(value)
     array = np.asarray(np.ma.getdata(value) if masked else value, dtype=np.float64)
@@ -601,3 +709,45 @@ def _restore_missing_matrix(
     output = np.full((size, values.shape[1]), np.nan, dtype=np.float64)
     output[finite, :] = values
     return output
+
+
+def _pack_snapshot(value: Any, arrays: dict[str, npt.NDArray[Any]]) -> Any:
+    if isinstance(value, np.ndarray):
+        if value.dtype.hasobject:
+            raise TypeError("native coefficient snapshots cannot contain object arrays")
+        key = f"array_{len(arrays):06d}"
+        arrays[key] = np.ascontiguousarray(value)
+        return {_ARRAY_MARKER: key}
+    if isinstance(value, Mapping):
+        packed: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("native coefficient snapshot keys must be strings")
+            packed[key] = _pack_snapshot(item, arrays)
+        return packed
+    if isinstance(value, (list, tuple)):
+        return [_pack_snapshot(item, arrays) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise TypeError(f"unsupported native coefficient snapshot value {type(value).__name__}")
+
+
+def _unpack_snapshot(value: Any, archive: Any, used: set[str]) -> Any:
+    if isinstance(value, dict):
+        if set(value) == {_ARRAY_MARKER}:
+            key = value[_ARRAY_MARKER]
+            if not isinstance(key, str) or key == _METADATA_KEY or key not in archive.files:
+                raise ValueError(f"invalid coefficient array reference {key!r}")
+            array = archive[key]
+            if array.dtype.hasobject:
+                raise ValueError(f"coefficient array {key!r} has forbidden object dtype")
+            used.add(key)
+            return np.ascontiguousarray(array)
+        return {key: _unpack_snapshot(item, archive, used) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_unpack_snapshot(item, archive, used) for item in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise ValueError(f"invalid coefficient metadata value {type(value).__name__}")

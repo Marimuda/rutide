@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib.metadata
+import json
+import tempfile
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import rutide
@@ -514,6 +517,167 @@ class BatchApiTests(unittest.TestCase):
         self.assertTrue(np.isnan(coefficients.weights[100, 0]))
         self.assertLess(coefficients.weights[400, 1], 0.1)
         np.testing.assert_array_equal(coefficients.weights, coefficients.robust.weights)
+
+
+class PersistenceTests(unittest.TestCase):
+    def test_scalar_robust_inference_round_trip_preserves_results(self) -> None:
+        count = 1_300
+        time = 60_300.0 + np.arange(count) / 24.0
+        observations = harmonic(time, M2_CPH, 1.0, 0.2)
+        observations += harmonic(time, S2_CPH, 0.2, 0.45)
+        observations += 0.01 * np.sin(np.arange(count) * 0.27)
+        observations[100] = np.nan
+        observations[500] += 8.0
+        coefficients = rutide.solve(
+            time,
+            observations,
+            lat=60.0,
+            constit=["M2", "S2"],
+            conf_int="MC",
+            MC_n=48,
+            MC_seed=11,
+            method="robust",
+            trend=False,
+            phase="raw",
+            nodal=False,
+            infer={
+                "inferred_names": ["S2"],
+                "reference_names": ["M2"],
+                "amp_ratios": [0.2],
+                "phase_offsets": [15.0],
+            },
+            verbose=False,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nested" / "scalar.rutide.npz"
+            self.assertEqual(coefficients.save(path), path)
+            restored = rutide.load(path)
+
+        self.assertIsInstance(restored, rutide.Coefficient)
+        for field in ["name", "A", "g", "A_ci", "g_ci", "PE", "SNR", "weights"]:
+            np.testing.assert_array_equal(coefficients[field], restored[field])
+        self.assertEqual(coefficients.robust.iterations, restored.robust.iterations)
+        target = 60_295.0 + np.arange(1_500) / 36.0
+        expected = rutide.reconstruct(target, coefficients, min_SNR=None, verbose=False)
+        actual = rutide.reconstruct(target, restored, min_SNR=None, verbose=False)
+        np.testing.assert_array_equal(expected.h, actual.h)
+
+    def test_vector_batch_round_trip_and_worker_override(self) -> None:
+        count = 1_100
+        series_count = 3
+        time = 60_400.0 + np.arange(count) / 24.0
+        eastward = np.column_stack(
+            [
+                harmonic(time, M2_CPH, 0.8 + 0.05 * series, 0.2)
+                + 0.02 * np.sin(np.arange(count) * 0.31)
+                for series in range(series_count)
+            ]
+        )
+        northward = np.column_stack(
+            [
+                harmonic(time, M2_CPH, 0.35, -0.4 + 0.1 * series)
+                + 0.01 * np.cos(np.arange(count) * 0.23)
+                for series in range(series_count)
+            ]
+        )
+        eastward[40, 1] = np.nan
+        northward[41, 1] = np.nan
+        eastward[500, 2] += 12.0
+        coefficients = rutide.solve_many(
+            time,
+            eastward,
+            northward,
+            lat=np.linspace(58.0, 62.0, series_count),
+            constit=["M2"],
+            conf_int="linear",
+            method="robust",
+            trend=False,
+            phase="raw",
+            nodal=False,
+            workers=2,
+            memory_limit_mb=0.02,
+            verbose=False,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "vector-batch.rutide.npz"
+            rutide.save(coefficients, path, compressed=False)
+            restored = rutide.load(path, workers=1)
+
+        self.assertIsInstance(restored, rutide.CoefficientBatch)
+        self.assertEqual(restored.worker_count, 1)
+        for field in [
+            "name",
+            "frequency_cph",
+            "rank_index",
+            "Lsmaj",
+            "Lsmin",
+            "theta",
+            "g",
+            "Lsmaj_ci",
+            "Lsmin_ci",
+            "theta_ci",
+            "g_ci",
+            "PE",
+            "SNR",
+            "weights",
+            "nobs",
+        ]:
+            np.testing.assert_array_equal(coefficients[field], restored[field])
+        target = 60_395.0 + np.arange(900) / 18.0
+        expected = rutide.reconstruct_many(target, coefficients, min_SNR=None, verbose=False)
+        actual = rutide.reconstruct_many(target, restored, min_SNR=None, verbose=False)
+        np.testing.assert_array_equal(expected.u, actual.u)
+        np.testing.assert_array_equal(expected.v, actual.v)
+
+    def test_archive_validation_rejects_missing_and_unknown_schemas(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            missing = directory / "missing.npz"
+            np.savez(missing, values=np.arange(3))
+            with self.assertRaisesRegex(ValueError, "missing coefficient metadata"):
+                rutide.load(missing)
+
+            time = 60_000.0 + np.arange(800) / 24.0
+            coefficients = rutide.solve(
+                time,
+                harmonic(time, M2_CPH, 1.0, 0.1),
+                lat=60.0,
+                constit=["M2"],
+                conf_int="none",
+                trend=False,
+                verbose=False,
+            )
+            valid = directory / "valid.npz"
+            coefficients.save(valid)
+            with np.load(valid, allow_pickle=False) as archive:
+                arrays = {name: archive[name] for name in archive.files}
+            metadata_name = "__rutide_metadata__"
+            document = json.loads(arrays[metadata_name].tobytes().decode("utf-8"))
+            document["schema_version"] = 999
+            arrays[metadata_name] = np.frombuffer(json.dumps(document).encode(), dtype=np.uint8)
+            invalid = directory / "future.npz"
+            np.savez(invalid, **arrays)
+            with self.assertRaisesRegex(ValueError, "unsupported coefficient archive schema"):
+                rutide.load(invalid)
+
+    def test_single_fit_rejects_worker_override(self) -> None:
+        time = 60_000.0 + np.arange(800) / 24.0
+        coefficients = rutide.solve(
+            time,
+            harmonic(time, M2_CPH, 1.0, 0.1),
+            lat=60.0,
+            constit=["M2"],
+            conf_int="none",
+            trend=False,
+            verbose=False,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "single.npz"
+            coefficients.save(path)
+            with self.assertRaisesRegex(ValueError, "coefficient batch"):
+                rutide.load(path, workers=2)
 
 
 if __name__ == "__main__":

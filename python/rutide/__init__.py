@@ -5,8 +5,10 @@ from ._api import (
     Coefficient,
     CoefficientBatch,
     Tide,
+    load,
     reconstruct,
     reconstruct_many,
+    save,
     solve,
     solve_many,
 )
@@ -18,8 +20,10 @@ __all__ = [
     "CoefficientBatch",
     "Tide",
     "__version__",
+    "load",
     "reconstruct",
     "reconstruct_many",
+    "save",
     "solve",
     "solve_many",
 ]

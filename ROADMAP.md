@@ -317,6 +317,11 @@ validation rather than partially applied.
   epochs, and filters. CPython 3.9+ stable-ABI wheels share the Cargo-sourced
   workspace version; locked CI and protected release workflows build and test
   packages without publishing implicitly.
+- Single and batch coefficient objects have atomic, pickle-free schema-1 NPZ
+  persistence. Archives preserve fitted solutions, uncertainty and robust
+  diagnostics, inference/options, and retained model time without retaining
+  source observations; load recreates the native reconstruction model and may
+  retune the batch worker count for the destination machine.
 
 Bounded spatial input and incremental native-layer output are complete. The
 default 512 MiB promoted-observation budget reduced depth-averaged vector peak

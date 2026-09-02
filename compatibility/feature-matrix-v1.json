@@ -15,7 +15,8 @@
     "python_api": {
       "stability": "pre-1.0",
       "minimum_python": "3.9",
-      "abi": "abi3-py39"
+      "abi": "abi3-py39",
+      "coefficient_schema": 1
     },
     "netcdf": {
       "scalar_schema_version": 16,
@@ -273,7 +274,22 @@
       ],
       "limitations": [
         "The Python interface is UTide-inspired rather than a strict drop-in replacement",
-        "Native fit objects are not yet serializable and arbitrary Python UTide coefficient dictionaries cannot be reconstructed"
+        "Arbitrary Python UTide coefficient dictionaries cannot be reconstructed"
+      ]
+    },
+    {
+      "id": "python-coefficient-persistence",
+      "title": "Versioned pickle-free single and batch coefficient persistence",
+      "support": "supported",
+      "scopes": ["python-api", "output"],
+      "parity": "rust-extension",
+      "evidence": [
+        "PYTHON_API.md",
+        "python/tests/test_api.py",
+        "crates/rutide-python/src/persistence.rs"
+      ],
+      "limitations": [
+        "Schema-1 archives are supported within the matching RUTide major/minor release line"
       ]
     }
   ]

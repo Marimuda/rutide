@@ -43,11 +43,12 @@
         "python_api": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["stability", "minimum_python", "abi"],
+          "required": ["stability", "minimum_python", "abi", "coefficient_schema"],
           "properties": {
             "stability": { "enum": ["pre-1.0"] },
             "minimum_python": { "type": "string" },
-            "abi": { "type": "string" }
+            "abi": { "type": "string" },
+            "coefficient_schema": { "type": "integer", "minimum": 1 }
           }
         },
         "netcdf": {

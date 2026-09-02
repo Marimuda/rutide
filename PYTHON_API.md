@@ -190,14 +190,40 @@ Robust fits expose the retained-row weights as `coef.weights` and under
 `coef.robust.weights`. OLS fits return `coef.weights is None` rather than
 allocating an all-ones array proportional to the input length.
 
+## Saving fitted coefficients
+
+Both single and batched fits can be saved and restored without repeating the
+analysis:
+
+```python
+import rutide
+
+coef.save("analysis.rutide.npz")
+restored = rutide.load("analysis.rutide.npz", workers=8)  # workers: batches only
+tide = rutide.reconstruct_many(target_time, restored)
+```
+
+`rutide.save(coef, path)` is the equivalent function form. It writes atomically
+and uses compressed NPZ by default; pass `compressed=False` when write speed is
+more important than storage. The archive is pickle-free and stores schema-1
+JSON metadata plus typed NumPy arrays. It contains the normalized retained
+timestamps, fitted solution, uncertainty and robust diagnostics, constituent
+selection, inference graph, and every option needed to rebuild the immutable
+native reconstruction model. Original observation values are deliberately not
+stored.
+
+RUTide `0.2.x` loads schema-1 archives written by another `0.2.x` release and
+rejects incompatible release lines or unknown schemas rather than guessing.
+Loading a batch recreates its dedicated native worker pool; `workers=` may
+override the saved worker count for the current machine. A loaded object has the
+same read-only arrays and reconstruction behavior as the original object.
+
 By default `reconstruct` uses `min_SNR=2.0` and `min_PE=0.0`, like UTide.
 SNR filtering requires a fit with confidence intervals. Set `min_SNR=None` for
 PE-only filtering or to reconstruct a fit made with `conf_int="none"`. An
 explicit `constit=[...]` selection takes precedence over diagnostic thresholds.
 
-Version `0.2` accepts only coefficients created by the same RUTide process; it
-does not import arbitrary Python UTide coefficient dictionaries and does not yet
-serialize native fit objects. `solve_many` covers in-memory station and model
-matrices. The CLI remains the appropriate interface when FVCOM NetCDF input and
-incremental output must stay bounded rather than materializing the complete
-array in Python.
+Version `0.2` does not import arbitrary Python UTide coefficient dictionaries.
+`solve_many` covers in-memory station and model matrices. The CLI remains the
+appropriate interface when FVCOM NetCDF input and incremental output must stay
+bounded rather than materializing the complete array in Python.

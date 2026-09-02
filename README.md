@@ -193,7 +193,9 @@ validated by the CLI.
 The batch endpoint shares astronomy, grouped missing masks, irregular spectral
 plans, and a dedicated worker pool inside Rust. Coefficients use stable
 `(series, constituent)` shapes with per-series presentation rankings and optional
-xarray conversion; a working-memory limit bounds native solve chunks.
+xarray conversion; a working-memory limit bounds native solve chunks. Single and
+batch coefficient objects can be atomically saved to a versioned, pickle-free
+NPZ archive and restored without refitting or storing source observations.
 
 See the [Python API guide](PYTHON_API.md) for installation, examples, time
 epochs, supported options, intentional compatibility differences, and the

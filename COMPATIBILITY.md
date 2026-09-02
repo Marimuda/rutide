@@ -77,6 +77,13 @@ limitations are defined in [`PYTHON_API.md`](PYTHON_API.md). The batch endpoint
 uses stable `(series, constituent)` result axes and separate per-series
 presentation maps; missing masks never reorder the constituent dimension.
 
+The pickle-free Python coefficient archive is independently versioned as schema
+1. RUTide accepts it only within the matching workspace major/minor release
+line, while patch releases preserve the schema and reconstruction behavior.
+Archives store fitted native state and the retained timestamp/model recipe, but
+not the source observations. Arbitrary Python UTide coefficient dictionaries
+remain outside this contract.
+
 Within the pre-1.0 series, Python breaking changes require a workspace minor
 version and changelog migration note. Patch releases preserve documented
 endpoint names and semantics. The native fit retained by a `Coefficient` is the

@@ -1,5 +1,7 @@
 //! Time-major multi-series Python bindings.
 
+mod persistence;
+
 use std::sync::Arc;
 
 use numpy::{
@@ -41,6 +43,8 @@ pub(super) struct BatchFit {
 struct BatchFitState {
     model: PreparedBatchModel,
     solutions: BatchSolutions,
+    time_mjd: Vec<f64>,
+    config: SolveConfig,
     names: Vec<String>,
     frequencies: Vec<Vec<f64>>,
     presentation_order: Vec<Vec<usize>>,
@@ -73,6 +77,10 @@ impl BatchFit {
 
     fn summary<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         self.inner.summary(py)
+    }
+
+    fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        persistence::batch_snapshot(&self.inner, py)
     }
 }
 
@@ -213,6 +221,17 @@ pub(super) fn reconstruct_many<'py>(
             Some(array2(time_count, series_count, northward)?.into_pyarray(py)),
         )),
     }
+}
+
+/// Restore a versioned native batch snapshot without repeating the fit.
+#[allow(clippy::needless_pass_by_value)]
+#[pyfunction]
+pub(super) fn restore_batch(
+    py: Python<'_>,
+    snapshot: &Bound<'_, PyDict>,
+    workers: Option<usize>,
+) -> PyResult<Py<BatchFit>> {
+    persistence::restore_batch(py, snapshot, workers)
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -428,11 +447,21 @@ fn solve_many_native(
         .collect::<Result<Vec<_>, _>>()?;
     let valid_positions =
         valid_observation_positions(&eastward, northward.as_deref(), time.len(), series_count);
+    let mut stored_config = config.clone();
+    stored_config.constituent_names = Some(
+        constituents
+            .iter()
+            .map(|constituent| constituent.name().to_owned())
+            .collect(),
+    );
 
+    let retained_time_count = time.len();
     Ok(BatchFit {
         inner: Arc::new(BatchFitState {
             model,
             solutions,
+            time_mjd: time,
+            config: stored_config,
             names,
             frequencies,
             presentation_order,
@@ -440,7 +469,7 @@ fn solve_many_native(
             valid_positions,
             source_time_positions,
             original_time_count,
-            retained_time_count: time.len(),
+            retained_time_count,
             method: config.method_name.to_ascii_lowercase(),
             confidence: normalized_confidence_name(confidence).to_owned(),
             phase_reference: phase_reference.name().to_owned(),

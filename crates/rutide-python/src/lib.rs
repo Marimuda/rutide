@@ -1,6 +1,7 @@
 //! Native implementation behind `RUTide`'s `UTide`-inspired Python API.
 
 mod batch;
+mod persistence;
 
 use std::{collections::HashSet, ops::Deref, sync::Arc};
 
@@ -45,6 +46,8 @@ struct Fit {
 struct FitState {
     model: PreparedModel,
     solution: FittedSolution,
+    time_mjd: Vec<f64>,
+    config: SolveConfig,
     names: Vec<String>,
     frequencies: Vec<f64>,
     presentation_order: Vec<usize>,
@@ -107,6 +110,10 @@ impl Fit {
         }
         output.set_item("aux", auxiliary)?;
         Ok(output)
+    }
+
+    fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        persistence::fit_snapshot(self, py)
     }
 }
 
@@ -223,6 +230,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(reconstruct, module)?)?;
     module.add_function(wrap_pyfunction!(batch::solve_many, module)?)?;
     module.add_function(wrap_pyfunction!(batch::reconstruct_many, module)?)?;
+    module.add_function(wrap_pyfunction!(batch::restore_batch, module)?)?;
+    module.add_function(wrap_pyfunction!(persistence::restore_fit, module)?)?;
     Ok(())
 }
 
@@ -386,10 +395,19 @@ fn solve_native(
         &frequencies,
         &solution,
     )?;
+    let mut stored_config = config.clone();
+    stored_config.constituent_names = Some(
+        constituents
+            .iter()
+            .map(|constituent| constituent.name().to_owned())
+            .collect(),
+    );
     Ok(Fit {
         inner: Arc::new(FitState {
             model,
             solution,
+            time_mjd: time,
+            config: stored_config,
             names,
             frequencies,
             presentation_order,

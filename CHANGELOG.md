@@ -20,6 +20,9 @@ published API and file-schema contracts.
 - Time-major `solve_many` / `reconstruct_many` Python bindings with varying
   latitudes, joint vector masks, deterministic worker pools, bounded native
   chunks, stable coefficient axes, per-series rankings, and xarray conversion.
+- Atomic, pickle-free schema-1 coefficient persistence for single and batch
+  fits, including uncertainty, robust diagnostics, inference, and reusable
+  native reconstruction state without source observations.
 - Irregular colored-confidence estimation through Lomb–Scargle residual spectra.
 - Bounded and incremental FVCOM scalar, depth-averaged, sigma-layer, and
   fixed-physical-depth application workflows.
