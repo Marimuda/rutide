@@ -51,6 +51,19 @@ pub enum LinearConfidence {
     Colored,
 }
 
+/// Options controlling the non-harmonic terms in a fitted model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FitOptions {
+    /// Fit a linear trend in addition to the always-present mean.
+    pub trend: bool,
+}
+
+impl Default for FitOptions {
+    fn default() -> Self {
+        Self { trend: true }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ConfidenceSpec<'noise> {
     None,
@@ -147,8 +160,8 @@ impl ScalarSolution {
 ///
 /// Preparation constructs and factorizes one real harmonic design matrix. The
 /// factorization is then reused for every spatial series sharing the timestamps.
-/// The model always includes a mean and linear trend to match the initial Python
-/// `UTide` parity profile.
+/// The model always includes a mean. A linear trend is enabled by default to
+/// preserve the initial Python `UTide` parity profile.
 #[derive(Debug)]
 pub struct FixedRawOls {
     constituents: Vec<Constituent>,
@@ -162,6 +175,7 @@ pub struct FixedRawOls {
     spectrum_observation_positions: Option<Vec<usize>>,
     irregular_spectrum: Option<IrregularSpectrumSampling>,
     reference_time_days: f64,
+    fit_options: FitOptions,
     design: Mat<f64>,
     decomposition: ColPivQr<f64>,
 }
@@ -174,10 +188,25 @@ impl FixedRawOls {
     /// Returns [`AnalysisError`] for empty, non-finite, non-increasing, duplicate,
     /// or underdetermined inputs.
     pub fn prepare(time_days: &[f64], constituents: &[Constituent]) -> Result<Self, AnalysisError> {
+        Self::prepare_with_options(time_days, constituents, FitOptions::default())
+    }
+
+    /// Validate inputs and prepare a model with explicit non-harmonic terms.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for empty, non-finite, non-increasing, duplicate,
+    /// or underdetermined inputs.
+    pub fn prepare_with_options(
+        time_days: &[f64],
+        constituents: &[Constituent],
+        fit_options: FitOptions,
+    ) -> Result<Self, AnalysisError> {
         validate_constituents(constituents)?;
-        let (reference_time_days, time_span_days) = validate_time(time_days, constituents.len())?;
+        let (reference_time_days, time_span_days) =
+            validate_time_with_options(time_days, constituents.len(), fit_options)?;
         let harmonic_columns = constituents.len() * 2;
-        let column_count = harmonic_columns + 2;
+        let column_count = harmonic_columns + 1 + usize::from(fit_options.trend);
 
         let design = Mat::from_fn(time_days.len(), column_count, |row, column| {
             match column.cmp(&harmonic_columns) {
@@ -204,6 +233,7 @@ impl FixedRawOls {
             time_span_days,
             reference_time_days,
             ConfidenceSampling::complete(time_days, time_span_days),
+            fit_options,
             design,
         ))
     }
@@ -214,6 +244,7 @@ impl FixedRawOls {
         time_span_days: f64,
         reference_time_days: f64,
         confidence_sampling: ConfidenceSampling,
+        fit_options: FitOptions,
         design: Mat<f64>,
     ) -> Self {
         let confidence_constituents = constituents.clone();
@@ -225,6 +256,7 @@ impl FixedRawOls {
             time_span_days,
             reference_time_days,
             confidence_sampling,
+            fit_options,
             design,
         )
     }
@@ -241,6 +273,7 @@ impl FixedRawOls {
         time_span_days: f64,
         reference_time_days: f64,
         confidence_sampling: ConfidenceSampling,
+        fit_options: FitOptions,
         design: Mat<f64>,
     ) -> Self {
         let decomposition = design.col_piv_qr();
@@ -256,6 +289,7 @@ impl FixedRawOls {
             spectrum_observation_positions: confidence_sampling.observation_positions,
             irregular_spectrum: confidence_sampling.irregular_spectrum,
             reference_time_days,
+            fit_options,
             design,
             decomposition,
         }
@@ -271,6 +305,12 @@ impl FixedRawOls {
     #[must_use]
     pub const fn time_count(&self) -> usize {
         self.time_count
+    }
+
+    /// Return the configured non-harmonic fit terms.
+    #[must_use]
+    pub const fn fit_options(&self) -> FitOptions {
+        self.fit_options
     }
 
     /// Fit one complete, finite scalar observation series.
@@ -756,7 +796,11 @@ impl FixedRawOls {
             cosine_coefficient_variance: None,
             sine_coefficient_variance: None,
             mean: coefficients[(harmonic_columns, component)],
-            slope_per_day: coefficients[(harmonic_columns + 1, component)] / self.time_span_days,
+            slope_per_day: if self.fit_options.trend {
+                coefficients[(harmonic_columns + 1, component)] / self.time_span_days
+            } else {
+                0.0
+            },
             reference_time_days: self.reference_time_days,
             robust,
         }
@@ -870,8 +914,11 @@ impl FixedRawOls {
             cosine_coefficient_variance,
             sine_coefficient_variance,
             mean: fit.coefficients[(harmonic_columns, component)],
-            slope_per_day: fit.coefficients[(harmonic_columns + 1, component)]
-                / self.time_span_days,
+            slope_per_day: if self.fit_options.trend {
+                fit.coefficients[(harmonic_columns + 1, component)] / self.time_span_days
+            } else {
+                0.0
+            },
             reference_time_days: self.reference_time_days,
             robust: Some(fit.diagnostics.clone()),
         }
@@ -1182,7 +1229,7 @@ impl FixedRawOls {
     ) -> Vec<f64> {
         let constituent_count = self.constituents.len();
         let reference_count = constituent_count - non_reference_count;
-        let column_count = constituent_count * 2 + 2;
+        let column_count = self.design.ncols();
         let basis = Mat::from_fn(self.time_count, column_count, |time, column| {
             if column < non_reference_count {
                 c64::new(
@@ -2410,6 +2457,14 @@ pub(crate) fn validate_time(
     time_days: &[f64],
     constituent_count: usize,
 ) -> Result<(f64, f64), AnalysisError> {
+    validate_time_with_options(time_days, constituent_count, FitOptions::default())
+}
+
+pub(crate) fn validate_time_with_options(
+    time_days: &[f64],
+    constituent_count: usize,
+    fit_options: FitOptions,
+) -> Result<(f64, f64), AnalysisError> {
     if time_days.is_empty() {
         return Err(AnalysisError::EmptyTime);
     }
@@ -2421,7 +2476,8 @@ pub(crate) fn validate_time(
             return Err(AnalysisError::NonIncreasingTime { index });
         }
     }
-    let required = constituent_count * 2 + 3;
+    let parameter_count = constituent_count * 2 + 1 + usize::from(fit_options.trend);
+    let required = parameter_count + 1;
     if time_days.len() < required {
         return Err(AnalysisError::InsufficientObservations {
             actual: time_days.len(),
@@ -2437,9 +2493,10 @@ pub(crate) fn validate_time(
 #[cfg(test)]
 mod tests {
     use super::{
-        Constituent, FixedRawOls, IrregularSpectrumSampling, LinearConfidence, LombScarglePlan,
-        band_averaged_fft_vector_residual_power, band_averaged_lomb_residual_power,
-        band_averaged_lomb_vector_residual_power, lomb_frequencies, usize_to_f64,
+        Constituent, FitOptions, FixedRawOls, IrregularSpectrumSampling, LinearConfidence,
+        LombScarglePlan, band_averaged_fft_vector_residual_power,
+        band_averaged_lomb_residual_power, band_averaged_lomb_vector_residual_power,
+        lomb_frequencies, usize_to_f64,
     };
     use crate::AnalysisError;
     use std::f64::consts::TAU;
@@ -2450,6 +2507,31 @@ mod tests {
             Constituent::new("S2", 1.0 / 12.0),
             Constituent::new("K1", 0.041_780_746_221_637_22),
         ]
+    }
+
+    #[test]
+    fn trend_disabled_model_uses_one_fewer_column_and_reports_zero_slope() {
+        let times = [0.0, 0.2, 0.55, 1.0];
+        let constituent = Constituent::new("test", 1.0 / 24.0);
+        let observations = times
+            .iter()
+            .map(|time| {
+                let angle = TAU * time;
+                0.4 + 1.2 * angle.cos() - 0.3 * angle.sin()
+            })
+            .collect::<Vec<_>>();
+        assert!(FixedRawOls::prepare(&times, std::slice::from_ref(&constituent)).is_err());
+
+        let model =
+            FixedRawOls::prepare_with_options(&times, &[constituent], FitOptions { trend: false })
+                .expect("four samples overdetermine cosine, sine, and mean");
+        let solution = model.solve(&observations).expect("valid observations");
+        assert_eq!(model.fit_options(), FitOptions { trend: false });
+        // The returned raw coefficients are defined at the record midpoint.
+        assert_close(solution.cosine_coefficient[0], -1.2, 1e-12);
+        assert_close(solution.sine_coefficient[0], 0.3, 1e-12);
+        assert_close(solution.mean, 0.4, 1e-12);
+        assert_close(solution.slope_per_day, 0.0, f64::EPSILON);
     }
 
     fn times() -> Vec<f64> {

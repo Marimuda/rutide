@@ -2,10 +2,10 @@
 
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
-    AnalysisError, GreenwichNodalOls, InferenceMode, LinearConfidence, MonteCarloOptions,
-    ReconstructionFilter, RobustOptions, ScalarInferenceBatch, ScalarInferenceOls,
-    ScalarInferenceRelation, TidalConstituent, VectorInferenceBatch, VectorInferenceOls,
-    VectorInferenceRelation,
+    AnalysisError, FitOptions, GreenwichNodalOls, InferenceMode, LinearConfidence,
+    MonteCarloOptions, ReconstructionFilter, RobustOptions, ScalarInferenceBatch,
+    ScalarInferenceOls, ScalarInferenceRelation, TidalConstituent, VectorInferenceBatch,
+    VectorInferenceOls, VectorInferenceRelation,
 };
 
 const LATITUDE: f64 = 60.957_717_895_507_81;
@@ -690,7 +690,7 @@ fn vector_monte_carlo_propagates_shared_rotary_reference_draws() {
     clippy::too_many_lines,
     reason = "covers scalar/vector irregular masks, worker invariance, and robust batch dispatch together"
 )]
-fn irregular_gappy_inference_monte_carlo_batches_are_reproducible() {
+fn irregular_gappy_trend_disabled_inference_monte_carlo_batches_are_reproducible() {
     faer::set_global_parallelism(faer::Par::Seq);
     let mut time = oracle_times(745);
     let final_index = time.len() - 1;
@@ -731,20 +731,25 @@ fn irregular_gappy_inference_monte_carlo_batches_are_reproducible() {
         eastward[(101 + series * 13) * series_count + series] = f64::NAN;
         northward[(379 + series * 9) * series_count + series] = f64::NAN;
     }
-    let scalar_batch = ScalarInferenceBatch::prepare_modified_julian_days(
+    let fit_options = FitOptions { trend: false };
+    let scalar_batch = ScalarInferenceBatch::prepare_modified_julian_days_with_options(
         &time,
         &requested(),
         &RELATIONSHIPS,
         InferenceMode::Exact,
+        fit_options,
     )
     .expect("valid scalar inference batch");
-    let vector_batch = VectorInferenceBatch::prepare_modified_julian_days(
+    let vector_batch = VectorInferenceBatch::prepare_modified_julian_days_with_options(
         &time,
         &requested(),
         &VECTOR_RELATIONSHIPS,
         InferenceMode::Exact,
+        fit_options,
     )
     .expect("valid vector inference batch");
+    assert_eq!(scalar_batch.fit_options(), fit_options);
+    assert_eq!(vector_batch.fit_options(), fit_options);
     let options = MonteCarloOptions {
         realizations: 97,
         seed: 20_260_904,
@@ -778,6 +783,16 @@ fn irregular_gappy_inference_monte_carlo_batches_are_reproducible() {
     let sequential = solve(1);
     let parallel = solve(4);
     assert_eq!(sequential, parallel);
+    assert!(
+        sequential
+            .0
+            .iter()
+            .all(|solution| solution.slope_per_day.to_bits() == 0.0_f64.to_bits())
+    );
+    assert!(sequential.1.iter().all(|solution| {
+        solution.eastward_slope_per_day.to_bits() == 0.0_f64.to_bits()
+            && solution.northward_slope_per_day.to_bits() == 0.0_f64.to_bits()
+    }));
     assert_ne!(
         sequential.0[0].amplitude_ci, sequential.0[1].amplitude_ci,
         "series must receive distinct derived random streams"
@@ -812,6 +827,15 @@ fn irregular_gappy_inference_monte_carlo_batches_are_reproducible() {
             .iter()
             .all(|solution| solution.robust.is_some())
     );
+    assert!(
+        robust_scalar
+            .iter()
+            .all(|solution| solution.slope_per_day.to_bits() == 0.0_f64.to_bits())
+    );
+    assert!(robust_vector.iter().all(|solution| {
+        solution.eastward_slope_per_day.to_bits() == 0.0_f64.to_bits()
+            && solution.northward_slope_per_day.to_bits() == 0.0_f64.to_bits()
+    }));
 }
 
 #[test]
@@ -953,6 +977,199 @@ fn matches_resolved_exact_colored_confidence_oracle() {
             assert_close(&format!("{field}[{index}]"), *actual, *expected, tolerance);
         }
     }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "freezes scalar and rotary-vector inference for Python trend=False"
+)]
+fn matches_python_utide_inference_with_trend_disabled() {
+    let time = oracle_times(745);
+    let observations = oracle_observations(745);
+    let fit_options = FitOptions { trend: false };
+    let scalar_model = ScalarInferenceOls::prepare_modified_julian_days_with_options(
+        &time,
+        LATITUDE,
+        &requested(),
+        &RELATIONSHIPS,
+        InferenceMode::Exact,
+        fit_options,
+    )
+    .expect("valid trend-disabled scalar inference model");
+    let scalar = scalar_model
+        .solve_with_linear_confidence(&observations, LinearConfidence::Colored)
+        .expect("valid trend-disabled inferred scalar solution");
+    assert_eq!(scalar_model.fit_options(), fit_options);
+    for (field, actual, expected, tolerance) in [
+        (
+            "amplitude",
+            &scalar.amplitude,
+            &[
+                0.005_364_921_502_067_653,
+                0.615_213_497_191_656_6,
+                0.099_986_944_929_154_57,
+                0.215_324_724_017_079_83,
+                0.049_993_472_464_577_283,
+            ],
+            5e-10,
+        ),
+        (
+            "phase",
+            &scalar.phase_degrees,
+            &[
+                64.730_174_848_578_77,
+                192.763_649_962_347_59,
+                141.344_139_143_178_38,
+                172.763_649_962_347_59,
+                96.344_139_143_178_38,
+            ],
+            5e-7,
+        ),
+        (
+            "amplitude CI",
+            scalar.amplitude_ci.as_ref().expect("amplitude CI"),
+            &[
+                0.000_158_384_269_193_132_32,
+                0.052_306_183_492_147_18,
+                0.016_050_196_369_348_72,
+                0.012_944_964_861_062_482,
+                0.005_674_556_037_602_392,
+            ],
+            5e-8,
+        ),
+        (
+            "phase CI",
+            scalar.phase_ci_degrees.as_ref().expect("phase CI"),
+            &[
+                1.691_216_902_897_597_4,
+                4.870_856_360_473_176,
+                9.197_138_964_587_024,
+                1.205_489_893_390_832_5,
+                3.251_705_628_124_404,
+            ],
+            5e-6,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(
+                &format!("no-trend inferred scalar {field}[{index}]"),
+                *actual,
+                *expected,
+                tolerance,
+            );
+        }
+    }
+    assert_close(
+        "no-trend inferred scalar mean",
+        scalar.mean,
+        0.091_108_518_233_299_45,
+        5e-10,
+    );
+    assert_close(
+        "no-trend inferred scalar slope",
+        scalar.slope_per_day,
+        0.0,
+        f64::EPSILON,
+    );
+
+    let (eastward, northward) = synthetic_vector_observations(&time);
+    let vector_model = VectorInferenceOls::prepare_modified_julian_days_with_options(
+        &time,
+        LATITUDE,
+        &requested(),
+        &VECTOR_RELATIONSHIPS,
+        InferenceMode::Exact,
+        fit_options,
+    )
+    .expect("valid trend-disabled vector inference model");
+    let vector = vector_model
+        .solve_vector_with_linear_confidence(&eastward, &northward, LinearConfidence::Colored)
+        .expect("valid trend-disabled inferred vector solution");
+    assert_eq!(vector_model.fit_options(), fit_options);
+    for (field, actual, expected, tolerance) in [
+        (
+            "semi-major",
+            &vector.semi_major,
+            &[
+                0.001_294_202_248_565_717,
+                0.001_930_193_703_780_505_8,
+                0.011_509_594_522_023_988,
+                0.000_597_849_819_522_564_2,
+                0.005_183_940_379_616_224,
+            ],
+            5e-10,
+        ),
+        (
+            "semi-minor",
+            &vector.semi_minor,
+            &[
+                0.000_194_752_769_899_466_3,
+                0.000_375_834_167_768_249_1,
+                0.000_092_456_894_108_540_99,
+                0.000_209_259_935_519_499_94,
+                0.000_617_085_328_450_042_6,
+            ],
+            5e-10,
+        ),
+        (
+            "semi-major CI",
+            vector.semi_major_ci.as_ref().expect("major CI"),
+            &[
+                0.027_136_145_362_273_455,
+                0.025_593_115_614_905_22,
+                0.015_258_408_962_170_858,
+                0.005_957_444_066_705_783,
+                0.009_489_063_409_879_714,
+            ],
+            5e-7,
+        ),
+        (
+            "semi-minor CI",
+            vector.semi_minor_ci.as_ref().expect("minor CI"),
+            &[
+                0.009_347_825_716_291_443,
+                0.010_599_870_336_009_799,
+                0.025_406_663_954_917_884,
+                0.005_957_444_066_705_782_5,
+                0.009_489_063_409_879_714,
+            ],
+            5e-7,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(
+                &format!("no-trend inferred vector {field}[{index}]"),
+                *actual,
+                *expected,
+                tolerance,
+            );
+        }
+    }
+    assert_close(
+        "no-trend inferred eastward mean",
+        vector.eastward_mean,
+        0.163_559_643_029_948_27,
+        5e-10,
+    );
+    assert_close(
+        "no-trend inferred northward mean",
+        vector.northward_mean,
+        -0.076_932_838_516_875_59,
+        5e-10,
+    );
+    assert_close(
+        "no-trend inferred eastward slope",
+        vector.eastward_slope_per_day,
+        0.0,
+        f64::EPSILON,
+    );
+    assert_close(
+        "no-trend inferred northward slope",
+        vector.northward_slope_per_day,
+        0.0,
+        f64::EPSILON,
+    );
 }
 
 #[test]

@@ -13,7 +13,7 @@ use faer::{
 use rayon::prelude::*;
 
 use crate::{
-    AnalysisError, Constituent, FixedRawOls, LinearConfidence, MonteCarloOptions,
+    AnalysisError, Constituent, FitOptions, FixedRawOls, LinearConfidence, MonteCarloOptions,
     RobustDiagnostics, RobustOptions, ScalarSolution, TidalConstituent, VectorReconstruction,
     VectorSolution,
     astronomy::at_modified_julian_day,
@@ -21,7 +21,8 @@ use crate::{
     monte_carlo::{scalar_transformed_intervals, vector_transformed_intervals},
     robust::fit_complex_with_initial as robust_complex_fit_with_initial,
     scalar::{
-        ConfidenceSampling, constituent_stream, equidistant_sample_interval_hours, validate_time,
+        ConfidenceSampling, constituent_stream, equidistant_sample_interval_hours,
+        validate_time_with_options,
     },
     vector::{from_component_solutions, linearized_ellipse_sigmas},
 };
@@ -325,6 +326,7 @@ pub struct VectorInferenceOls {
     reference_time_modified_julian_day: f64,
     time_span_days: f64,
     time_count: usize,
+    fit_options: FitOptions,
     base_constituents: Vec<TidalConstituent>,
     recipes: Vec<CorrectionRecipe>,
     confidence_sampling: ConfidenceSampling,
@@ -386,8 +388,28 @@ impl GreenwichNodalOls {
         latitude_degrees_north: f64,
         constituents: &[TidalConstituent],
     ) -> Result<Self, AnalysisError> {
+        Self::prepare_modified_julian_days_with_options(
+            modified_julian_days,
+            latitude_degrees_north,
+            constituents,
+            FitOptions::default(),
+        )
+    }
+
+    /// Build and factorize an exact corrected basis with explicit fit options.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] when timestamps, latitude, constituents, or
+    /// the requested model are invalid.
+    pub fn prepare_modified_julian_days_with_options(
+        modified_julian_days: &[f64],
+        latitude_degrees_north: f64,
+        constituents: &[TidalConstituent],
+        fit_options: FitOptions,
+    ) -> Result<Self, AnalysisError> {
         validate_latitude(latitude_degrees_north)?;
-        let basis = CorrectionBasis::prepare(modified_julian_days, constituents)?;
+        let basis = CorrectionBasis::prepare(modified_julian_days, constituents, fit_options)?;
         let model = basis.model_at_latitude(latitude_degrees_north)?;
 
         Ok(Self {
@@ -428,6 +450,12 @@ impl GreenwichNodalOls {
     #[must_use]
     pub const fn time_count(&self) -> usize {
         self.model.time_count()
+    }
+
+    /// Return the configured non-harmonic fit terms.
+    #[must_use]
+    pub const fn fit_options(&self) -> FitOptions {
+        self.model.fit_options()
     }
 
     /// Fit one complete, finite scalar observation series.
@@ -816,12 +844,37 @@ impl ScalarInferenceOls {
         relationships: &[ScalarInferenceRelation],
         mode: InferenceMode,
     ) -> Result<Self, AnalysisError> {
+        Self::prepare_modified_julian_days_with_options(
+            modified_julian_days,
+            latitude_degrees_north,
+            constituents,
+            relationships,
+            mode,
+            FitOptions::default(),
+        )
+    }
+
+    /// Build a scalar inferred-constituent model with explicit fit options.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AnalysisError` for invalid input, inference relationships, or
+    /// an underdetermined requested model.
+    pub fn prepare_modified_julian_days_with_options(
+        modified_julian_days: &[f64],
+        latitude_degrees_north: f64,
+        constituents: &[TidalConstituent],
+        relationships: &[ScalarInferenceRelation],
+        mode: InferenceMode,
+        fit_options: FitOptions,
+    ) -> Result<Self, AnalysisError> {
         validate_latitude(latitude_degrees_north)?;
         let layout = scalar_inference_layout(constituents, relationships)?;
         let basis = CorrectionBasis::prepare_with_model_count(
             modified_julian_days,
             &layout.tidal_constituents,
             layout.fit_count,
+            fit_options,
         )?;
         let record = basis.record_subset((0..basis.time_terms.len()).collect(), true)?;
         Self::from_basis_record(
@@ -902,6 +955,12 @@ impl ScalarInferenceOls {
     #[must_use]
     pub const fn time_count(&self) -> usize {
         self.model.time_count()
+    }
+
+    /// Return the configured non-harmonic fit terms.
+    #[must_use]
+    pub const fn fit_options(&self) -> FitOptions {
+        self.model.fit_options()
     }
 
     /// Fit one finite scalar series and expand inferred coefficients.
@@ -1323,12 +1382,37 @@ impl VectorInferenceOls {
         relationships: &[VectorInferenceRelation],
         mode: InferenceMode,
     ) -> Result<Self, AnalysisError> {
+        Self::prepare_modified_julian_days_with_options(
+            modified_julian_days,
+            latitude_degrees_north,
+            constituents,
+            relationships,
+            mode,
+            FitOptions::default(),
+        )
+    }
+
+    /// Build a coupled vector inference model with explicit fit options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid inputs, inference relationships, or an
+    /// underdetermined requested model.
+    pub fn prepare_modified_julian_days_with_options(
+        modified_julian_days: &[f64],
+        latitude_degrees_north: f64,
+        constituents: &[TidalConstituent],
+        relationships: &[VectorInferenceRelation],
+        mode: InferenceMode,
+        fit_options: FitOptions,
+    ) -> Result<Self, AnalysisError> {
         validate_latitude(latitude_degrees_north)?;
         let layout = vector_inference_layout(constituents, relationships)?;
         let basis = CorrectionBasis::prepare_with_model_count(
             modified_julian_days,
             &layout.tidal_constituents,
             layout.fit_count,
+            fit_options,
         )?;
         let record = basis.record_subset((0..basis.time_terms.len()).collect(), true)?;
         Self::from_basis_record(
@@ -1367,6 +1451,7 @@ impl VectorInferenceOls {
             reference_time_modified_julian_day: record.reference_time,
             time_span_days: record.time_span_days,
             time_count: record.positions.len(),
+            fit_options: basis.fit_options,
             base_constituents: basis.base_constituents.clone(),
             recipes: basis.recipes.clone(),
             confidence_sampling: record.confidence_sampling.clone(),
@@ -1415,6 +1500,12 @@ impl VectorInferenceOls {
     #[must_use]
     pub const fn time_count(&self) -> usize {
         self.time_count
+    }
+
+    /// Return the configured non-harmonic fit terms.
+    #[must_use]
+    pub const fn fit_options(&self) -> FitOptions {
+        self.fit_options
     }
 
     /// Fit one eastward/northward current series.
@@ -1740,14 +1831,18 @@ impl VectorInferenceOls {
             ),
             BatchConfidence::MonteCarlo { .. } => None,
         });
-        let trailing = self.design.ncols() - 2;
-        let mean = coefficients[(trailing, 0)];
-        let slope = coefficients[(trailing + 1, 0)];
+        let harmonic_columns = fit_count * 2;
+        let mean = coefficients[(harmonic_columns, 0)];
+        let slope = if self.fit_options.trend {
+            coefficients[(harmonic_columns + 1, 0)] / self.time_span_days
+        } else {
+            c64::new(0.0, 0.0)
+        };
         let eastward = vector_inference_component_solution(
             eastward_cosine.clone(),
             eastward_sine.clone(),
             mean.re,
-            slope.re / self.time_span_days,
+            slope.re,
             self.reference_time_modified_julian_day,
             intervals.as_ref().map(|intervals| {
                 (
@@ -1760,7 +1855,7 @@ impl VectorInferenceOls {
             northward_cosine.clone(),
             northward_sine.clone(),
             mean.im,
-            slope.im / self.time_span_days,
+            slope.im,
             self.reference_time_modified_julian_day,
             intervals.as_ref().map(|intervals| {
                 (
@@ -1859,7 +1954,11 @@ impl VectorInferenceOls {
         weights: Option<&[f64]>,
     ) -> VectorInferenceIntervals {
         let basis = self.vector_inference_covariance_basis(observations, coefficients, weights);
-        let fit_count = (self.design.ncols() - 2) / 2;
+        let fit_count = self
+            .output_mappings
+            .iter()
+            .filter(|mapping| !mapping.inferred)
+            .count();
         let mut base_variances = Vec::with_capacity(fit_count);
         for constituent in 0..fit_count {
             let negative = constituent + fit_count;
@@ -2008,7 +2107,11 @@ impl VectorInferenceOls {
         weights: Option<&[f64]>,
     ) -> Vec<[[f64; 4]; 4]> {
         let basis = self.vector_inference_covariance_basis(observations, coefficients, weights);
-        let fit_count = (self.design.ncols() - 2) / 2;
+        let fit_count = self
+            .output_mappings
+            .iter()
+            .filter(|mapping| !mapping.inferred)
+            .count();
         let reference_count = fit_count - self.non_reference_count;
         let mut covariances = Vec::with_capacity(fit_count);
         for constituent in 0..fit_count {
@@ -2555,11 +2658,34 @@ impl ScalarInferenceBatch {
         relationships: &[ScalarInferenceRelation],
         mode: InferenceMode,
     ) -> Result<Self, AnalysisError> {
+        Self::prepare_modified_julian_days_with_options(
+            modified_julian_days,
+            constituents,
+            relationships,
+            mode,
+            FitOptions::default(),
+        )
+    }
+
+    /// Prepare shared scalar-inference astronomy with explicit fit options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input, relationships, or an underdetermined
+    /// requested model.
+    pub fn prepare_modified_julian_days_with_options(
+        modified_julian_days: &[f64],
+        constituents: &[TidalConstituent],
+        relationships: &[ScalarInferenceRelation],
+        mode: InferenceMode,
+        fit_options: FitOptions,
+    ) -> Result<Self, AnalysisError> {
         let layout = scalar_inference_layout(constituents, relationships)?;
         let basis = CorrectionBasis::prepare_with_model_count(
             modified_julian_days,
             &layout.tidal_constituents,
             layout.fit_count,
+            fit_options,
         )?;
         Ok(Self {
             basis,
@@ -2573,6 +2699,12 @@ impl ScalarInferenceBatch {
     #[must_use]
     pub const fn time_count(&self) -> usize {
         self.basis.time_terms.len()
+    }
+
+    /// Return the configured non-harmonic fit terms.
+    #[must_use]
+    pub const fn fit_options(&self) -> FitOptions {
+        self.basis.fit_options
     }
 
     /// Return every reported constituent in coefficient order.
@@ -2983,11 +3115,34 @@ impl VectorInferenceBatch {
         relationships: &[VectorInferenceRelation],
         mode: InferenceMode,
     ) -> Result<Self, AnalysisError> {
+        Self::prepare_modified_julian_days_with_options(
+            modified_julian_days,
+            constituents,
+            relationships,
+            mode,
+            FitOptions::default(),
+        )
+    }
+
+    /// Prepare shared vector-inference astronomy with explicit fit options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input, relationships, or an underdetermined
+    /// requested model.
+    pub fn prepare_modified_julian_days_with_options(
+        modified_julian_days: &[f64],
+        constituents: &[TidalConstituent],
+        relationships: &[VectorInferenceRelation],
+        mode: InferenceMode,
+        fit_options: FitOptions,
+    ) -> Result<Self, AnalysisError> {
         let layout = vector_inference_layout(constituents, relationships)?;
         let basis = CorrectionBasis::prepare_with_model_count(
             modified_julian_days,
             &layout.tidal_constituents,
             layout.fit_count,
+            fit_options,
         )?;
         Ok(Self {
             basis,
@@ -3001,6 +3156,12 @@ impl VectorInferenceBatch {
     #[must_use]
     pub const fn time_count(&self) -> usize {
         self.basis.time_terms.len()
+    }
+
+    /// Return the configured non-harmonic fit terms.
+    #[must_use]
+    pub const fn fit_options(&self) -> FitOptions {
+        self.basis.fit_options
     }
 
     /// Return every reported constituent in coefficient order.
@@ -3448,8 +3609,25 @@ impl GreenwichNodalBatch {
         modified_julian_days: &[f64],
         constituents: &[TidalConstituent],
     ) -> Result<Self, AnalysisError> {
+        Self::prepare_modified_julian_days_with_options(
+            modified_julian_days,
+            constituents,
+            FitOptions::default(),
+        )
+    }
+
+    /// Prepare shared astronomical terms with explicit fit options.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] when inputs or the requested model are invalid.
+    pub fn prepare_modified_julian_days_with_options(
+        modified_julian_days: &[f64],
+        constituents: &[TidalConstituent],
+        fit_options: FitOptions,
+    ) -> Result<Self, AnalysisError> {
         Ok(Self {
-            basis: CorrectionBasis::prepare(modified_julian_days, constituents)?,
+            basis: CorrectionBasis::prepare(modified_julian_days, constituents, fit_options)?,
         })
     }
 
@@ -3457,6 +3635,12 @@ impl GreenwichNodalBatch {
     #[must_use]
     pub const fn time_count(&self) -> usize {
         self.basis.time_terms.len()
+    }
+
+    /// Return the configured non-harmonic fit terms.
+    #[must_use]
+    pub const fn fit_options(&self) -> FitOptions {
+        self.basis.fit_options
     }
 
     /// Return the prepared catalog constituents in coefficient order.
@@ -4121,6 +4305,7 @@ struct CorrectionBasis {
     time_terms: Vec<TimeTerms>,
     reference_time_modified_julian_day: f64,
     time_span_days: f64,
+    fit_options: FitOptions,
     sample_interval_hours: Option<f64>,
 }
 
@@ -4371,18 +4556,25 @@ impl CorrectionBasis {
     fn prepare(
         modified_julian_days: &[f64],
         constituents: &[TidalConstituent],
+        fit_options: FitOptions,
     ) -> Result<Self, AnalysisError> {
-        Self::prepare_with_model_count(modified_julian_days, constituents, constituents.len())
+        Self::prepare_with_model_count(
+            modified_julian_days,
+            constituents,
+            constituents.len(),
+            fit_options,
+        )
     }
 
     fn prepare_with_model_count(
         modified_julian_days: &[f64],
         constituents: &[TidalConstituent],
         model_constituent_count: usize,
+        fit_options: FitOptions,
     ) -> Result<Self, AnalysisError> {
         validate_tidal_constituents(constituents)?;
         let (reference_time, time_span_days) =
-            validate_time(modified_julian_days, model_constituent_count)?;
+            validate_time_with_options(modified_julian_days, model_constituent_count, fit_options)?;
         let (base_constituents, recipes) = dependency_recipes(constituents);
         let scalar_constituents = scalar_constituents_at_reference(
             constituents,
@@ -4426,6 +4618,7 @@ impl CorrectionBasis {
             time_terms,
             reference_time_modified_julian_day: reference_time,
             time_span_days,
+            fit_options,
             sample_interval_hours: equidistant_sample_interval_hours(modified_julian_days),
         })
     }
@@ -4445,7 +4638,8 @@ impl CorrectionBasis {
     ) -> Result<FixedRawOls, AnalysisError> {
         validate_latitude(latitude)?;
         let harmonic_columns = layout.fit_count * 2;
-        let mut design = Mat::zeros(record.positions.len(), harmonic_columns + 2);
+        let column_count = harmonic_columns + 1 + usize::from(self.fit_options.trend);
+        let mut design = Mat::zeros(record.positions.len(), column_count);
         let latitude_factors = latitude_factors(latitude);
         for (time_index, position) in record.positions.iter().copied().enumerate() {
             let terms = &self.time_terms[position];
@@ -4481,8 +4675,10 @@ impl CorrectionBasis {
                 }
             }
             design[(time_index, harmonic_columns)] = 1.0;
-            design[(time_index, harmonic_columns + 1)] =
-                (terms.modified_julian_day - record.reference_time) / record.time_span_days;
+            if self.fit_options.trend {
+                design[(time_index, harmonic_columns + 1)] =
+                    (terms.modified_julian_day - record.reference_time) / record.time_span_days;
+            }
         }
         Ok(FixedRawOls::from_design_with_confidence_constituents(
             record.scalar_constituents[..layout.fit_count].to_vec(),
@@ -4492,6 +4688,7 @@ impl CorrectionBasis {
             record.time_span_days,
             record.reference_time,
             record.confidence_sampling.clone(),
+            self.fit_options,
             design,
         ))
     }
@@ -4504,7 +4701,8 @@ impl CorrectionBasis {
         record: &RecordSubset,
     ) -> Result<Mat<c64>, AnalysisError> {
         validate_latitude(latitude)?;
-        let column_count = layout.fit_count * 2 + 2;
+        let harmonic_columns = layout.fit_count * 2;
+        let column_count = harmonic_columns + 1 + usize::from(self.fit_options.trend);
         let mut design = Mat::zeros(record.positions.len(), column_count);
         let latitude_factors = latitude_factors(latitude);
         for (time_index, position) in record.positions.iter().copied().enumerate() {
@@ -4544,11 +4742,13 @@ impl CorrectionBasis {
                 design[(time_index, positive_reference_start + reference_position)] = positive;
                 design[(time_index, negative_reference_start + reference_position)] = negative;
             }
-            design[(time_index, column_count - 2)] = c64::new(1.0, 0.0);
-            design[(time_index, column_count - 1)] = c64::new(
-                (terms.modified_julian_day - record.reference_time) / record.time_span_days,
-                0.0,
-            );
+            design[(time_index, harmonic_columns)] = c64::new(1.0, 0.0);
+            if self.fit_options.trend {
+                design[(time_index, harmonic_columns + 1)] = c64::new(
+                    (terms.modified_julian_day - record.reference_time) / record.time_span_days,
+                    0.0,
+                );
+            }
         }
         Ok(design)
     }
@@ -4563,8 +4763,11 @@ impl CorrectionBasis {
             .copied()
             .map(|position| self.time_terms[position].modified_julian_day)
             .collect::<Vec<_>>();
-        let (subset_reference, subset_span) =
-            validate_time(&modified_julian_days, self.model_constituent_count)?;
+        let (subset_reference, subset_span) = validate_time_with_options(
+            &modified_julian_days,
+            self.model_constituent_count,
+            self.fit_options,
+        )?;
         let original_is_equidistant = self.sample_interval_hours.is_some();
         let (reference_time, time_span_days, scalar_constituents, confidence_sampling) =
             if original_is_equidistant {
@@ -4615,7 +4818,8 @@ impl CorrectionBasis {
     ) -> Result<FixedRawOls, AnalysisError> {
         validate_latitude(latitude)?;
         let harmonic_columns = self.tidal_constituents.len() * 2;
-        let mut design = Mat::zeros(record.positions.len(), harmonic_columns + 2);
+        let column_count = harmonic_columns + 1 + usize::from(self.fit_options.trend);
+        let mut design = Mat::zeros(record.positions.len(), column_count);
         let latitude_factors = latitude_factors(latitude);
         for (time_index, position) in record.positions.iter().copied().enumerate() {
             let terms = &self.time_terms[position];
@@ -4633,8 +4837,10 @@ impl CorrectionBasis {
                 design[(time_index, constituent_index * 2 + 1)] = nodal_amplitude * angle.sin();
             }
             design[(time_index, harmonic_columns)] = 1.0;
-            design[(time_index, harmonic_columns + 1)] =
-                (terms.modified_julian_day - record.reference_time) / record.time_span_days;
+            if self.fit_options.trend {
+                design[(time_index, harmonic_columns + 1)] =
+                    (terms.modified_julian_day - record.reference_time) / record.time_span_days;
+            }
         }
         Ok(FixedRawOls::from_design(
             record.scalar_constituents.clone(),
@@ -4642,6 +4848,7 @@ impl CorrectionBasis {
             record.time_span_days,
             record.reference_time,
             record.confidence_sampling.clone(),
+            self.fit_options,
             design,
         ))
     }

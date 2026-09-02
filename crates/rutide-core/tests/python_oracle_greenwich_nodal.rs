@@ -2,7 +2,7 @@
 
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
-    AnalysisError, GreenwichNodalBatch, GreenwichNodalOls, GreenwichNodalReconstructor,
+    AnalysisError, FitOptions, GreenwichNodalBatch, GreenwichNodalOls, GreenwichNodalReconstructor,
     LinearConfidence, MonteCarloOptions, ReconstructionFilter, RobustOptions, TidalConstituent,
 };
 
@@ -267,6 +267,198 @@ fn matches_python_utide_for_real_fvcom_elevation() {
         solution.slope_per_day,
         EXPECTED_SLOPE_PER_DAY,
         3e-12,
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "freezes scalar and vector coefficients plus colored intervals for Python trend=False"
+)]
+fn matches_python_utide_with_trend_disabled() {
+    let time = oracle_times();
+    let observations = oracle_observations();
+    let options = FitOptions { trend: false };
+    let model = GreenwichNodalOls::prepare_modified_julian_days_with_options(
+        &time,
+        LATITUDE_DEGREES_NORTH,
+        &CONSTITUENTS,
+        options,
+    )
+    .expect("valid trend-disabled model");
+    let scalar = model
+        .solve_with_linear_confidence(&observations, LinearConfidence::Colored)
+        .expect("valid trend-disabled scalar solution");
+    assert_eq!(model.fit_options(), options);
+    for (field, actual, expected, tolerance) in [
+        (
+            "amplitude",
+            &scalar.amplitude,
+            &[
+                0.653_688_008_517_015_4,
+                0.226_499_047_317_034_44,
+                0.158_185_721_266_017_32,
+                0.112_154_840_796_228_5,
+                0.069_248_097_197_129_27,
+            ],
+            5e-11,
+        ),
+        (
+            "phase",
+            &scalar.phase_degrees,
+            &[
+                189.390_582_953_384_47,
+                229.039_448_491_749_17,
+                163.365_202_479_752_87,
+                154.510_882_931_514_06,
+                20.326_520_499_173_974,
+            ],
+            5e-8,
+        ),
+        (
+            "amplitude CI",
+            scalar.amplitude_ci.as_ref().expect("amplitude CI"),
+            &[
+                0.015_573_715_781_056_981,
+                0.015_574_797_226_646_77,
+                0.015_575_490_201_899_739,
+                0.010_021_669_866_443_34,
+                0.010_038_253_524_617_6,
+            ],
+            5e-9,
+        ),
+        (
+            "phase CI",
+            scalar.phase_ci_degrees.as_ref().expect("phase CI"),
+            &[
+                1.364_964_903_876_680_2,
+                3.939_085_971_636_990_4,
+                5.639_949_666_784_921,
+                5.130_549_625_688_577,
+                8.295_769_367_692_161,
+            ],
+            5e-7,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(
+                &format!("no-trend {field}[{index}]"),
+                *actual,
+                *expected,
+                tolerance,
+            );
+        }
+    }
+    assert_close(
+        "no-trend mean",
+        scalar.mean,
+        0.091_040_665_648_788_57,
+        5e-11,
+    );
+    assert_close("no-trend slope", scalar.slope_per_day, 0.0, f64::EPSILON);
+
+    let batch = GreenwichNodalBatch::prepare_modified_julian_days_with_options(
+        &time,
+        &CONSTITUENTS,
+        options,
+    )
+    .expect("valid trend-disabled batch");
+    assert_eq!(batch.fit_options(), options);
+    let batch_solution = batch
+        .solve_time_major_with_linear_confidence(
+            &observations,
+            &[LATITUDE_DEGREES_NORTH],
+            LinearConfidence::Colored,
+        )
+        .expect("valid batch solution");
+    assert_eq!(batch_solution.as_slice(), std::slice::from_ref(&scalar));
+
+    let (eastward, northward) = synthetic_vector_observations(&time);
+    let vector = model
+        .solve_vector_with_linear_confidence(&eastward, &northward, LinearConfidence::Colored)
+        .expect("valid trend-disabled vector solution");
+    for (field, actual, expected, tolerance) in [
+        (
+            "semi-major",
+            &vector.semi_major,
+            &[
+                0.002_291_214_337_322_088_4,
+                0.002_505_978_497_015_262,
+                0.001_756_108_956_550_487,
+                0.003_274_763_239_083_977_4,
+                0.042_862_136_703_990_93,
+            ],
+            5e-10,
+        ),
+        (
+            "semi-minor",
+            &vector.semi_minor,
+            &[
+                0.000_128_699_131_225_115_54,
+                -0.000_724_357_429_841_571_2,
+                0.001_328_799_778_751_671_5,
+                -0.000_946_774_273_530_124_6,
+                -0.007_503_205_767_192_839,
+            ],
+            5e-10,
+        ),
+        (
+            "semi-major CI",
+            vector.semi_major_ci.as_ref().expect("major CI"),
+            &[
+                0.031_287_706_568_072_65,
+                0.033_176_453_074_374_154,
+                0.024_002_310_153_427_48,
+                0.034_054_810_054_763_54,
+                0.003_630_607_578_576_585_6,
+            ],
+            5e-8,
+        ),
+        (
+            "semi-minor CI",
+            vector.semi_minor_ci.as_ref().expect("minor CI"),
+            &[
+                0.009_880_436_014_417_356,
+                0.005_739_563_754_980_892,
+                0.022_518_491_594_073_757,
+                0.013_152_688_247_846_097,
+                0.038_303_286_451_683_224,
+            ],
+            5e-8,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(
+                &format!("no-trend {field}[{index}]"),
+                *actual,
+                *expected,
+                tolerance,
+            );
+        }
+    }
+    assert_close(
+        "no-trend eastward mean",
+        vector.eastward_mean,
+        0.163_543_475_144_704,
+        5e-11,
+    );
+    assert_close(
+        "no-trend northward mean",
+        vector.northward_mean,
+        -0.076_833_183_415_025_49,
+        5e-11,
+    );
+    assert_close(
+        "no-trend eastward slope",
+        vector.eastward_slope_per_day,
+        0.0,
+        f64::EPSILON,
+    );
+    assert_close(
+        "no-trend northward slope",
+        vector.northward_slope_per_day,
+        0.0,
+        f64::EPSILON,
     );
 }
 

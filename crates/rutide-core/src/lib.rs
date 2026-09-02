@@ -26,7 +26,7 @@ pub use corrected::{
 pub use error::AnalysisError;
 pub use monte_carlo::MonteCarloOptions;
 pub use robust::{RobustDiagnostics, RobustOptions, RobustTermination};
-pub use scalar::{Constituent, FixedRawOls, LinearConfidence, ScalarSolution};
+pub use scalar::{Constituent, FitOptions, FixedRawOls, LinearConfidence, ScalarSolution};
 pub use selection::{RayleighSelection, select_constituents_by_rayleigh};
 pub use vector::{VectorReconstruction, VectorSolution};
 
