@@ -55,13 +55,14 @@ irregular profile, nonlinear propagation adds 0.05–2.24% over scalar linear
 confidence and 27.73–33.74% over vector linear confidence while retaining
 bitwise-identical checksums across 1 and 16 workers.
 
-The implemented scalar kernels now cover fixed-constituent OLS with mean and
-trend in both raw-phase mode and exact Greenwich/nodal mode. The exact-correction
-catalog contains all 146 constituents, 162 satellite corrections, and 251
-shallow-water relationships from the pinned Python oracle. The corrected bulk
-API shares latitude-independent astronomy, pre-aggregates satellite terms, and
-parallelizes the latitude-specific factorizations across spatial series. Both
-paths have real-FVCOM parity tests against the pinned Python oracle.
+The implemented scalar kernels now cover fixed-constituent OLS with a mean and
+optional trend in both raw-phase mode and exact Greenwich/nodal mode. The
+exact-correction catalog contains all 146 constituents, 162 satellite
+corrections, and 251 shallow-water relationships from the pinned Python oracle.
+The corrected bulk API shares latitude-independent astronomy, pre-aggregates
+satellite terms, and parallelizes the latitude-specific factorizations across
+spatial series. Both paths have real-FVCOM parity tests against the pinned
+Python oracle.
 
 Percent-energy diagnostics, linearized and Monte Carlo 95% amplitude/phase
 confidence intervals, CI-derived signal-to-noise ratio, per-solution PE/SNR
@@ -195,6 +196,13 @@ diagnostics and ragged `robust_weight` / `robust_leverage` arrays. For a series
 with missing values, each ragged row follows the finite observations in original
 timestamp order.
 
+Add `--no-trend` to match Python UTide's `trend=False` model. The mean remains
+fitted, but the linear-time column is omitted from the solve. This option works
+for scalar and vector analyses, ordinary and inferred constituents, OLS and
+robust fitting, all confidence methods, and complete, gappy, or irregular
+records. JSON reports and NetCDF metadata record `trend_enabled`; NetCDF keeps
+its stable slope variables and writes exact zeros when the trend is disabled.
+
 Add one repeatable `--infer INFERRED:REFERENCE:AMPLITUDE_RATIO:PHASE_OFFSET`
 for each constrained scalar constituent. Exact astronomical inference is the
 default; `--infer-approximate` selects Python UTide's reference-only approximate
@@ -231,7 +239,7 @@ cargo run --release --bin rutide -- analyze-scalar \
 
 The library-level `GreenwichNodalReconstructor` and model convenience method
 accept arbitrary finite Modified Julian Days, including held-out and forecast
-times, and always retain the fitted mean and trend.
+times, and retain the fitted mean plus the trend when it was enabled.
 
 Use `--node-count N` for a prefix or `--nodes 0,10,20` for an explicit
 correctness sample. Existing destinations are preserved unless `--overwrite`

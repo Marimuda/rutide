@@ -14,7 +14,7 @@ defined behavior, and representative oracle tests are versioned.
 - Full pinned catalog: 146 constituents, 162 satellite corrections, and 251
   shallow-water relationships.
 - Explicit and Rayleigh-selected dynamic constituent lists.
-- Ordinary least-squares scalar and vector fits with mean and trend.
+- Ordinary least-squares scalar and vector fits with a mean and optional trend.
 - Raw-phase and exact Greenwich/nodal numerical kernels.
 - Percent energy, linearized 95% confidence intervals, SNR, and ranking views.
 - Reconstruction at arbitrary target times with constituent, PE, and SNR filters.
@@ -202,9 +202,15 @@ comparison adds 0.05–2.24% over scalar linear-confidence time and 27.73–33.7
 over vector time, with deterministic 1/16-worker checksums. Python speedup is not
 reported because the Python implementation rejects the combination.
 
-## 5. Solver-option parity — planned
+## 5. Solver-option parity — in progress
 
-- Make the linear trend optional while retaining a fitted mean.
+- **Complete:** make the linear trend optional while retaining a fitted mean.
+  The core and FVCOM scalar/vector APIs cover ordinary and inferred
+  constituents, OLS and robust fitting, every confidence method, and complete,
+  missing, and irregular records. Pinned Python `trend=False` fixtures freeze
+  scalar and vector coefficients and colored intervals. JSON reports and the
+  versioned NetCDF schemas expose `trend_enabled`; stable slope fields are exact
+  zeros when the trend is omitted.
 - Expose exact Greenwich, linear-time, and raw phase modes through one API.
 - Expose exact, linear-time, and disabled nodal/satellite corrections.
 - Support result presentation by PE, SNR, frequency, or explicit order without
@@ -212,8 +218,8 @@ reported because the Python implementation rejects the combination.
 - Define missing/non-finite timestamp handling and datetime/epoch conversion at
   application or binding boundaries.
 
-Each option combination needs focused oracle coverage. Unsupported combinations
-must be rejected during validation rather than partially applied.
+Each remaining option combination needs focused oracle coverage. Unsupported
+combinations must be rejected during validation rather than partially applied.
 
 ## 6. Product and resource work — planned
 

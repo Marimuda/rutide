@@ -779,7 +779,7 @@ impl GreenwichNodalOls {
     /// Reconstruct one solution at arbitrary Modified Julian Days.
     ///
     /// Exact Greenwich phase and nodal corrections are evaluated at each target
-    /// timestamp. The fitted mean and trend are always retained.
+    /// timestamp. The fitted mean, and the trend when enabled, are retained.
     ///
     /// # Errors
     ///
