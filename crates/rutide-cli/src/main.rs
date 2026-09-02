@@ -359,15 +359,6 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     } else {
         InferenceMode::Exact
     };
-    if matches!(confidence_interval, ConfidenceInterval::MonteCarlo { .. })
-        && (!scalar_inference_relationships.is_empty()
-            || !vector_inference_relationships.is_empty())
-    {
-        return Err(
-            "--confidence monte-carlo with --infer is not yet supported; use linear confidence"
-                .to_owned(),
-        );
-    }
     let reconstruction = resolve_reconstruction(
         reconstruct,
         reconstruction_constituents,
@@ -907,6 +898,12 @@ mod tests {
             "--infer",
             "S2:M2:0.35:20",
             "--infer-approximate",
+            "--confidence",
+            "monte-carlo",
+            "--mc-realizations",
+            "33",
+            "--mc-seed",
+            "7",
         ]))
         .expect("valid scalar inference");
         let Command::AnalyzeScalar(config) = scalar else {
@@ -924,6 +921,16 @@ mod tests {
                 )],
             })
         );
+        assert_eq!(
+            config.confidence_interval,
+            ConfidenceInterval::MonteCarlo {
+                options: MonteCarloOptions {
+                    realizations: 33,
+                    seed: 7,
+                },
+                noise: LinearConfidence::Colored,
+            }
+        );
 
         let vector = parse_arguments(args(&[
             "analyze-vector",
@@ -935,6 +942,8 @@ mod tests {
             "O1:K1:0.5:45:0.4:30",
             "--method",
             "robust",
+            "--confidence",
+            "monte-carlo",
         ]))
         .expect("valid vector inference");
         let Command::AnalyzeVector(config) = vector else {
@@ -955,6 +964,10 @@ mod tests {
             })
         );
         assert!(matches!(config.analysis_method, AnalysisMethod::Robust(_)));
+        assert!(matches!(
+            config.confidence_interval,
+            ConfidenceInterval::MonteCarlo { .. }
+        ));
 
         for invalid in [
             &["--infer-approximate"][..],
@@ -1138,12 +1151,6 @@ mod tests {
         for extra in [
             &["--confidence", "linear", "--mc-seed", "1"][..],
             &["--confidence", "monte-carlo", "--mc-realizations", "1"][..],
-            &[
-                "--confidence",
-                "monte-carlo",
-                "--infer",
-                "S2:M2:0.3:20:0.2:10",
-            ][..],
         ] {
             let mut values = vec![
                 "analyze-vector",

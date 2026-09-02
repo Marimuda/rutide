@@ -357,6 +357,14 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                         &input.latitudes,
                         noise,
                     ),
+                (AnalysisMethod::Ols, ConfidenceInterval::MonteCarlo { options, noise }) => batch
+                    .solve_vector_time_major_with_missing_and_monte_carlo_confidence(
+                        &input.eastward,
+                        &input.northward,
+                        &input.latitudes,
+                        options,
+                        noise,
+                    ),
                 (AnalysisMethod::Robust(options), ConfidenceInterval::None) => batch
                     .solve_vector_time_major_with_missing_robust(
                         &input.eastward,
@@ -372,9 +380,20 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                         options,
                         noise,
                     ),
-                (_, ConfidenceInterval::MonteCarlo { .. }) => {
-                    Err(AnalysisError::UnsupportedMonteCarloInference)
-                }
+                (
+                    AnalysisMethod::Robust(robust_options),
+                    ConfidenceInterval::MonteCarlo {
+                        options: monte_carlo_options,
+                        noise,
+                    },
+                ) => batch.solve_vector_time_major_with_missing_robust_and_monte_carlo_confidence(
+                    &input.eastward,
+                    &input.northward,
+                    &input.latitudes,
+                    robust_options,
+                    monte_carlo_options,
+                    noise,
+                ),
             }
         }
     })?;
@@ -542,16 +561,6 @@ fn validate_vector_config(config: &VectorAnalyzeConfig) -> Result<(), AppError> 
     {
         return Err(AppError::Invalid(
             "inference requires at least one relationship".to_owned(),
-        ));
-    }
-    if config.inference.is_some()
-        && matches!(
-            config.confidence_interval,
-            ConfidenceInterval::MonteCarlo { .. }
-        )
-    {
-        return Err(AppError::Invalid(
-            "Monte Carlo confidence with inferred constituents is not yet supported".to_owned(),
         ));
     }
     Ok(())
@@ -1627,7 +1636,13 @@ mod tests {
                     ),
                 ],
             }),
-            confidence_interval: ConfidenceInterval::Linear(LinearConfidence::Colored),
+            confidence_interval: ConfidenceInterval::MonteCarlo {
+                options: MonteCarloOptions {
+                    realizations: 64,
+                    seed: 99,
+                },
+                noise: LinearConfidence::Colored,
+            },
             analysis_method: AnalysisMethod::Robust(RobustOptions {
                 tolerance: 0.01,
                 ..RobustOptions::default()
@@ -1647,6 +1662,9 @@ mod tests {
             "exact"
         );
         assert_eq!(inference_report.analysis_method, "robust");
+        assert_eq!(inference_report.confidence_interval, "monte-carlo");
+        assert_eq!(inference_report.monte_carlo_realizations, Some(64));
+        assert_eq!(inference_report.monte_carlo_seed, Some(99));
         assert_eq!(
             inference_report.profile,
             "fixed-constituents-greenwich-nodal-vector-inference-robust"
@@ -1668,6 +1686,22 @@ mod tests {
                 .value()
                 .expect("read inferred constituent names"),
             netcdf::AttributeValue::Str("S2,O1".to_owned())
+        );
+        assert_eq!(
+            inference_output
+                .attribute("confidence_interval")
+                .expect("confidence method")
+                .value()
+                .expect("read confidence method"),
+            netcdf::AttributeValue::Str("monte-carlo".to_owned())
+        );
+        assert_eq!(
+            inference_output
+                .attribute("monte_carlo_seed")
+                .expect("Monte Carlo seed")
+                .value()
+                .expect("read Monte Carlo seed"),
+            netcdf::AttributeValue::Ulonglong(99)
         );
         assert_eq!(
             inference_output

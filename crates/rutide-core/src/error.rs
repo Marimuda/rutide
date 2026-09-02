@@ -143,8 +143,6 @@ pub enum AnalysisError {
         /// Constituent position whose covariance could not be sampled.
         constituent: usize,
     },
-    /// Monte Carlo propagation through inferred relationships is not implemented yet.
-    UnsupportedMonteCarloInference,
 }
 
 impl fmt::Display for AnalysisError {
@@ -269,9 +267,6 @@ impl fmt::Display for AnalysisError {
             Self::InvalidConfidenceCovariance { constituent } => write!(
                 formatter,
                 "coefficient covariance for constituent {constituent} is not finite or could not be repaired for sampling"
-            ),
-            Self::UnsupportedMonteCarloInference => formatter.write_str(
-                "Monte Carlo confidence with inferred constituents is not yet supported",
             ),
         }
     }

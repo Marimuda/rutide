@@ -856,6 +856,13 @@ fn solve_input(
                     &input.latitudes,
                     noise,
                 ),
+            (AnalysisMethod::Ols, ConfidenceInterval::MonteCarlo { options, noise }) => batch
+                .solve_time_major_with_missing_and_monte_carlo_confidence(
+                    &input.observations,
+                    &input.latitudes,
+                    options,
+                    noise,
+                ),
             (AnalysisMethod::Robust(options), ConfidenceInterval::None) => batch
                 .solve_time_major_with_missing_robust(
                     &input.observations,
@@ -869,9 +876,19 @@ fn solve_input(
                     options,
                     noise,
                 ),
-            (_, ConfidenceInterval::MonteCarlo { .. }) => {
-                Err(AnalysisError::UnsupportedMonteCarloInference)
-            }
+            (
+                AnalysisMethod::Robust(robust_options),
+                ConfidenceInterval::MonteCarlo {
+                    options: monte_carlo_options,
+                    noise,
+                },
+            ) => batch.solve_time_major_with_missing_robust_and_monte_carlo_confidence(
+                &input.observations,
+                &input.latitudes,
+                robust_options,
+                monte_carlo_options,
+                noise,
+            ),
         },
     })
 }
@@ -928,11 +945,6 @@ fn validate_config(config: &AnalyzeConfig) -> Result<(), AppError> {
         if options.realizations < 2 {
             return Err(AppError::Invalid(
                 "Monte Carlo confidence requires at least two realizations".to_owned(),
-            ));
-        }
-        if config.inference.is_some() {
-            return Err(AppError::Invalid(
-                "Monte Carlo confidence with inferred constituents is not yet supported".to_owned(),
             ));
         }
     }
