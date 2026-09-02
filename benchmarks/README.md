@@ -131,6 +131,19 @@ same relationships with independent positive/negative rotary ratios. Both sum
 all reported amplitude or semi-major confidence intervals as a cross-language
 checksum; preparation remains outside the repeated solve-only timing.
 
+The inference probe defaults to linear confidence for the matched Python
+comparison. Its Rust-only Monte Carlo extension can be measured with an
+effective realization count and deterministic seed:
+
+```console
+RUTIDE_BENCH_CONFIDENCE=monte-carlo \
+  RUTIDE_BENCH_MC_REALIZATIONS=200 RUTIDE_BENCH_MC_SEED=0 \
+  cargo bench -p rutide-core --bench inference_throughput
+```
+
+There is no paired Python command for this profile because Python UTide raises
+`NotImplementedError` when inference and Monte Carlo confidence are combined.
+
 The `fixed-raw` solver profile is the first Rust parity target. It fits M2, S2,
 N2, K1, and O1 with ordinary least squares, a mean and trend, raw phase, no nodal
 corrections, and no confidence intervals. This deliberately isolates harmonic

@@ -49,6 +49,12 @@ records complete scalar/vector covariance sampling on irregular OLS and regular
 robust profiles. RUTide is 17.24–61.09x faster on one worker and 10.80–35.08x
 faster at 16 workers for the matched 200-realization workloads.
 
+The focused [inferred Monte Carlo check](benchmarks/results/inferred-monte-carlo-2026-09-02.md)
+records the Rust-only extension that Python UTide rejects. On the 100-series
+irregular profile, nonlinear propagation adds 0.05–2.24% over scalar linear
+confidence and 27.73–33.74% over vector linear confidence while retaining
+bitwise-identical checksums across 1 and 16 workers.
+
 The implemented scalar kernels now cover fixed-constituent OLS with mean and
 trend in both raw-phase mode and exact Greenwich/nodal mode. The exact-correction
 catalog contains all 146 constituents, 162 satellite corrections, and 251
@@ -88,6 +94,11 @@ covariances are symmetrized, projected onto the positive-semidefinite cone, and
 nudged to a sampleable positive-definite matrix. A pinned ChaCha12 RNG and
 series/constituent-derived streams make a seed reproducible independently of
 worker scheduling; NumPy and Rust draws are not expected to be bit-identical.
+For inference, each independently fitted reference is sampled once per
+realization and all of its inferred scalar or positive/negative rotary
+coefficients are derived from that same draw. This preserves the exact
+reference/inferred correlation instead of treating constrained constituents as
+independent uncertain estimates.
 
 ## Repository layout
 
@@ -105,13 +116,13 @@ Large FVCOM data and generated benchmark results also remain outside Git.
 The completed compatibility surface and remaining scientific, interface, and
 resource tasks are tracked in [`ROADMAP.md`](ROADMAP.md). Irregular scalar and
 vector colored confidence use Lomb–Scargle residual spectra, robust fitting and
-non-inferred Monte Carlo confidence are complete. Scalar and coupled-vector
-inferred constituents now pass exact,
-approximate, and gappy Python oracle fixtures and are exposed by the FVCOM
-commands. Their comparative benchmark is complete. Monte Carlo propagation
-through inferred relationships is the remaining confidence extension; it is
-mathematically feasible but explicitly rejected until its correlated-reference
-sampling contract and tests are implemented.
+Monte Carlo confidence are complete. Scalar and coupled-vector inferred
+constituents pass exact, approximate, and gappy Python oracle fixtures and are
+exposed by the FVCOM commands. Monte Carlo propagation through those
+relationships supports OLS and robust fits, white and colored noise, complete,
+missing, and irregular records, and deterministic parallel batches. Their
+comparative linear-confidence benchmark is complete; Python UTide cannot supply
+a direct Monte Carlo-inference timing because it rejects that combination.
 
 ## Development
 
@@ -172,8 +183,9 @@ The defaults are 200 realizations and root seed 0; override them with
 which is ignored and always draws 200 realizations, both Rust options are
 effective. Add `--white-noise` to either confidence method to bypass residual
 band coloring. Monte Carlo works with OLS or robust fitting, regular, missing,
-and truly irregular scalar/current records. It is currently rejected together
-with `--infer` rather than silently omitting uncertainty propagation.
+and truly irregular scalar/current records, including inferred constituents.
+Inferred estimates reuse the reference's sampled realization so their
+constraint and correlation are retained exactly.
 
 Add `--method robust` for Python-compatible Cauchy iteratively reweighted least
 squares. Defaults are tuning constant `2.385`, fractional tolerance `0.001`, and
@@ -278,8 +290,8 @@ realizations rather than independently linearizing the two components.
 
 Vector inference uses separate positive- and negative-rotary constraints:
 `--infer INFERRED:REFERENCE:AMP+:PHASE+:AMP-:PHASE-`. It supports exact or
-approximate OLS or robust fitting, missing values, white/colored linear
-confidence, PE/SNR, and reconstruction. Robust inference solves the coupled
+approximate OLS or robust fitting, missing values, white/colored linear or Monte
+Carlo confidence, PE/SNR, and reconstruction. Robust inference solves the coupled
 complex rotary model with one Cauchy weight per retained timestamp; NetCDF
 outputs retain those shared weights, complex-model leverage, convergence
 diagnostics, and reconstruction metadata. Add `--method robust` alongside the

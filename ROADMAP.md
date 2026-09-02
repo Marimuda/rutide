@@ -109,13 +109,12 @@ workers.
 - Support inferred/reference names, amplitude ratios, phase offsets, and exact and
   approximate inference modes.
 - Validate scalar ratios separately from the two-ratio vector convention.
-- Propagate inferred constituents through diagnostics, linear confidence intervals,
-  ordering, serialization, and reconstruction.
+- Propagate inferred constituents through diagnostics, linear and Monte Carlo
+  confidence intervals, ordering, serialization, and reconstruction.
 
 Acceptance requires resolved/unresolved scalar pairs, vector ellipses, invalid
-reference graphs, and exact/approximate Python-oracle fixtures. Python UTide does
-not implement Monte Carlo confidence combined with inference; RUTide must either
-retain that explicit boundary or specify and validate an extension.
+reference graphs, exact/approximate Python-oracle fixtures, and independent
+invariants for the Monte Carlo extension that Python UTide does not implement.
 
 The scalar and vector fixed-latitude kernels are complete. Scalar inference
 includes robust and bulk solves; the vector kernel uses one coupled complex solve
@@ -126,6 +125,13 @@ resolved and unresolved pinned-oracle fixtures. Inference confidence preserves a
 pinned Python column-order/indexing quirk inside these models only. Scalar and
 joint-mask vector batches now support varying latitudes, complete or missing
 records, and white/colored confidence while retaining bounded shared Lomb plans.
+Monte Carlo batches sample every independent reference coefficient once per
+realization and transform that shared draw through all scalar or rotary inference
+relationships. Exact/approximate, OLS/robust, white/colored, complete/missing,
+and regular/irregular paths are covered, including bitwise worker-count
+reproducibility. Python-oracle tests freeze the underlying fitted coefficients,
+covariances, and linear confidence; transformation invariants and cross-solver
+tests cover the unsupported-in-Python nonlinear propagation.
 The scalar and vector FVCOM commands now accept repeatable relationships and an
 exact/approximate switch; JSON reports and versioned NetCDF schemas retain every
 ratio, phase offset, convention, and mode, while the canonical digest includes
@@ -147,7 +153,7 @@ mode is 69.30–86.55x faster at 16 workers. These measurements predate the robu
 coupled-vector implementation; robust inference performance has not yet been
 benchmarked separately.
 
-## 4. Monte Carlo confidence intervals — non-inferred implementation complete
+## 4. Monte Carlo confidence intervals — complete
 
 - Complete 2×2 scalar and 4×4 vector coefficient covariances are sampled for OLS
   and final-weight Cauchy robust fits.
@@ -164,6 +170,10 @@ benchmarked separately.
   diagonally nudged until Cholesky sampling is valid.
 - Missing and truly irregular scalar/vector batches, robust fits, CLI options,
   result digests, JSON reports, and versioned NetCDF metadata are integrated.
+- Scalar and vector inference preserve perfect reference/inferred dependence by
+  applying every constrained relationship to the same joint reference draw.
+  Exact/approximate, OLS/robust, white/colored, and regular/irregular batches are
+  supported with deterministic per-series streams.
 
 The acceptance suite now covers deterministic seeded scalar/vector fixtures,
 white and colored noise, near-degenerate ellipses, covariance repair, statistical
@@ -173,19 +183,24 @@ option is ignored and always uses an internal 200 realizations; RUTide preserves
 that default but deliberately makes its configured count effective.
 
 There is no theoretical restriction on combining Monte Carlo confidence with
-inferred constituents. Correct support must sample each independently fitted
-ordinary/reference coefficient jointly, apply exact or approximate inference
-relations to every realization, and retain reference/inferred correlation before
-forming amplitudes or ellipses. Python UTide does not implement that path. RUTide
-currently rejects the combination explicitly; implementing and validating this
-extension is the remaining scientific subtask.
+inferred constituents. RUTide samples each independently fitted
+ordinary/reference coefficient jointly, applies exact or approximate inference
+relations to every realization, and retains reference/inferred correlation
+before forming amplitudes or ellipses. Python UTide does not implement that path,
+so validation combines pinned-Python parity for the fitted model and covariance
+inputs with analytic scaling/rotation invariants, shared-draw dependence checks,
+cross-solver equivalence, and batch reproducibility tests.
 
 The dedicated
 `benchmarks/results/monte-carlo-confidence-2026-09-01.md` snapshot covers
 regular robust and irregular/gappy OLS scalar/vector workloads. On matched
 200-realization comparisons, RUTide is 17.24–61.09x faster than pinned Python on
-one worker and 10.80–35.08x faster at 16 workers. This closes the performance
-acceptance task for the supported non-inferred surface.
+one worker and 10.80–35.08x faster at 16 workers. Those historical measurements
+cover the shared non-inferred surface. The Rust-only inferred profile is recorded
+in `benchmarks/results/inferred-monte-carlo-2026-09-02.md`: its focused irregular
+comparison adds 0.05–2.24% over scalar linear-confidence time and 27.73–33.74%
+over vector time, with deterministic 1/16-worker checksums. Python speedup is not
+reported because the Python implementation rejects the combination.
 
 ## 5. Solver-option parity — planned
 

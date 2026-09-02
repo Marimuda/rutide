@@ -78,7 +78,10 @@ confidence stage. The 16-worker, 100-series cases also expose scheduling
 overhead because each worker receives only about six series. Even there RUTide
 retains a 10.80–35.08x advantage.
 
-This closes the performance acceptance task for non-inferred Monte Carlo
-confidence. Monte Carlo propagation through inferred-constituent relationships
-remains an explicitly rejected, scientifically feasible extension requiring a
-separate correlated-reference sampling contract and oracle-independent tests.
+This snapshot closes the performance acceptance task for the non-inferred
+surface measured on 2026-09-01. Inferred Monte Carlo support was implemented
+later: every independently fitted reference is sampled once and its inferred
+coefficients are transformed from the same realization, preserving their
+dependence. Python UTide rejects that combination, so it is covered by
+oracle-independent scaling, rotation, shared-draw, cross-solver, and deterministic
+batch invariants rather than retroactively included in these timings.
