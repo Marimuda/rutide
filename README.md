@@ -56,8 +56,9 @@ confidence and 27.73–33.74% over vector linear confidence while retaining
 bitwise-identical checksums across 1 and 16 workers.
 
 The implemented scalar kernels now cover fixed-constituent OLS with a mean and
-optional trend using raw, linear-time Greenwich, or exact Greenwich phase. The
-exact-correction catalog contains all 146 constituents, 162 satellite
+optional trend using raw, linear-time Greenwich, or exact Greenwich phase and
+exact, midpoint-linearized, or disabled nodal corrections. The correction
+catalog contains all 146 constituents, 162 satellite
 corrections, and 251 shallow-water relationships from the pinned Python oracle.
 The corrected bulk API shares latitude-independent astronomy, pre-aggregates
 satellite terms, and parallelizes the latitude-specific factorizations across
@@ -66,9 +67,9 @@ Python oracle.
 
 Percent-energy diagnostics, linearized and Monte Carlo 95% amplitude/phase
 confidence intervals, CI-derived signal-to-noise ratio, per-solution PE/SNR
-ranking, and exact scalar reconstruction are available. Reconstruction supports
-arbitrary target times in the core API and an opt-in complete original-time
-series in the FVCOM command.
+ranking, and matching scalar reconstruction are available. Reconstruction
+supports arbitrary target times in the core API and an opt-in complete
+original-time series in the FVCOM command.
 Scalar `_FillValue` and `NaN` observations are omitted per series, with shared
 valid-time masks grouped before fitting. Depth-averaged vector currents now use
 the same machinery with a joint `ua`/`va` validity mask and return current
@@ -208,10 +209,22 @@ Python UTide's phase-reference convention. `greenwich` is the default and
 evaluates the astronomical argument at every timestamp. `linear-time` evaluates
 it once at the fitted record midpoint and advances it using the constituent's
 reference-time frequency. `raw` references phase directly to that midpoint.
-Exact nodal/satellite corrections remain enabled in all three cases; their
-independent approximation/disable controls are the next solver-parity item.
-The selected convention is retained in JSON reports, NetCDF metadata, result
-digests, profile names, and reconstruction.
+
+Use `--nodal exact`, `--nodal linear-time`, or `--nodal disabled` independently
+of `--phase`. `exact` is the default and evaluates nodal/satellite amplitude and
+phase corrections at every timestamp. `linear-time` evaluates them once at the
+fitted record midpoint and holds them constant; this is Python UTide's
+`nodal="linear_time"` approximation. `disabled` applies unit nodal amplitude and
+zero nodal phase, matching Python's `nodal=False`. For an irregular series with
+missing observations, the midpoint belongs to that series' retained record.
+Fit and reconstruction always use the same selected mode. Exact mode remains
+the scientifically preferred default, especially for long records; the other
+modes are primarily compatibility and sensitivity controls.
+
+Both phase and nodal choices are retained independently in JSON reports, NetCDF
+metadata, result digests, profile names, and reconstruction. Existing default
+profile names keep their `nodal` component; alternatives use
+`nodal-linear-time` or `no-nodal`.
 
 Add one repeatable `--infer INFERRED:REFERENCE:AMPLITUDE_RATIO:PHASE_OFFSET`
 for each constrained scalar constituent. Exact astronomical inference is the
@@ -287,9 +300,9 @@ cargo run --release --bin rutide -- analyze-vector \
   --workers 64
 ```
 
-The output includes semi-major and signed semi-minor axes, inclination, Greenwich
-phase, PE, and—when enabled—the four ellipse CIs and SNR. Reconstruction is
-written as `eastward_reconstruction(time, series)` and
+The output includes semi-major and signed semi-minor axes, inclination, the
+configured phase convention, PE, and—when enabled—the four ellipse CIs and SNR.
+Reconstruction is written as `eastward_reconstruction(time, series)` and
 `northward_reconstruction(time, series)`. Use `--element-count N` or
 `--elements 0,10,20` for subsets. Dynamic constituent selection and reconstruction
 filters behave as in scalar mode.

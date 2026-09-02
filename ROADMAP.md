@@ -15,7 +15,8 @@ defined behavior, and representative oracle tests are versioned.
   shallow-water relationships.
 - Explicit and Rayleigh-selected dynamic constituent lists.
 - Ordinary least-squares scalar and vector fits with a mean and optional trend.
-- Raw, linear-time Greenwich, and exact Greenwich phase with exact nodal terms.
+- Raw, linear-time Greenwich, and exact Greenwich phase with independently
+  selectable exact, midpoint-linearized, or disabled nodal terms.
 - Percent energy, linearized 95% confidence intervals, SNR, and ranking views.
 - Reconstruction at arbitrary target times with constituent, PE, and SNR filters.
 - Per-series missing observations, grouped valid-time masks, and joint eastward /
@@ -218,7 +219,14 @@ reported because the Python implementation rejects the combination.
   digests, reports, and versioned NetCDF metadata. Pinned Python fixtures cover
   scalar coefficients and colored intervals, vector ellipses, exact and
   approximate inference, and held-out reconstruction.
-- Expose exact, linear-time, and disabled nodal/satellite corrections.
+- **Complete:** expose exact, linear-time, and disabled nodal/satellite
+  corrections independently of the phase-reference convention. The option is
+  shared by ordinary and inferred scalar/vector fits, retained-record epochs,
+  reconstruction, CLI profiles, canonical digests, JSON reports, and versioned
+  NetCDF metadata. Alternative modes avoid per-timestamp satellite evaluation;
+  the exact default path retains its prior behavior. Pinned Python fixtures cover
+  scalar coefficients, rotary ellipses, exact/approximate inference, batching,
+  missing irregular records, and held-out reconstruction.
 - Support result presentation by PE, SNR, frequency, or explicit order without
   losing stable constituent identity in bulk results.
 - Define missing/non-finite timestamp handling and datetime/epoch conversion at

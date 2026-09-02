@@ -13,8 +13,8 @@ use rutide_cli::{
     analyze_scalar, analyze_vector,
 };
 use rutide_core::{
-    FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, PhaseReference,
-    ReconstructionFilter, RobustOptions, ScalarInferenceRelation, TidalConstituent,
+    FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections,
+    PhaseReference, ReconstructionFilter, RobustOptions, ScalarInferenceRelation, TidalConstituent,
     VectorInferenceRelation,
 };
 
@@ -43,6 +43,7 @@ Options:
   --infer-approximate Use Python-compatible reference-only approximate inference
   --no-trend         Fit a mean without a linear trend (default: mean and trend)
   --phase MODE        Phase reference: greenwich, linear-time, or raw (default: greenwich)
+  --nodal MODE        Nodal corrections: exact, linear-time, or disabled (default: exact)
   --method MODE       Least squares: ols or robust (default: ols)
   --robust-tuning X   Cauchy tuning constant (default: 2.385)
   --robust-tolerance X
@@ -153,6 +154,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let mut inference_approximate = false;
     let mut trend_disabled = false;
     let mut phase_reference = None;
+    let mut nodal_corrections = None;
     let mut robust_requested = None;
     let mut robust_tuning = None;
     let mut robust_tolerance = None;
@@ -250,6 +252,15 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                     return Err("--phase may only be supplied once".to_owned());
                 }
                 phase_reference = Some(parse_phase_reference(&required_value(
+                    &mut arguments,
+                    option,
+                )?)?);
+            }
+            "--nodal" => {
+                if nodal_corrections.is_some() {
+                    return Err("--nodal may only be supplied once".to_owned());
+                }
+                nodal_corrections = Some(parse_nodal_corrections(&required_value(
                     &mut arguments,
                     option,
                 )?)?);
@@ -383,6 +394,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
         trend: !trend_disabled,
     };
     let phase_reference = phase_reference.unwrap_or_default();
+    let nodal_corrections = nodal_corrections.unwrap_or_default();
     let reconstruction = resolve_reconstruction(
         reconstruct,
         reconstruction_constituents,
@@ -414,6 +426,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             inference,
             fit_options,
             phase_reference,
+            nodal_corrections,
             confidence_interval,
             analysis_method,
             reconstruction,
@@ -435,6 +448,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             inference,
             fit_options,
             phase_reference,
+            nodal_corrections,
             confidence_interval,
             analysis_method,
             reconstruction,
@@ -720,6 +734,18 @@ fn parse_phase_reference(value: &OsStr) -> Result<PhaseReference, String> {
     }
 }
 
+fn parse_nodal_corrections(value: &OsStr) -> Result<NodalCorrections, String> {
+    match value.to_str() {
+        Some("exact") => Ok(NodalCorrections::Exact),
+        Some("linear-time") => Ok(NodalCorrections::LinearTime),
+        Some("disabled") => Ok(NodalCorrections::Disabled),
+        Some(value) => Err(format!(
+            "--nodal must be exact, linear-time, or disabled, got {value}"
+        )),
+        None => Err("--nodal must be valid UTF-8".to_owned()),
+    }
+}
+
 fn parse_analysis_method(value: &OsStr) -> Result<bool, String> {
     match value.to_str() {
         Some("ols") => Ok(false),
@@ -810,9 +836,9 @@ mod tests {
         NodeSelection, ScalarInferenceConfig, VectorInferenceConfig,
     };
     use rutide_core::{
-        FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, PhaseReference,
-        ReconstructionFilter, RobustOptions, ScalarInferenceRelation, TidalConstituent,
-        VectorInferenceRelation,
+        FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections,
+        PhaseReference, ReconstructionFilter, RobustOptions, ScalarInferenceRelation,
+        TidalConstituent, VectorInferenceRelation,
     };
 
     fn args<'a>(values: &'a [&'a str]) -> impl Iterator<Item = OsString> + 'a {
@@ -844,6 +870,7 @@ mod tests {
         assert_eq!(config.confidence_interval, ConfidenceInterval::None);
         assert_eq!(config.analysis_method, AnalysisMethod::Ols);
         assert_eq!(config.reconstruction, None);
+        assert_eq!(config.nodal_corrections, NodalCorrections::Exact);
         assert_eq!(config.workers, 8);
     }
 
@@ -904,6 +931,8 @@ mod tests {
             "linear",
             "--phase",
             "linear-time",
+            "--nodal",
+            "linear-time",
             "--reconstruct",
         ]))
         .expect("valid vector arguments");
@@ -917,6 +946,7 @@ mod tests {
         );
         assert_eq!(config.reconstruction, Some(ReconstructionFilter::All));
         assert_eq!(config.phase_reference, PhaseReference::LinearTime);
+        assert_eq!(config.nodal_corrections, NodalCorrections::LinearTime);
         assert!(
             parse_arguments(args(&[
                 "analyze-vector",
@@ -949,6 +979,8 @@ mod tests {
             "--no-trend",
             "--phase",
             "raw",
+            "--nodal",
+            "disabled",
             "--confidence",
             "monte-carlo",
             "--mc-realizations",
@@ -974,6 +1006,7 @@ mod tests {
         );
         assert_eq!(config.fit_options, FitOptions { trend: false });
         assert_eq!(config.phase_reference, PhaseReference::Raw);
+        assert_eq!(config.nodal_corrections, NodalCorrections::Disabled);
         assert_eq!(
             config.confidence_interval,
             ConfidenceInterval::MonteCarlo {
@@ -1019,6 +1052,7 @@ mod tests {
         assert!(matches!(config.analysis_method, AnalysisMethod::Robust(_)));
         assert_eq!(config.fit_options, FitOptions::default());
         assert_eq!(config.phase_reference, PhaseReference::Greenwich);
+        assert_eq!(config.nodal_corrections, NodalCorrections::Exact);
         assert!(matches!(
             config.confidence_interval,
             ConfidenceInterval::MonteCarlo { .. }
@@ -1029,6 +1063,8 @@ mod tests {
             &["--no-trend", "--no-trend"][..],
             &["--phase", "raw", "--phase", "greenwich"][..],
             &["--phase", "linear_time"][..],
+            &["--nodal", "exact", "--nodal", "disabled"][..],
+            &["--nodal", "linear_time"][..],
             &["--infer", "S2:M2:-0.1:20"][..],
             &["--infer", "S2:M2:0.3"][..],
         ] {

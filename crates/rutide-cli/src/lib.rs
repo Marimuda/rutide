@@ -14,9 +14,9 @@ use netcdf::{FileMut, Variable, VariableMut};
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
     AnalysisError, Constituent, FitOptions, GreenwichNodalBatch, GreenwichNodalReconstructor,
-    InferenceMode, LinearConfidence, MonteCarloOptions, PhaseReference, RayleighSelection,
-    ReconstructionFilter, RobustOptions, RobustTermination, ScalarInferenceBatch,
-    ScalarInferenceRelation, ScalarSolution, SolverOptions, TidalConstituent,
+    InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections, PhaseReference,
+    RayleighSelection, ReconstructionFilter, RobustOptions, RobustTermination,
+    ScalarInferenceBatch, ScalarInferenceRelation, ScalarSolution, SolverOptions, TidalConstituent,
     VectorInferenceRelation, select_constituents_by_rayleigh,
 };
 use serde::Serialize;
@@ -27,7 +27,7 @@ mod vector;
 pub use vector::{VectorAnalyzeConfig, VectorRunReport, VectorSampleResult, analyze_vector};
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
-const OUTPUT_SCHEMA_VERSION: u32 = 10;
+const OUTPUT_SCHEMA_VERSION: u32 = 11;
 /// Backward-compatible benchmark constituent set used when none is specified.
 pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -164,6 +164,8 @@ pub struct AnalyzeConfig {
     pub fit_options: FitOptions,
     /// Astronomical argument used to reference reported phases.
     pub phase_reference: PhaseReference,
+    /// Exact, midpoint-linearized, or disabled nodal/satellite corrections.
+    pub nodal_corrections: NodalCorrections,
     /// Optional linearized or Monte Carlo confidence and its noise model.
     pub confidence_interval: ConfidenceInterval,
     /// Ordinary or Cauchy robust least squares.
@@ -369,6 +371,8 @@ pub struct RunReport {
     pub trend_enabled: bool,
     /// Astronomical phase reference: `greenwich`, `linear-time`, or `raw`.
     pub phase_reference: &'static str,
+    /// Nodal/satellite corrections: `exact`, `linear-time`, or `disabled`.
+    pub nodal_corrections: &'static str,
     /// Robust options when robust fitting is enabled.
     pub robust_options: Option<RobustOptionsReport>,
     /// Auditable constituent-selection method and threshold.
@@ -524,8 +528,10 @@ impl ScalarAnalysisBatch {
         inference: Option<&ScalarInferenceConfig>,
         fit_options: FitOptions,
         phase_reference: PhaseReference,
+        nodal_corrections: NodalCorrections,
     ) -> Result<Self, AnalysisError> {
-        let solver_options = SolverOptions::new(fit_options, phase_reference);
+        let solver_options = SolverOptions::new(fit_options, phase_reference)
+            .with_nodal_corrections(nodal_corrections);
         match inference {
             Some(inference) => {
                 ScalarInferenceBatch::prepare_modified_julian_days_with_solver_options(
@@ -604,6 +610,7 @@ impl ResolvedConstituentSelection {
         inferred: bool,
         fit_options: FitOptions,
         phase_reference: PhaseReference,
+        nodal_corrections: NodalCorrections,
     ) -> String {
         let selection = match self.report.method {
             "explicit" => "fixed-constituents",
@@ -613,10 +620,19 @@ impl ResolvedConstituentSelection {
         let inference = if inferred { "inference-" } else { "" };
         let trend = if fit_options.trend { "" } else { "-no-trend" };
         format!(
-            "{selection}-{}-nodal-{inference}{}{trend}",
+            "{selection}-{}-{}-{inference}{}{trend}",
             phase_reference.name(),
+            nodal_profile_component(nodal_corrections),
             analysis_method.name(),
         )
+    }
+}
+
+const fn nodal_profile_component(mode: NodalCorrections) -> &'static str {
+    match mode {
+        NodalCorrections::Exact => "nodal",
+        NodalCorrections::LinearTime => "nodal-linear-time",
+        NodalCorrections::Disabled => "no-nodal",
     }
 }
 
@@ -648,6 +664,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         config.inference.as_ref(),
         config.fit_options,
         config.phase_reference,
+        config.nodal_corrections,
     )?;
     if let Some(filter) = &config.reconstruction {
         validate_reconstruction_filter(filter, batch.tidal_constituents())?;
@@ -687,6 +704,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         &solutions,
         config.fit_options,
         config.phase_reference,
+        config.nodal_corrections,
         config.analysis_method,
         config.confidence_interval,
         config
@@ -723,6 +741,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             inference: config.inference.as_ref(),
             fit_options: config.fit_options,
             phase_reference: config.phase_reference,
+            nodal_corrections: config.nodal_corrections,
             analysis_method: config.analysis_method,
             confidence_interval: config.confidence_interval,
             modified_julian_days: &input.modified_julian_days,
@@ -750,6 +769,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             config.inference.is_some(),
             config.fit_options,
             config.phase_reference,
+            config.nodal_corrections,
         ),
         input_path: config.input.to_string_lossy().into_owned(),
         input_file_bytes: input.input_file_bytes,
@@ -767,6 +787,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         analysis_method: config.analysis_method.name(),
         trend_enabled: config.fit_options.trend,
         phase_reference: config.phase_reference.name(),
+        nodal_corrections: config.nodal_corrections.name(),
         robust_options: match config.analysis_method {
             AnalysisMethod::Ols => None,
             AnalysisMethod::Robust(options) => Some(options.into()),
@@ -1474,15 +1495,18 @@ fn result_digest(
     solutions: &[ScalarSolution],
     fit_options: FitOptions,
     phase_reference: PhaseReference,
+    nodal_corrections: NodalCorrections,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     inference: Option<&InferenceReport>,
     reconstruction: Option<(&ReconstructionFilter, &[Vec<f64>])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-scalar-nodal-v10\0");
+    digest.update(b"rutide-scalar-nodal-v11\0");
     digest.update([u8::from(fit_options.trend)]);
     digest.update(phase_reference.name().as_bytes());
+    digest.update([0]);
+    digest.update(nodal_corrections.name().as_bytes());
     digest.update([0]);
     digest.update(analysis_method.name().as_bytes());
     if let AnalysisMethod::Robust(options) = analysis_method {
@@ -1726,6 +1750,7 @@ struct OutputData<'data> {
     inference: Option<&'data ScalarInferenceConfig>,
     fit_options: FitOptions,
     phase_reference: PhaseReference,
+    nodal_corrections: NodalCorrections,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     modified_julian_days: &'data [f64],
@@ -1765,6 +1790,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         inference,
         fit_options,
         phase_reference,
+        nodal_corrections,
         analysis_method,
         confidence_interval,
         modified_julian_days,
@@ -1785,11 +1811,13 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         inference.is_some(),
         fit_options,
         phase_reference,
+        nodal_corrections,
     );
     output.add_attribute("profile", profile.as_str())?;
     output.add_attribute("analysis_method", analysis_method.name())?;
     output.add_attribute("trend_enabled", i64::from(fit_options.trend))?;
     output.add_attribute("phase_reference", phase_reference.name())?;
+    output.add_attribute("nodal_corrections", nodal_corrections.name())?;
     if let AnalysisMethod::Robust(options) = analysis_method {
         output.add_attribute("robust_tuning_constant", options.tuning_constant)?;
         output.add_attribute("robust_tolerance", options.tolerance)?;

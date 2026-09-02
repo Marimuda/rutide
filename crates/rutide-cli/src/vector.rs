@@ -11,8 +11,8 @@ use netcdf::{FileMut, Variable};
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
     AnalysisError, Constituent, FitOptions, GreenwichNodalBatch, GreenwichNodalReconstructor,
-    PhaseReference, ReconstructionFilter, SolverOptions, TidalConstituent, VectorInferenceBatch,
-    VectorReconstruction, VectorSolution,
+    NodalCorrections, PhaseReference, ReconstructionFilter, SolverOptions, TidalConstituent,
+    VectorInferenceBatch, VectorReconstruction, VectorSolution,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -21,15 +21,15 @@ use super::{
     AnalysisMethod, AnalyzeConfig, AppError, ConfidenceInterval, ConstituentSelection,
     ConstituentSelectionReport, InferenceReport, MILLISECONDS_PER_DAY, NodeSelection,
     ReconstructionReport, ResolvedConstituentSelection, RobustOptionsReport, StageTimings,
-    VectorInferenceConfig, encode_hex, normalize_source_observation, reconstruction_report,
-    required_dimension_length, required_variable, resolve_constituent_selection,
-    robust_termination_code, temporary_sibling, update_inference_digest,
-    update_reconstruction_filter_digest, validate_config, validate_dimensions,
-    validate_reconstruction_filter, validate_source_value, write_inference_metadata,
-    write_json_report, write_robust_schema_metadata, write_variable,
+    VectorInferenceConfig, encode_hex, nodal_profile_component, normalize_source_observation,
+    reconstruction_report, required_dimension_length, required_variable,
+    resolve_constituent_selection, robust_termination_code, temporary_sibling,
+    update_inference_digest, update_reconstruction_filter_digest, validate_config,
+    validate_dimensions, validate_reconstruction_filter, validate_source_value,
+    write_inference_metadata, write_json_report, write_robust_schema_metadata, write_variable,
 };
 
-const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 6;
+const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 7;
 
 /// Configuration for one depth-averaged FVCOM current analysis.
 #[derive(Clone, Debug, PartialEq)]
@@ -50,6 +50,8 @@ pub struct VectorAnalyzeConfig {
     pub fit_options: FitOptions,
     /// Astronomical argument used to reference reported phases.
     pub phase_reference: PhaseReference,
+    /// Exact, midpoint-linearized, or disabled nodal/satellite corrections.
+    pub nodal_corrections: NodalCorrections,
     /// Optional linearized or Monte Carlo ellipse intervals and noise model.
     pub confidence_interval: ConfidenceInterval,
     /// Ordinary or Cauchy robust least squares.
@@ -143,6 +145,8 @@ pub struct VectorRunReport {
     pub trend_enabled: bool,
     /// Astronomical phase reference: `greenwich`, `linear-time`, or `raw`.
     pub phase_reference: &'static str,
+    /// Nodal/satellite corrections: `exact`, `linear-time`, or `disabled`.
+    pub nodal_corrections: &'static str,
     /// Robust options when robust fitting is enabled.
     pub robust_options: Option<RobustOptionsReport>,
     /// Auditable constituent-selection method and threshold.
@@ -198,8 +202,10 @@ impl VectorAnalysisBatch {
         inference: Option<&VectorInferenceConfig>,
         fit_options: FitOptions,
         phase_reference: PhaseReference,
+        nodal_corrections: NodalCorrections,
     ) -> Result<Self, AnalysisError> {
-        let solver_options = SolverOptions::new(fit_options, phase_reference);
+        let solver_options = SolverOptions::new(fit_options, phase_reference)
+            .with_nodal_corrections(nodal_corrections);
         match inference {
             Some(inference) => {
                 VectorInferenceBatch::prepare_modified_julian_days_with_solver_options(
@@ -297,6 +303,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         config.inference.as_ref(),
         config.fit_options,
         config.phase_reference,
+        config.nodal_corrections,
     )?;
     if let Some(filter) = &config.reconstruction {
         validate_reconstruction_filter(filter, batch.tidal_constituents())?;
@@ -445,6 +452,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         &solutions,
         config.fit_options,
         config.phase_reference,
+        config.nodal_corrections,
         config.analysis_method,
         config.confidence_interval,
         config
@@ -474,6 +482,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             inference: config.inference.as_ref(),
             fit_options: config.fit_options,
             phase_reference: config.phase_reference,
+            nodal_corrections: config.nodal_corrections,
             analysis_method: config.analysis_method,
             confidence_interval: config.confidence_interval,
             reference_time_modified_julian_day: batch.reference_time_modified_julian_day(),
@@ -500,6 +509,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             config.inference.is_some(),
             config.fit_options,
             config.phase_reference,
+            config.nodal_corrections,
         ),
         input_path: config.input.to_string_lossy().into_owned(),
         input_file_bytes: input.input_file_bytes,
@@ -517,6 +527,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         analysis_method: config.analysis_method.name(),
         trend_enabled: config.fit_options.trend,
         phase_reference: config.phase_reference.name(),
+        nodal_corrections: config.nodal_corrections.name(),
         robust_options: match config.analysis_method {
             AnalysisMethod::Ols => None,
             AnalysisMethod::Robust(options) => Some(options.into()),
@@ -578,6 +589,7 @@ fn validate_vector_config(config: &VectorAnalyzeConfig) -> Result<(), AppError> 
         inference: None,
         fit_options: config.fit_options,
         phase_reference: config.phase_reference,
+        nodal_corrections: config.nodal_corrections,
         confidence_interval: config.confidence_interval,
         analysis_method: config.analysis_method,
         reconstruction: config.reconstruction.clone(),
@@ -602,6 +614,7 @@ fn vector_profile(
     inferred: bool,
     fit_options: FitOptions,
     phase_reference: PhaseReference,
+    nodal_corrections: NodalCorrections,
 ) -> String {
     let selection = match selection.report.method {
         "explicit" => "fixed-constituents",
@@ -611,8 +624,9 @@ fn vector_profile(
     let inference = if inferred { "inference-" } else { "" };
     let trend = if fit_options.trend { "" } else { "-no-trend" };
     format!(
-        "{selection}-{}-nodal-vector-{inference}{}{trend}",
+        "{selection}-{}-{}-vector-{inference}{}{trend}",
         phase_reference.name(),
+        nodal_profile_component(nodal_corrections),
         analysis_method.name(),
     )
 }
@@ -849,15 +863,18 @@ fn vector_result_digest(
     solutions: &[VectorSolution],
     fit_options: FitOptions,
     phase_reference: PhaseReference,
+    nodal_corrections: NodalCorrections,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     inference: Option<&InferenceReport>,
     reconstruction: Option<(&ReconstructionFilter, &[VectorReconstruction])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-vector-nodal-v6\0");
+    digest.update(b"rutide-vector-nodal-v7\0");
     digest.update([u8::from(fit_options.trend)]);
     digest.update(phase_reference.name().as_bytes());
+    digest.update([0]);
+    digest.update(nodal_corrections.name().as_bytes());
     digest.update([0]);
     digest.update(analysis_method.name().as_bytes());
     if let AnalysisMethod::Robust(options) = analysis_method {
@@ -1013,6 +1030,7 @@ struct VectorOutputData<'data> {
     inference: Option<&'data VectorInferenceConfig>,
     fit_options: FitOptions,
     phase_reference: PhaseReference,
+    nodal_corrections: NodalCorrections,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     reference_time_modified_julian_day: f64,
@@ -1061,11 +1079,13 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
         data.inference.is_some(),
         data.fit_options,
         data.phase_reference,
+        data.nodal_corrections,
     );
     output.add_attribute("profile", profile.as_str())?;
     output.add_attribute("analysis_method", data.analysis_method.name())?;
     output.add_attribute("trend_enabled", i64::from(data.fit_options.trend))?;
     output.add_attribute("phase_reference", data.phase_reference.name())?;
+    output.add_attribute("nodal_corrections", data.nodal_corrections.name())?;
     if let AnalysisMethod::Robust(options) = data.analysis_method {
         output.add_attribute("robust_tuning_constant", options.tuning_constant)?;
         output.add_attribute("robust_tolerance", options.tolerance)?;
@@ -1451,8 +1471,9 @@ mod tests {
     use std::fs;
 
     use rutide_core::{
-        FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, PhaseReference,
-        ReconstructionFilter, RobustOptions, TidalConstituent, VectorInferenceRelation,
+        FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections,
+        PhaseReference, ReconstructionFilter, RobustOptions, TidalConstituent,
+        VectorInferenceRelation,
     };
 
     use super::{
@@ -1553,6 +1574,7 @@ mod tests {
             inference: None,
             fit_options: FitOptions::default(),
             phase_reference: PhaseReference::Greenwich,
+            nodal_corrections: NodalCorrections::Exact,
             confidence_interval: ConfidenceInterval::MonteCarlo {
                 options: MonteCarloOptions {
                     realizations: 64,
@@ -1667,6 +1689,7 @@ mod tests {
             }),
             fit_options: FitOptions { trend: false },
             phase_reference: PhaseReference::Raw,
+            nodal_corrections: NodalCorrections::LinearTime,
             confidence_interval: ConfidenceInterval::MonteCarlo {
                 options: MonteCarloOptions {
                     realizations: 64,
@@ -1695,12 +1718,13 @@ mod tests {
         assert_eq!(inference_report.analysis_method, "robust");
         assert!(!inference_report.trend_enabled);
         assert_eq!(inference_report.phase_reference, "raw");
+        assert_eq!(inference_report.nodal_corrections, "linear-time");
         assert_eq!(inference_report.confidence_interval, "monte-carlo");
         assert_eq!(inference_report.monte_carlo_realizations, Some(64));
         assert_eq!(inference_report.monte_carlo_seed, Some(99));
         assert_eq!(
             inference_report.profile,
-            "fixed-constituents-raw-nodal-vector-inference-robust-no-trend"
+            "fixed-constituents-raw-nodal-linear-time-vector-inference-robust-no-trend"
         );
         let inference_output =
             netcdf::open(&inference_output_path).expect("open inferred vector output");
@@ -1735,6 +1759,14 @@ mod tests {
                 .value()
                 .expect("read phase-reference metadata"),
             netcdf::AttributeValue::Str("raw".to_owned())
+        );
+        assert_eq!(
+            inference_output
+                .attribute("nodal_corrections")
+                .expect("nodal-correction metadata")
+                .value()
+                .expect("read nodal-correction metadata"),
+            netcdf::AttributeValue::Str("linear-time".to_owned())
         );
         assert_eq!(
             inference_output
