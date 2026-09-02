@@ -1,6 +1,6 @@
 # Compatibility and stability contracts
 
-RUTide is currently version `0.1.0`. The numerical and file-format contracts are
+RUTide is currently version `0.2.0`. The numerical and file-format contracts are
 explicitly versioned, but the Rust crates remain pre-1.0 and are not published to
 crates.io yet. This document defines what downstream users can rely on while the
 remaining product work is completed.

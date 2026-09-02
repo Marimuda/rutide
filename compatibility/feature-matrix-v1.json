@@ -1,7 +1,7 @@
 {
   "$schema": "./feature-matrix.schema.json",
   "matrix_schema_version": 1,
-  "project_version": "0.1.0",
+  "project_version": "0.2.0",
   "last_reviewed": "2026-09-02",
   "python_oracle": {
     "implementation": "UTide",

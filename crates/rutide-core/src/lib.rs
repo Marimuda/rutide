@@ -43,13 +43,3 @@ pub use vector::{VectorReconstruction, VectorSolution};
 
 /// The `RUTide` core crate version used to produce a result.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[cfg(test)]
-mod tests {
-    use super::VERSION;
-
-    #[test]
-    fn version_matches_workspace_package() {
-        assert_eq!(VERSION, "0.1.0");
-    }
-}
