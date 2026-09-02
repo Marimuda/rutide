@@ -13,10 +13,10 @@ use std::{
 use netcdf::{FileMut, Variable, VariableMut};
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
-    AnalysisError, Constituent, GreenwichNodalBatch, GreenwichNodalReconstructor, InferenceMode,
-    LinearConfidence, MonteCarloOptions, RayleighSelection, ReconstructionFilter, RobustOptions,
-    RobustTermination, ScalarInferenceBatch, ScalarInferenceRelation, ScalarSolution,
-    TidalConstituent, VectorInferenceRelation, select_constituents_by_rayleigh,
+    AnalysisError, Constituent, FitOptions, GreenwichNodalBatch, GreenwichNodalReconstructor,
+    InferenceMode, LinearConfidence, MonteCarloOptions, RayleighSelection, ReconstructionFilter,
+    RobustOptions, RobustTermination, ScalarInferenceBatch, ScalarInferenceRelation,
+    ScalarSolution, TidalConstituent, VectorInferenceRelation, select_constituents_by_rayleigh,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -26,7 +26,7 @@ mod vector;
 pub use vector::{VectorAnalyzeConfig, VectorRunReport, VectorSampleResult, analyze_vector};
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
-const OUTPUT_SCHEMA_VERSION: u32 = 8;
+const OUTPUT_SCHEMA_VERSION: u32 = 9;
 /// Backward-compatible benchmark constituent set used when none is specified.
 pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -159,6 +159,8 @@ pub struct AnalyzeConfig {
     pub constituent_selection: ConstituentSelection,
     /// Optional constrained inferred constituents.
     pub inference: Option<ScalarInferenceConfig>,
+    /// Mean/trend terms included in the harmonic fit.
+    pub fit_options: FitOptions,
     /// Optional linearized or Monte Carlo confidence and its noise model.
     pub confidence_interval: ConfidenceInterval,
     /// Ordinary or Cauchy robust least squares.
@@ -360,6 +362,8 @@ pub struct RunReport {
     pub workers: usize,
     /// Least-squares method: `ols` or `robust`.
     pub analysis_method: &'static str,
+    /// Whether a linear trend was included alongside the fitted mean.
+    pub trend_enabled: bool,
     /// Robust options when robust fitting is enabled.
     pub robust_options: Option<RobustOptionsReport>,
     /// Auditable constituent-selection method and threshold.
@@ -513,18 +517,21 @@ impl ScalarAnalysisBatch {
         modified_julian_days: &[f64],
         constituents: &[TidalConstituent],
         inference: Option<&ScalarInferenceConfig>,
+        fit_options: FitOptions,
     ) -> Result<Self, AnalysisError> {
         match inference {
-            Some(inference) => ScalarInferenceBatch::prepare_modified_julian_days(
+            Some(inference) => ScalarInferenceBatch::prepare_modified_julian_days_with_options(
                 modified_julian_days,
                 constituents,
                 &inference.relationships,
                 inference.mode,
+                fit_options,
             )
             .map(Self::Inferred),
-            None => GreenwichNodalBatch::prepare_modified_julian_days(
+            None => GreenwichNodalBatch::prepare_modified_julian_days_with_options(
                 modified_julian_days,
                 constituents,
+                fit_options,
             )
             .map(Self::Standard),
         }
@@ -582,7 +589,41 @@ struct ResolvedConstituentSelection {
 }
 
 impl ResolvedConstituentSelection {
-    fn profile(&self, analysis_method: AnalysisMethod, inferred: bool) -> &'static str {
+    fn profile(
+        &self,
+        analysis_method: AnalysisMethod,
+        inferred: bool,
+        fit_options: FitOptions,
+    ) -> &'static str {
+        if !fit_options.trend {
+            return match (self.report.method, analysis_method, inferred) {
+                ("explicit", AnalysisMethod::Ols, false) => {
+                    "fixed-constituents-greenwich-nodal-ols-no-trend"
+                }
+                ("rayleigh", AnalysisMethod::Ols, false) => {
+                    "rayleigh-auto-greenwich-nodal-ols-no-trend"
+                }
+                ("explicit", AnalysisMethod::Robust(_), false) => {
+                    "fixed-constituents-greenwich-nodal-robust-no-trend"
+                }
+                ("rayleigh", AnalysisMethod::Robust(_), false) => {
+                    "rayleigh-auto-greenwich-nodal-robust-no-trend"
+                }
+                ("explicit", AnalysisMethod::Ols, true) => {
+                    "fixed-constituents-greenwich-nodal-inference-ols-no-trend"
+                }
+                ("rayleigh", AnalysisMethod::Ols, true) => {
+                    "rayleigh-auto-greenwich-nodal-inference-ols-no-trend"
+                }
+                ("explicit", AnalysisMethod::Robust(_), true) => {
+                    "fixed-constituents-greenwich-nodal-inference-robust-no-trend"
+                }
+                ("rayleigh", AnalysisMethod::Robust(_), true) => {
+                    "rayleigh-auto-greenwich-nodal-inference-robust-no-trend"
+                }
+                _ => unreachable!("selection methods are constructed internally"),
+            };
+        }
         if inferred {
             return match (self.report.method, analysis_method) {
                 ("explicit", AnalysisMethod::Ols) => {
@@ -634,6 +675,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         &input.modified_julian_days,
         &selection.constituents,
         config.inference.as_ref(),
+        config.fit_options,
     )?;
     if let Some(filter) = &config.reconstruction {
         validate_reconstruction_filter(filter, batch.tidal_constituents())?;
@@ -671,6 +713,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         batch.constituents(),
         &series_frequency_cph,
         &solutions,
+        config.fit_options,
         config.analysis_method,
         config.confidence_interval,
         config
@@ -705,6 +748,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             result_sha256: &result_sha256,
             selection: &selection,
             inference: config.inference.as_ref(),
+            fit_options: config.fit_options,
             analysis_method: config.analysis_method,
             confidence_interval: config.confidence_interval,
             modified_julian_days: &input.modified_julian_days,
@@ -727,7 +771,11 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         schema_version: OUTPUT_SCHEMA_VERSION,
         created_unix_seconds,
         rutide_version: rutide_core::VERSION,
-        profile: selection.profile(config.analysis_method, config.inference.is_some()),
+        profile: selection.profile(
+            config.analysis_method,
+            config.inference.is_some(),
+            config.fit_options,
+        ),
         input_path: config.input.to_string_lossy().into_owned(),
         input_file_bytes: input.input_file_bytes,
         logical_input_bytes: input.logical_input_bytes,
@@ -742,6 +790,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             .count(),
         workers: config.workers,
         analysis_method: config.analysis_method.name(),
+        trend_enabled: config.fit_options.trend,
         robust_options: match config.analysis_method {
             AnalysisMethod::Ols => None,
             AnalysisMethod::Robust(options) => Some(options.into()),
@@ -1446,13 +1495,15 @@ fn result_digest(
     constituents: &[Constituent],
     series_frequency_cph: &[Vec<f64>],
     solutions: &[ScalarSolution],
+    fit_options: FitOptions,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     inference: Option<&InferenceReport>,
     reconstruction: Option<(&ReconstructionFilter, &[Vec<f64>])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-scalar-greenwich-nodal-v8\0");
+    digest.update(b"rutide-scalar-greenwich-nodal-v9\0");
+    digest.update([u8::from(fit_options.trend)]);
     digest.update(analysis_method.name().as_bytes());
     if let AnalysisMethod::Robust(options) = analysis_method {
         digest.update(options.tuning_constant.to_bits().to_le_bytes());
@@ -1693,6 +1744,7 @@ struct OutputData<'data> {
     result_sha256: &'data str,
     selection: &'data ResolvedConstituentSelection,
     inference: Option<&'data ScalarInferenceConfig>,
+    fit_options: FitOptions,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     modified_julian_days: &'data [f64],
@@ -1730,6 +1782,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         result_sha256,
         selection,
         inference,
+        fit_options,
         analysis_method,
         confidence_interval,
         modified_julian_days,
@@ -1747,9 +1800,10 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
     output.add_attribute("rutide_version", rutide_core::VERSION)?;
     output.add_attribute(
         "profile",
-        selection.profile(analysis_method, inference.is_some()),
+        selection.profile(analysis_method, inference.is_some(), fit_options),
     )?;
     output.add_attribute("analysis_method", analysis_method.name())?;
+    output.add_attribute("trend_enabled", i64::from(fit_options.trend))?;
     if let AnalysisMethod::Robust(options) = analysis_method {
         output.add_attribute("robust_tuning_constant", options.tuning_constant)?;
         output.add_attribute("robust_tolerance", options.tolerance)?;

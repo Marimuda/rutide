@@ -10,7 +10,7 @@ use std::{
 use netcdf::{FileMut, Variable};
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
-    AnalysisError, Constituent, GreenwichNodalBatch, GreenwichNodalReconstructor,
+    AnalysisError, Constituent, FitOptions, GreenwichNodalBatch, GreenwichNodalReconstructor,
     ReconstructionFilter, TidalConstituent, VectorInferenceBatch, VectorReconstruction,
     VectorSolution,
 };
@@ -29,7 +29,7 @@ use super::{
     write_json_report, write_robust_schema_metadata, write_variable,
 };
 
-const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 4;
+const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 5;
 
 /// Configuration for one depth-averaged FVCOM current analysis.
 #[derive(Clone, Debug, PartialEq)]
@@ -46,6 +46,8 @@ pub struct VectorAnalyzeConfig {
     pub constituent_selection: ConstituentSelection,
     /// Optional constrained positive/negative rotary inferred constituents.
     pub inference: Option<VectorInferenceConfig>,
+    /// Mean/trend terms included in the harmonic fit.
+    pub fit_options: FitOptions,
     /// Optional linearized or Monte Carlo ellipse intervals and noise model.
     pub confidence_interval: ConfidenceInterval,
     /// Ordinary or Cauchy robust least squares.
@@ -135,6 +137,8 @@ pub struct VectorRunReport {
     pub workers: usize,
     /// Least-squares method: `ols` or `robust`.
     pub analysis_method: &'static str,
+    /// Whether a linear trend was included alongside the fitted mean.
+    pub trend_enabled: bool,
     /// Robust options when robust fitting is enabled.
     pub robust_options: Option<RobustOptionsReport>,
     /// Auditable constituent-selection method and threshold.
@@ -188,17 +192,23 @@ impl VectorAnalysisBatch {
         times: &[f64],
         constituents: &[TidalConstituent],
         inference: Option<&VectorInferenceConfig>,
+        fit_options: FitOptions,
     ) -> Result<Self, AnalysisError> {
         match inference {
-            Some(inference) => VectorInferenceBatch::prepare_modified_julian_days(
+            Some(inference) => VectorInferenceBatch::prepare_modified_julian_days_with_options(
                 times,
                 constituents,
                 &inference.relationships,
                 inference.mode,
+                fit_options,
             )
             .map(Self::Inferred),
-            None => GreenwichNodalBatch::prepare_modified_julian_days(times, constituents)
-                .map(Self::Standard),
+            None => GreenwichNodalBatch::prepare_modified_julian_days_with_options(
+                times,
+                constituents,
+                fit_options,
+            )
+            .map(Self::Standard),
         }
     }
 
@@ -277,6 +287,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         &input.modified_julian_days,
         &selection.constituents,
         config.inference.as_ref(),
+        config.fit_options,
     )?;
     if let Some(filter) = &config.reconstruction {
         validate_reconstruction_filter(filter, batch.tidal_constituents())?;
@@ -423,6 +434,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         batch.constituents(),
         &series_frequency_cph,
         &solutions,
+        config.fit_options,
         config.analysis_method,
         config.confidence_interval,
         config
@@ -450,6 +462,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             result_sha256: &result_sha256,
             selection: &selection,
             inference: config.inference.as_ref(),
+            fit_options: config.fit_options,
             analysis_method: config.analysis_method,
             confidence_interval: config.confidence_interval,
             reference_time_modified_julian_day: batch.reference_time_modified_julian_day(),
@@ -474,6 +487,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             &selection,
             config.analysis_method,
             config.inference.is_some(),
+            config.fit_options,
         ),
         input_path: config.input.to_string_lossy().into_owned(),
         input_file_bytes: input.input_file_bytes,
@@ -489,6 +503,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             .count(),
         workers: config.workers,
         analysis_method: config.analysis_method.name(),
+        trend_enabled: config.fit_options.trend,
         robust_options: match config.analysis_method {
             AnalysisMethod::Ols => None,
             AnalysisMethod::Robust(options) => Some(options.into()),
@@ -548,6 +563,7 @@ fn validate_vector_config(config: &VectorAnalyzeConfig) -> Result<(), AppError> 
         nodes: config.elements.clone(),
         constituent_selection: config.constituent_selection.clone(),
         inference: None,
+        fit_options: config.fit_options,
         confidence_interval: config.confidence_interval,
         analysis_method: config.analysis_method,
         reconstruction: config.reconstruction.clone(),
@@ -570,7 +586,37 @@ fn vector_profile(
     selection: &ResolvedConstituentSelection,
     analysis_method: AnalysisMethod,
     inferred: bool,
+    fit_options: FitOptions,
 ) -> &'static str {
+    if !fit_options.trend {
+        return match (selection.report.method, analysis_method, inferred) {
+            ("explicit", AnalysisMethod::Ols, false) => {
+                "fixed-constituents-greenwich-nodal-vector-ols-no-trend"
+            }
+            ("rayleigh", AnalysisMethod::Ols, false) => {
+                "rayleigh-auto-greenwich-nodal-vector-ols-no-trend"
+            }
+            ("explicit", AnalysisMethod::Robust(_), false) => {
+                "fixed-constituents-greenwich-nodal-vector-robust-no-trend"
+            }
+            ("rayleigh", AnalysisMethod::Robust(_), false) => {
+                "rayleigh-auto-greenwich-nodal-vector-robust-no-trend"
+            }
+            ("explicit", AnalysisMethod::Ols, true) => {
+                "fixed-constituents-greenwich-nodal-vector-inference-ols-no-trend"
+            }
+            ("rayleigh", AnalysisMethod::Ols, true) => {
+                "rayleigh-auto-greenwich-nodal-vector-inference-ols-no-trend"
+            }
+            ("explicit", AnalysisMethod::Robust(_), true) => {
+                "fixed-constituents-greenwich-nodal-vector-inference-robust-no-trend"
+            }
+            ("rayleigh", AnalysisMethod::Robust(_), true) => {
+                "rayleigh-auto-greenwich-nodal-vector-inference-robust-no-trend"
+            }
+            _ => unreachable!("selection methods are constructed internally"),
+        };
+    }
     if inferred {
         return match (selection.report.method, analysis_method) {
             ("explicit", AnalysisMethod::Ols) => {
@@ -829,13 +875,15 @@ fn vector_result_digest(
     constituents: &[Constituent],
     series_frequency_cph: &[Vec<f64>],
     solutions: &[VectorSolution],
+    fit_options: FitOptions,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     inference: Option<&InferenceReport>,
     reconstruction: Option<(&ReconstructionFilter, &[VectorReconstruction])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-vector-greenwich-nodal-v4\0");
+    digest.update(b"rutide-vector-greenwich-nodal-v5\0");
+    digest.update([u8::from(fit_options.trend)]);
     digest.update(analysis_method.name().as_bytes());
     if let AnalysisMethod::Robust(options) = analysis_method {
         digest.update(options.tuning_constant.to_bits().to_le_bytes());
@@ -988,6 +1036,7 @@ struct VectorOutputData<'data> {
     result_sha256: &'data str,
     selection: &'data ResolvedConstituentSelection,
     inference: Option<&'data VectorInferenceConfig>,
+    fit_options: FitOptions,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     reference_time_modified_julian_day: f64,
@@ -1036,9 +1085,11 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
             data.selection,
             data.analysis_method,
             data.inference.is_some(),
+            data.fit_options,
         ),
     )?;
     output.add_attribute("analysis_method", data.analysis_method.name())?;
+    output.add_attribute("trend_enabled", i64::from(data.fit_options.trend))?;
     if let AnalysisMethod::Robust(options) = data.analysis_method {
         output.add_attribute("robust_tuning_constant", options.tuning_constant)?;
         output.add_attribute("robust_tolerance", options.tolerance)?;
@@ -1424,8 +1475,8 @@ mod tests {
     use std::fs;
 
     use rutide_core::{
-        InferenceMode, LinearConfidence, MonteCarloOptions, ReconstructionFilter, RobustOptions,
-        TidalConstituent, VectorInferenceRelation,
+        FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, ReconstructionFilter,
+        RobustOptions, TidalConstituent, VectorInferenceRelation,
     };
 
     use super::{
@@ -1524,6 +1575,7 @@ mod tests {
                 TidalConstituent::K1,
             ]),
             inference: None,
+            fit_options: FitOptions::default(),
             confidence_interval: ConfidenceInterval::MonteCarlo {
                 options: MonteCarloOptions {
                     realizations: 64,
@@ -1636,6 +1688,7 @@ mod tests {
                     ),
                 ],
             }),
+            fit_options: FitOptions { trend: false },
             confidence_interval: ConfidenceInterval::MonteCarlo {
                 options: MonteCarloOptions {
                     realizations: 64,
@@ -1662,12 +1715,13 @@ mod tests {
             "exact"
         );
         assert_eq!(inference_report.analysis_method, "robust");
+        assert!(!inference_report.trend_enabled);
         assert_eq!(inference_report.confidence_interval, "monte-carlo");
         assert_eq!(inference_report.monte_carlo_realizations, Some(64));
         assert_eq!(inference_report.monte_carlo_seed, Some(99));
         assert_eq!(
             inference_report.profile,
-            "fixed-constituents-greenwich-nodal-vector-inference-robust"
+            "fixed-constituents-greenwich-nodal-vector-inference-robust-no-trend"
         );
         let inference_output =
             netcdf::open(&inference_output_path).expect("open inferred vector output");
@@ -1689,6 +1743,14 @@ mod tests {
         );
         assert_eq!(
             inference_output
+                .attribute("trend_enabled")
+                .expect("trend metadata")
+                .value()
+                .expect("read trend metadata"),
+            netcdf::AttributeValue::Longlong(0)
+        );
+        assert_eq!(
+            inference_output
                 .attribute("confidence_interval")
                 .expect("confidence method")
                 .value()
@@ -1703,6 +1765,17 @@ mod tests {
                 .expect("read Monte Carlo seed"),
             netcdf::AttributeValue::Ulonglong(99)
         );
+        for name in ["eastward_slope", "northward_slope"] {
+            assert!(
+                inference_output
+                    .variable(name)
+                    .expect("slope variable")
+                    .get_values::<f64, _>(..)
+                    .expect("read slopes")
+                    .iter()
+                    .all(|value| value.to_bits() == 0.0_f64.to_bits())
+            );
+        }
         assert_eq!(
             inference_output
                 .variable("semi_major")

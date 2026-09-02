@@ -13,8 +13,8 @@ use rutide_cli::{
     analyze_scalar, analyze_vector,
 };
 use rutide_core::{
-    InferenceMode, LinearConfidence, MonteCarloOptions, ReconstructionFilter, RobustOptions,
-    ScalarInferenceRelation, TidalConstituent, VectorInferenceRelation,
+    FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, ReconstructionFilter,
+    RobustOptions, ScalarInferenceRelation, TidalConstituent, VectorInferenceRelation,
 };
 
 // The application repeatedly allocates short-lived QR storage across worker
@@ -40,6 +40,7 @@ Options:
   --infer SPEC        Repeatable inferred relationship:
                       scalar I:R:AMP:PHASE; vector I:R:AMP+:PHASE+:AMP-:PHASE-
   --infer-approximate Use Python-compatible reference-only approximate inference
+  --no-trend         Fit a mean without a linear trend (default: mean and trend)
   --method MODE       Least squares: ols or robust (default: ols)
   --robust-tuning X   Cauchy tuning constant (default: 2.385)
   --robust-tolerance X
@@ -148,6 +149,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let mut scalar_inference_relationships = Vec::new();
     let mut vector_inference_relationships = Vec::new();
     let mut inference_approximate = false;
+    let mut trend_disabled = false;
     let mut robust_requested = None;
     let mut robust_tuning = None;
     let mut robust_tolerance = None;
@@ -233,6 +235,12 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                     return Err("--infer-approximate may only be supplied once".to_owned());
                 }
                 inference_approximate = true;
+            }
+            "--no-trend" => {
+                if trend_disabled {
+                    return Err("--no-trend may only be supplied once".to_owned());
+                }
+                trend_disabled = true;
             }
             "--method" => {
                 if robust_requested.is_some() {
@@ -359,6 +367,9 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     } else {
         InferenceMode::Exact
     };
+    let fit_options = FitOptions {
+        trend: !trend_disabled,
+    };
     let reconstruction = resolve_reconstruction(
         reconstruct,
         reconstruction_constituents,
@@ -388,6 +399,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             elements: selection,
             constituent_selection,
             inference,
+            fit_options,
             confidence_interval,
             analysis_method,
             reconstruction,
@@ -407,6 +419,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             nodes: selection,
             constituent_selection,
             inference,
+            fit_options,
             confidence_interval,
             analysis_method,
             reconstruction,
@@ -770,8 +783,8 @@ mod tests {
         NodeSelection, ScalarInferenceConfig, VectorInferenceConfig,
     };
     use rutide_core::{
-        InferenceMode, LinearConfidence, MonteCarloOptions, ReconstructionFilter, RobustOptions,
-        ScalarInferenceRelation, TidalConstituent, VectorInferenceRelation,
+        FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, ReconstructionFilter,
+        RobustOptions, ScalarInferenceRelation, TidalConstituent, VectorInferenceRelation,
     };
 
     fn args<'a>(values: &'a [&'a str]) -> impl Iterator<Item = OsString> + 'a {
@@ -898,6 +911,7 @@ mod tests {
             "--infer",
             "S2:M2:0.35:20",
             "--infer-approximate",
+            "--no-trend",
             "--confidence",
             "monte-carlo",
             "--mc-realizations",
@@ -921,6 +935,7 @@ mod tests {
                 )],
             })
         );
+        assert_eq!(config.fit_options, FitOptions { trend: false });
         assert_eq!(
             config.confidence_interval,
             ConfidenceInterval::MonteCarlo {
@@ -964,6 +979,7 @@ mod tests {
             })
         );
         assert!(matches!(config.analysis_method, AnalysisMethod::Robust(_)));
+        assert_eq!(config.fit_options, FitOptions::default());
         assert!(matches!(
             config.confidence_interval,
             ConfidenceInterval::MonteCarlo { .. }
@@ -971,6 +987,7 @@ mod tests {
 
         for invalid in [
             &["--infer-approximate"][..],
+            &["--no-trend", "--no-trend"][..],
             &["--infer", "S2:M2:-0.1:20"][..],
             &["--infer", "S2:M2:0.3"][..],
         ] {
