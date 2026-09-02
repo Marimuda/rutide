@@ -23,8 +23,8 @@ within a schema version. Both crates require Rust 1.98 and forbid unsafe code.
 
 The compiled schema constants are public as
 `rutide_cli::SCALAR_OUTPUT_SCHEMA_VERSION` and
-`rutide_cli::VECTOR_OUTPUT_SCHEMA_VERSION`. They currently identify scalar v15
-and vector v13.
+`rutide_cli::VECTOR_OUTPUT_SCHEMA_VERSION`. They currently identify scalar v16
+and vector v14.
 
 A schema version covers dimension names and order, required variables, variable
 meaning and units, enumerated flag values, required global attributes, and JSON
@@ -66,3 +66,28 @@ The machine-readable status is
 validated against
 [`compatibility/feature-matrix.schema.json`](compatibility/feature-matrix.schema.json)
 and checked against compiled constants in the Rust test suite.
+
+## Solver-option composition
+
+Every valid Cartesian combination of the documented scalar/vector solver axes is
+supported. This includes regular, gappy-grid, and irregular sampling; explicit
+or Rayleigh selection; no, exact, or approximate inference; OLS or any robust
+weight; optional trend; every phase and nodal mode; no, linear, or Monte Carlo
+confidence with white or colored noise; every presentation order; and every
+reconstruction filter.
+
+The versioned
+[`compatibility/solver-option-matrix-v1.json`](compatibility/solver-option-matrix-v1.json)
+is the normative list of axis values, explicit rejection constraints, Python
+parity exceptions, and retained evidence. Its schema is
+[`compatibility/solver-option-matrix.schema.json`](compatibility/solver-option-matrix.schema.json).
+The matrix uses a supported-by-default composition rule: combinations are not
+silently omitted, and invalid combinations such as SNR without confidence are
+named and rejected during validation.
+
+The fundamental trend, phase, nodal, scope, and inference-mode cross-product is
+executed as a test. Dense seam tests additionally combine robust fitting,
+irregular missing observations, colored confidence, inference, alternative
+astronomical conventions, Monte Carlo propagation, ordering, and reconstruction.
+Where Python UTide has an executable path, values are frozen against the pinned
+oracle; otherwise the matrix identifies the path as a tested Rust extension.

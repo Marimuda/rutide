@@ -4289,8 +4289,7 @@ impl GreenwichNodalBatch {
     ///
     /// # Errors
     ///
-    /// Returns [`AnalysisError`] for invalid input or when colored noise is
-    /// requested for non-equidistant timestamps.
+    /// Returns [`AnalysisError`] for invalid input or confidence estimation.
     pub fn solve_time_major_with_linear_confidence(
         &self,
         observations: &[f64],

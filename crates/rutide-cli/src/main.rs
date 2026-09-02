@@ -1081,18 +1081,20 @@ mod tests {
                 max_iterations: 75,
             })
         );
-        assert!(
-            parse_arguments(args(&[
+        for robust_option in [
+            &["--robust-tuning", "2.5"][..],
+            &["--robust-weight", "welsch"][..],
+        ] {
+            let mut values = vec![
                 "analyze-scalar",
                 "--input",
                 "input.nc",
                 "--output",
                 "output.nc",
-                "--robust-tuning",
-                "2.5",
-            ]))
-            .is_err()
-        );
+            ];
+            values.extend_from_slice(robust_option);
+            assert!(parse_arguments(args(&values)).is_err());
+        }
         let command = parse_arguments(args(&[
             "analyze-vector",
             "--input",

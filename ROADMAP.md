@@ -225,7 +225,7 @@ comparison adds 0.05–2.24% over scalar linear-confidence time and 27.73–33.7
 over vector time, with deterministic 1/16-worker checksums. Python speedup is not
 reported because the Python implementation rejects the combination.
 
-## 5. Solver-option parity — in progress
+## 5. Solver-option parity — complete
 
 - **Complete:** make the linear trend optional while retaining a fitted mean.
   The core and FVCOM scalar/vector APIs cover ordinary and inferred
@@ -266,8 +266,16 @@ reported because the Python implementation rejects the combination.
   Python fit. Pinned epoch constants, leap dates, invalid civil components,
   missing-time oracle parity, and FVCOM scalar/vector fill rows are covered.
 
-Each remaining option combination needs focused oracle coverage. Unsupported
-combinations must be rejected during validation rather than partially applied.
+The supported-by-default Cartesian composition rule, all public axis values,
+explicit rejection constraints, parity exceptions, and evidence are frozen in
+`compatibility/solver-option-matrix-v1.json`. The fundamental scalar/vector,
+ordinary/inferred, trend, phase, and nodal cross-product is executed directly.
+A dense pinned-Python scalar seam combines approximate inference, Welsch IRLS,
+no trend, linear-time phase, disabled nodal corrections, irregular missing
+observations, and Lomb–Scargle colored confidence. Existing dense application
+coverage supplies Monte Carlo inference, ordering, and reconstruction seams.
+Unsupported input combinations are named in the matrix and rejected during
+validation rather than partially applied.
 
 ## 6. Product and resource work — planned
 

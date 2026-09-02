@@ -43,6 +43,14 @@ pub const FEATURE_MATRIX_JSON: &str = include_str!("../../../compatibility/featu
 /// JSON Schema describing [`FEATURE_MATRIX_JSON`].
 pub const FEATURE_MATRIX_SCHEMA_JSON: &str =
     include_str!("../../../compatibility/feature-matrix.schema.json");
+/// Schema version of the embedded solver-option compatibility matrix.
+pub const SOLVER_OPTION_MATRIX_SCHEMA_VERSION: u32 = 1;
+/// Machine-readable solver-option composition, rejection, and evidence contract.
+pub const SOLVER_OPTION_MATRIX_JSON: &str =
+    include_str!("../../../compatibility/solver-option-matrix-v1.json");
+/// JSON Schema describing [`SOLVER_OPTION_MATRIX_JSON`].
+pub const SOLVER_OPTION_MATRIX_SCHEMA_JSON: &str =
+    include_str!("../../../compatibility/solver-option-matrix.schema.json");
 const DEFAULT_OBSERVATION_CHUNK_BYTES: usize = 512 * 1024 * 1024;
 /// Backward-compatible benchmark constituent set used when none is specified.
 pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
@@ -3432,10 +3440,12 @@ mod tests {
     use super::{
         ConstituentOrder, FEATURE_MATRIX_JSON, FEATURE_MATRIX_SCHEMA_JSON,
         FEATURE_MATRIX_SCHEMA_VERSION, NodeSelection, SCALAR_OUTPUT_SCHEMA_VERSION,
-        ScalarInferenceConfig, VECTOR_OUTPUT_SCHEMA_VERSION, constituent_order_indices, encode_hex,
-        normalize_source_observation, read_fvcom_scalar, resolve_node_selection,
-        spatial_chunk_plan, summarize_sampling, temporary_sibling, update_robust_options_digest,
-        write_inference_metadata, write_reconstruction_variables, write_sampling_diagnostics,
+        SOLVER_OPTION_MATRIX_JSON, SOLVER_OPTION_MATRIX_SCHEMA_JSON,
+        SOLVER_OPTION_MATRIX_SCHEMA_VERSION, ScalarInferenceConfig, VECTOR_OUTPUT_SCHEMA_VERSION,
+        constituent_order_indices, encode_hex, normalize_source_observation, read_fvcom_scalar,
+        resolve_node_selection, spatial_chunk_plan, summarize_sampling, temporary_sibling,
+        update_robust_options_digest, write_inference_metadata, write_reconstruction_variables,
+        write_sampling_diagnostics,
     };
     use rutide_core::{
         CATALOG_ORACLE_REVISION, Constituent, GreenwichNodalOls, InferenceMode, LinearConfidence,
@@ -3524,6 +3534,152 @@ mod tests {
             for path in evidence {
                 let path = path.as_str().expect("evidence path");
                 assert!(workspace.join(path).exists(), "missing evidence: {path}");
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the contract test validates every matrix axis, evidence path, and coverage value"
+    )]
+    fn embedded_solver_option_matrix_is_complete_and_consistent() {
+        let matrix: Value =
+            serde_json::from_str(SOLVER_OPTION_MATRIX_JSON).expect("valid solver-option matrix");
+        let schema: Value = serde_json::from_str(SOLVER_OPTION_MATRIX_SCHEMA_JSON)
+            .expect("valid solver-option matrix schema");
+        assert_eq!(
+            schema["properties"]["matrix_schema_version"]["const"],
+            Value::from(SOLVER_OPTION_MATRIX_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            matrix["matrix_schema_version"],
+            Value::from(SOLVER_OPTION_MATRIX_SCHEMA_VERSION)
+        );
+        assert_eq!(matrix["python_oracle_revision"], CATALOG_ORACLE_REVISION);
+        assert_eq!(matrix["composition"]["default_status"], "supported");
+
+        let axes = matrix["axes"].as_object().expect("solver-option axes");
+        let expected_axis_names = [
+            "analysis_method",
+            "confidence_method",
+            "confidence_noise",
+            "constituent_order",
+            "constituent_selection",
+            "inference",
+            "nodal_corrections",
+            "phase_reference",
+            "reconstruction",
+            "robust_weight",
+            "sampling",
+            "scope",
+            "trend",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            axes.keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_axis_names
+        );
+
+        let axis_values = axes
+            .iter()
+            .map(|(axis, values)| {
+                let values = values
+                    .as_array()
+                    .expect("axis value array")
+                    .iter()
+                    .map(|value| value.as_str().expect("axis string value"))
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert!(!values.is_empty(), "empty solver-option axis: {axis}");
+                (axis.as_str(), values)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            axis_values["phase_reference"],
+            ["greenwich", "linear-time", "raw"].into_iter().collect()
+        );
+        assert_eq!(
+            axis_values["nodal_corrections"],
+            ["disabled", "exact", "linear-time"].into_iter().collect()
+        );
+        let mut robust_weights = [
+            RobustWeightFunction::Andrews,
+            RobustWeightFunction::Bisquare,
+            RobustWeightFunction::Cauchy,
+            RobustWeightFunction::Fair,
+            RobustWeightFunction::Huber,
+            RobustWeightFunction::Logistic,
+            RobustWeightFunction::Ols,
+            RobustWeightFunction::Talwar,
+            RobustWeightFunction::Welsch,
+        ]
+        .into_iter()
+        .map(RobustWeightFunction::name)
+        .collect::<std::collections::BTreeSet<_>>();
+        robust_weights.insert("not-applicable");
+        assert_eq!(axis_values["robust_weight"], robust_weights);
+
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut covered = axes
+            .keys()
+            .map(|axis| (axis.as_str(), std::collections::BTreeSet::new()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let coverage = matrix["coverage"].as_array().expect("coverage entries");
+        let coverage_ids = coverage
+            .iter()
+            .map(|entry| entry["id"].as_str().expect("coverage identifier"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            coverage_ids.len(),
+            coverage.len(),
+            "duplicate coverage identifier"
+        );
+        for entry in coverage {
+            for (axis, values) in entry["covers"].as_object().expect("covered axes") {
+                let allowed = axis_values
+                    .get(axis.as_str())
+                    .unwrap_or_else(|| panic!("unknown covered axis: {axis}"));
+                let observed = covered.get_mut(axis.as_str()).expect("known covered axis");
+                for value in values.as_array().expect("covered value array") {
+                    let value = value.as_str().expect("covered string value");
+                    assert!(
+                        allowed.contains(value),
+                        "unknown {axis} coverage value: {value}"
+                    );
+                    observed.insert(value);
+                }
+            }
+            for path in entry["evidence"].as_array().expect("coverage evidence") {
+                let path = path.as_str().expect("coverage evidence path");
+                assert!(workspace.join(path).exists(), "missing evidence: {path}");
+            }
+        }
+        assert_eq!(
+            covered, axis_values,
+            "every declared axis value needs evidence"
+        );
+
+        for collection in ["rejection_constraints", "parity_exceptions"] {
+            let entries = matrix[collection].as_array().expect("contract entries");
+            let ids = entries
+                .iter()
+                .map(|entry| entry["id"].as_str().expect("contract identifier"))
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                ids.len(),
+                entries.len(),
+                "duplicate {collection} identifier"
+            );
+            for entry in entries {
+                if let Some(evidence) = entry.get("evidence") {
+                    for path in evidence.as_array().expect("exception evidence") {
+                        let path = path.as_str().expect("exception evidence path");
+                        assert!(workspace.join(path).exists(), "missing evidence: {path}");
+                    }
+                }
             }
         }
     }

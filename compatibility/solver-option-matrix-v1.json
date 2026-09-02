@@ -1,0 +1,298 @@
+{
+  "$schema": "./solver-option-matrix.schema.json",
+  "matrix_schema_version": 1,
+  "last_reviewed": "2026-09-02",
+  "python_oracle_revision": "8fabe121752bc317931472a10a42e306715106de",
+  "composition": {
+    "default_status": "supported",
+    "statement": "Every Cartesian product of the listed axis values is supported for scalar and vector analysis when the rejection constraints are satisfied. Parity exceptions identify scientifically supported Rust extensions rather than unsupported combinations."
+  },
+  "axes": {
+    "scope": ["scalar", "vector"],
+    "sampling": ["regular", "gappy-regular-grid", "irregular"],
+    "constituent_selection": ["explicit", "rayleigh"],
+    "inference": ["none", "exact", "approximate"],
+    "analysis_method": ["ols", "robust"],
+    "robust_weight": [
+      "not-applicable",
+      "andrews",
+      "bisquare",
+      "cauchy",
+      "fair",
+      "huber",
+      "logistic",
+      "ols",
+      "talwar",
+      "welsch"
+    ],
+    "trend": ["enabled", "disabled"],
+    "phase_reference": ["greenwich", "linear-time", "raw"],
+    "nodal_corrections": ["exact", "linear-time", "disabled"],
+    "confidence_method": ["none", "linear", "monte-carlo"],
+    "confidence_noise": ["not-applicable", "white", "colored"],
+    "constituent_order": [
+      "selection",
+      "frequency",
+      "percent-energy",
+      "signal-to-noise",
+      "explicit-permutation"
+    ],
+    "reconstruction": [
+      "none",
+      "all",
+      "constituents",
+      "diagnostics-percent-energy",
+      "diagnostics-percent-energy-and-snr"
+    ]
+  },
+  "rejection_constraints": [
+    {
+      "id": "ols-has-no-robust-weight",
+      "status": "rejected",
+      "rule": "analysis_method=ols requires robust_weight=not-applicable",
+      "reason": "Robust options supplied to an OLS analysis are ambiguous and rejected instead of ignored.",
+      "evidence": ["crates/rutide-cli/src/main.rs"]
+    },
+    {
+      "id": "robust-requires-weight",
+      "status": "rejected",
+      "rule": "analysis_method=robust requires robust_weight!=not-applicable",
+      "reason": "Every IRLS solve has an explicit residual-weight definition; Cauchy is the default.",
+      "evidence": ["crates/rutide-cli/src/main.rs"]
+    },
+    {
+      "id": "confidence-none-has-no-noise-model",
+      "status": "rejected",
+      "rule": "confidence_method=none requires confidence_noise=not-applicable",
+      "reason": "A residual-noise model has no meaning without confidence estimation.",
+      "evidence": ["crates/rutide-cli/src/main.rs"]
+    },
+    {
+      "id": "confidence-requires-noise-model",
+      "status": "rejected",
+      "rule": "confidence_method!=none requires confidence_noise in {white,colored}",
+      "reason": "Linear and Monte Carlo covariance construction require a declared residual-noise model.",
+      "evidence": ["crates/rutide-cli/src/lib.rs"]
+    },
+    {
+      "id": "snr-order-requires-confidence",
+      "status": "rejected",
+      "rule": "constituent_order=signal-to-noise requires confidence_method!=none",
+      "reason": "Signal-to-noise ratios are derived from confidence intervals.",
+      "evidence": ["crates/rutide-cli/src/lib.rs", "crates/rutide-cli/src/main.rs"]
+    },
+    {
+      "id": "snr-reconstruction-requires-confidence",
+      "status": "rejected",
+      "rule": "reconstruction=diagnostics-percent-energy-and-snr requires confidence_method!=none",
+      "reason": "Signal-to-noise reconstruction filtering requires computed confidence intervals.",
+      "evidence": ["crates/rutide-core/src/corrected.rs", "crates/rutide-cli/src/main.rs"]
+    },
+    {
+      "id": "inference-requires-valid-relationships",
+      "status": "rejected",
+      "rule": "inference!=none requires one or more valid acyclic inferred/reference relationships",
+      "reason": "Empty, self-referential, duplicate, non-finite, or inferred-reference graphs are rejected.",
+      "evidence": ["crates/rutide-core/tests/python_oracle_inference.rs"]
+    },
+    {
+      "id": "explicit-order-is-complete",
+      "status": "rejected",
+      "rule": "constituent_order=explicit-permutation requires each fitted constituent exactly once",
+      "reason": "Presentation order cannot add, omit, or duplicate fitted coefficients.",
+      "evidence": ["crates/rutide-cli/src/lib.rs", "crates/rutide-cli/src/main.rs"]
+    },
+    {
+      "id": "explicit-reconstruction-is-selected-subset",
+      "status": "rejected",
+      "rule": "reconstruction=constituents requires a non-empty unique subset of fitted constituents",
+      "reason": "Reconstruction cannot reference an unavailable coefficient.",
+      "evidence": ["crates/rutide-core/src/corrected.rs", "crates/rutide-cli/src/main.rs"]
+    },
+    {
+      "id": "monte-carlo-requires-replicates",
+      "status": "rejected",
+      "rule": "confidence_method=monte-carlo requires realizations>=2",
+      "reason": "At least two realizations are needed to estimate a distribution interval.",
+      "evidence": ["crates/rutide-core/src/monte_carlo.rs", "crates/rutide-cli/src/main.rs"]
+    },
+    {
+      "id": "retained-time-axis-is-strict",
+      "status": "rejected",
+      "rule": "normalized retained timestamps must be finite and strictly increasing",
+      "reason": "Non-finite source timestamps are removed with their observations; duplicate or decreasing retained timestamps are ambiguous.",
+      "evidence": ["crates/rutide-core/src/time.rs"]
+    },
+    {
+      "id": "model-is-overdetermined",
+      "status": "rejected",
+      "rule": "each retained series must contain more finite observations than fitted model columns",
+      "reason": "Underdetermined harmonic fits do not have a unique least-squares solution.",
+      "evidence": ["crates/rutide-core/src/scalar.rs"]
+    }
+  ],
+  "parity_exceptions": [
+    {
+      "id": "monte-carlo-inference",
+      "parity": "rust-extension",
+      "condition": "inference!=none and confidence_method=monte-carlo",
+      "reason": "Python UTide rejects Monte Carlo confidence with inference; RUTide propagates shared reference draws through every relationship.",
+      "evidence": [
+        "crates/rutide-core/tests/python_oracle_inference.rs",
+        "benchmarks/results/inferred-monte-carlo-2026-09-02.md"
+      ]
+    },
+    {
+      "id": "broken-python-robust-array-weights",
+      "parity": "rust-extension",
+      "condition": "robust_weight in {andrews,huber,logistic}",
+      "reason": "The pinned Python implementations raise on residual arrays; RUTide uses the standard bounded scalar definitions.",
+      "evidence": [
+        "crates/rutide-core/tests/python_oracle_greenwich_nodal.rs"
+      ]
+    },
+    {
+      "id": "effective-monte-carlo-realization-count",
+      "parity": "rust-extension",
+      "condition": "confidence_method=monte-carlo and configured realizations!=200",
+      "reason": "Python UTide ignores MC_n and always draws 200 realizations; RUTide makes the validated setting effective.",
+      "evidence": [
+        "crates/rutide-core/tests/python_oracle_greenwich_nodal.rs"
+      ]
+    }
+  ],
+  "coverage": [
+    {
+      "id": "fundamental-solver-cross-product",
+      "kind": "composition-invariant",
+      "covers": {
+        "scope": ["scalar", "vector"],
+        "sampling": ["regular"],
+        "constituent_selection": ["explicit"],
+        "inference": ["none", "exact", "approximate"],
+        "analysis_method": ["ols"],
+        "robust_weight": ["not-applicable"],
+        "trend": ["enabled", "disabled"],
+        "phase_reference": ["greenwich", "linear-time", "raw"],
+        "nodal_corrections": ["exact", "linear-time", "disabled"],
+        "confidence_method": ["none"],
+        "confidence_noise": ["not-applicable"],
+        "constituent_order": ["selection"],
+        "reconstruction": ["none"]
+      },
+      "evidence": ["crates/rutide-core/tests/python_oracle_inference.rs"]
+    },
+    {
+      "id": "robust-weight-family",
+      "kind": "python-oracle-and-extension-invariants",
+      "covers": {
+        "scope": ["scalar", "vector"],
+        "sampling": ["regular"],
+        "inference": ["none", "exact"],
+        "analysis_method": ["robust"],
+        "robust_weight": [
+          "andrews",
+          "bisquare",
+          "cauchy",
+          "fair",
+          "huber",
+          "logistic",
+          "ols",
+          "talwar",
+          "welsch"
+        ]
+      },
+      "evidence": [
+        "crates/rutide-core/tests/python_oracle_greenwich_nodal.rs",
+        "crates/rutide-core/tests/python_oracle_inference.rs"
+      ]
+    },
+    {
+      "id": "dense-scalar-python-seam",
+      "kind": "python-oracle",
+      "covers": {
+        "scope": ["scalar"],
+        "sampling": ["irregular"],
+        "constituent_selection": ["explicit"],
+        "inference": ["approximate"],
+        "analysis_method": ["robust"],
+        "robust_weight": ["welsch"],
+        "trend": ["disabled"],
+        "phase_reference": ["linear-time"],
+        "nodal_corrections": ["disabled"],
+        "confidence_method": ["linear"],
+        "confidence_noise": ["colored"],
+        "constituent_order": ["selection"],
+        "reconstruction": ["none"]
+      },
+      "evidence": ["crates/rutide-core/tests/python_oracle_inference.rs"]
+    },
+    {
+      "id": "missing-and-monte-carlo-inference",
+      "kind": "python-input-oracle-and-extension-invariants",
+      "covers": {
+        "scope": ["scalar", "vector"],
+        "sampling": ["gappy-regular-grid", "irregular"],
+        "inference": ["exact", "approximate"],
+        "analysis_method": ["ols", "robust"],
+        "robust_weight": ["cauchy"],
+        "trend": ["disabled"],
+        "confidence_method": ["monte-carlo"],
+        "confidence_noise": ["white", "colored"]
+      },
+      "evidence": [
+        "crates/rutide-core/tests/python_oracle_inference.rs",
+        "benchmarks/results/inferred-monte-carlo-2026-09-02.md"
+      ]
+    },
+    {
+      "id": "selection-order-and-reconstruction",
+      "kind": "python-oracle-and-application-integration",
+      "covers": {
+        "scope": ["scalar", "vector"],
+        "constituent_selection": ["explicit", "rayleigh"],
+        "confidence_method": ["linear", "monte-carlo"],
+        "confidence_noise": ["white", "colored"],
+        "constituent_order": [
+          "selection",
+          "frequency",
+          "percent-energy",
+          "signal-to-noise",
+          "explicit-permutation"
+        ],
+        "reconstruction": [
+          "none",
+          "all",
+          "constituents",
+          "diagnostics-percent-energy",
+          "diagnostics-percent-energy-and-snr"
+        ]
+      },
+      "evidence": [
+        "crates/rutide-core/tests/python_oracle_greenwich_nodal.rs",
+        "crates/rutide-cli/src/lib.rs",
+        "crates/rutide-cli/src/vector.rs"
+      ]
+    },
+    {
+      "id": "dense-vector-application-seam",
+      "kind": "application-integration",
+      "covers": {
+        "scope": ["vector"],
+        "sampling": ["gappy-regular-grid"],
+        "constituent_selection": ["explicit"],
+        "inference": ["exact"],
+        "analysis_method": ["robust"],
+        "robust_weight": ["welsch"],
+        "trend": ["disabled"],
+        "phase_reference": ["raw"],
+        "nodal_corrections": ["linear-time"],
+        "confidence_method": ["monte-carlo"],
+        "confidence_noise": ["colored"],
+        "constituent_order": ["frequency"],
+        "reconstruction": ["all"]
+      },
+      "evidence": ["crates/rutide-cli/src/vector.rs"]
+    }
+  ]
+}

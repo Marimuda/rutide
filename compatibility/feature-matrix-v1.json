@@ -185,6 +185,22 @@
       "evidence": ["crates/rutide-core/src/time.rs"]
     },
     {
+      "id": "solver-option-composition",
+      "title": "Validated scalar and vector solver-option composition",
+      "support": "supported",
+      "scopes": ["core", "fvcom-scalar", "fvcom-vector", "output"],
+      "parity": "python-oracle",
+      "evidence": [
+        "compatibility/solver-option-matrix-v1.json",
+        "crates/rutide-core/tests/python_oracle_inference.rs",
+        "crates/rutide-cli/src/lib.rs",
+        "crates/rutide-cli/src/vector.rs"
+      ],
+      "limitations": [
+        "Rust-extension combinations are identified separately in the solver-option matrix"
+      ]
+    },
+    {
       "id": "fvcom-surface-elevation",
       "title": "FVCOM zeta(time,node) application",
       "support": "supported",

@@ -147,6 +147,9 @@ relationships supports OLS and robust fits, white and colored noise, complete,
 missing, and irregular records, and deterministic parallel batches. Their
 comparative linear-confidence benchmark is complete; Python UTide cannot supply
 a direct Monte Carlo-inference timing because it rejects that combination.
+The supported solver-option cross-product, validation constraints, parity
+exceptions, and evidence are frozen in
+[`compatibility/solver-option-matrix-v1.json`](compatibility/solver-option-matrix-v1.json).
 
 ## Development
 

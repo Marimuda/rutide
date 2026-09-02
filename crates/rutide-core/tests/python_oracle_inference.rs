@@ -313,6 +313,219 @@ fn assert_close(label: &str, actual: f64, expected: f64, tolerance: f64) {
     );
 }
 
+#[test]
+fn solver_option_cross_product_supports_standard_and_inferred_scalar_and_vector_fits() {
+    let time = oracle_times(169);
+    let observations = oracle_observations(169);
+    let (eastward, northward) = synthetic_vector_observations(&time);
+
+    for trend in [true, false] {
+        for phase_reference in [
+            PhaseReference::Greenwich,
+            PhaseReference::LinearTime,
+            PhaseReference::Raw,
+        ] {
+            for nodal_corrections in [
+                NodalCorrections::Exact,
+                NodalCorrections::LinearTime,
+                NodalCorrections::Disabled,
+            ] {
+                let options = SolverOptions::new(FitOptions { trend }, phase_reference)
+                    .with_nodal_corrections(nodal_corrections);
+                let standard = GreenwichNodalOls::prepare_modified_julian_days_with_solver_options(
+                    &time,
+                    LATITUDE,
+                    &requested(),
+                    options,
+                )
+                .expect("supported standard solver-option product");
+                let scalar = standard
+                    .solve(&observations)
+                    .expect("supported standard scalar product");
+                let vector = standard
+                    .solve_vector(&eastward, &northward)
+                    .expect("supported standard vector product");
+                assert!(scalar.amplitude.iter().all(|value| value.is_finite()));
+                assert!(vector.semi_major.iter().all(|value| value.is_finite()));
+
+                for mode in [InferenceMode::Exact, InferenceMode::Approximate] {
+                    let scalar_model =
+                        ScalarInferenceOls::prepare_modified_julian_days_with_solver_options(
+                            &time,
+                            LATITUDE,
+                            &requested(),
+                            &RELATIONSHIPS,
+                            mode,
+                            options,
+                        )
+                        .expect("supported inferred scalar solver-option product");
+                    let scalar = scalar_model
+                        .solve(&observations)
+                        .expect("supported inferred scalar product");
+                    let vector_model =
+                        VectorInferenceOls::prepare_modified_julian_days_with_solver_options(
+                            &time,
+                            LATITUDE,
+                            &requested(),
+                            &VECTOR_RELATIONSHIPS,
+                            mode,
+                            options,
+                        )
+                        .expect("supported inferred vector solver-option product");
+                    let vector = vector_model
+                        .solve_vector(&eastward, &northward)
+                        .expect("supported inferred vector product");
+                    assert!(scalar.amplitude.iter().all(|value| value.is_finite()));
+                    assert!(vector.semi_major.iter().all(|value| value.is_finite()));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "freezes one dense cross-feature scalar inference seam against Python UTide"
+)]
+fn robust_irregular_scalar_inference_option_seam_matches_python_utide() {
+    let mut time = oracle_times(745);
+    for (index, value) in time.iter_mut().enumerate().skip(1).take(743) {
+        let index = f64::from(u32::try_from(index).expect("oracle index fits u32"));
+        *value += 0.002 * (index * 0.37).sin() + 0.0007 * (index * 0.11).cos();
+    }
+    let mut observations = oracle_observations(745);
+    for index in [0, 137, 411] {
+        observations[index] = f64::NAN;
+    }
+    for (index, offset) in [(71, 5.0), (218, -4.0), (503, 6.0)] {
+        observations[index] += offset;
+    }
+    let solver_options =
+        SolverOptions::new(FitOptions { trend: false }, PhaseReference::LinearTime)
+            .with_nodal_corrections(NodalCorrections::Disabled);
+    let model = ScalarInferenceBatch::prepare_modified_julian_days_with_solver_options(
+        &time,
+        &requested(),
+        &RELATIONSHIPS,
+        InferenceMode::Approximate,
+        solver_options,
+    )
+    .expect("valid cross-feature scalar inference model");
+    let solution = model
+        .solve_time_major_with_missing_robust_and_linear_confidence(
+            &observations,
+            &[LATITUDE],
+            RobustOptions::for_weight_function(RobustWeightFunction::Welsch),
+            LinearConfidence::Colored,
+        )
+        .expect("valid cross-feature scalar inference solution")
+        .pop()
+        .expect("one scalar solution");
+
+    for (field, actual, expected, tolerance) in [
+        (
+            "amplitude",
+            &solution.amplitude,
+            &[
+                0.014_479_700_239_293_417,
+                0.660_188_148_801_487_5,
+                0.105_110_933_607_938_8,
+                0.231_065_852_080_520_6,
+                0.052_555_466_803_969_41,
+            ],
+            5e-10,
+        ),
+        (
+            "phase",
+            &solution.phase_degrees,
+            &[
+                357.023_061_324_779_23,
+                187.812_470_872_600_7,
+                163.846_689_805_741_73,
+                167.812_470_872_600_73,
+                118.846_689_805_741_72,
+            ],
+            5e-7,
+        ),
+        (
+            "amplitude_ci",
+            solution.amplitude_ci.as_ref().expect("amplitude intervals"),
+            &[
+                0.004_251_272_173_848_812,
+                0.047_285_525_666_302_015,
+                0.014_036_959_257_954_599,
+                0.011_705_054_788_330_652,
+                0.004_946_652_130_825_772,
+            ],
+            5e-7,
+        ),
+        (
+            "phase_ci",
+            solution.phase_ci_degrees.as_ref().expect("phase intervals"),
+            &[
+                16.735_357_008_614_255,
+                4.111_212_339_914_18,
+                7.601_601_930_624_025,
+                1.017_257_888_272_546_3,
+                2.696_411_116_210_521,
+            ],
+            5e-5,
+        ),
+        (
+            "percent_energy",
+            &solution.percent_energy,
+            &[
+                0.041_660_726_946_887_69,
+                86.605_036_563_936_88,
+                2.195_348_584_027_176,
+                10.609_116_979_082_268,
+                0.548_837_146_006_794_2,
+            ],
+            5e-7,
+        ),
+        (
+            "signal_to_noise",
+            solution
+                .signal_to_noise
+                .as_ref()
+                .expect("signal-to-noise ratios"),
+            &[
+                44.564_954_215_754_65,
+                748.843_643_752_024_8,
+                215.408_011_221_084_2,
+                1_497.051_626_957_057_6,
+                433.635_868_927_639_25,
+            ],
+            5e-4,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(
+                &format!("cross-feature scalar {field}[{index}]"),
+                *actual,
+                *expected,
+                tolerance,
+            );
+        }
+    }
+    assert_close(
+        "cross-feature scalar mean",
+        solution.mean,
+        0.089_509_294_651_724_98,
+        5e-10,
+    );
+    assert_eq!(solution.slope_per_day.to_bits(), 0.0_f64.to_bits());
+    let diagnostics = solution.robust.as_ref().expect("robust diagnostics");
+    assert_eq!(diagnostics.iterations, 4);
+    assert_close(
+        "cross-feature scalar weight sum",
+        diagnostics.weights.iter().sum(),
+        677.123_756_105_674_1,
+        5e-7,
+    );
+}
+
 fn check_oracle(count: usize, mode: InferenceMode, expected: &Expected) {
     let time = oracle_times(count);
     let observations = oracle_observations(count);
