@@ -24,7 +24,7 @@ within a schema version. Both crates require Rust 1.98 and forbid unsafe code.
 The compiled schema constants are public as
 `rutide_cli::SCALAR_OUTPUT_SCHEMA_VERSION` and
 `rutide_cli::VECTOR_OUTPUT_SCHEMA_VERSION`. They currently identify scalar v15
-and vector v12.
+and vector v13.
 
 A schema version covers dimension names and order, required variables, variable
 meaning and units, enumerated flag values, required global attributes, and JSON
@@ -41,7 +41,9 @@ required always creates a new schema version.
 Scalar fields use a public `series` axis. Depth-averaged vector fields also use
 `series`; native sigma-layer vector fields use `siglay, element` and retain the
 requested source indices in coordinate variables. Native sigma layers are model
-coordinates, not fixed physical depths.
+coordinates, not fixed physical depths. Fixed-depth vector fields use
+`depth, element`, with positive metres below the instantaneous free surface and
+the interpolation/masking contract in `FIXED_DEPTH_INTERPOLATION.md`.
 
 ## Determinism and digests
 

@@ -270,8 +270,17 @@ combinations must be rejected during validation rather than partially applied.
   `(siglay, element[, constituent])` coefficient and diagnostic arrays plus
   `(time, siglay, element)` reconstruction. Sparse classic-NetCDF reads traverse
   records in storage order, and a 96-series, three-layer real-FVCOM comparison
-  passes the pinned Python UTide oracle. Fixed-physical-depth interpolation is
-  intentionally separate from native terrain-following layers.
+  passes the pinned Python UTide oracle.
+- Fixed-physical-depth FVCOM currents are complete. Requested positive metres
+  below the instantaneous free surface are evaluated from nodal `siglay`, `h`,
+  and time-varying `zeta` at each triangle centroid, linearly interpolated
+  without extrapolation, and jointly masked by `wet_cells`, geometry, and both
+  current components. Bounded element blocks read all native layers once for
+  every requested depth and stream schema-v13 `(depth, element)` results. The
+  frozen scientific contract and focused fixture are in
+  `FIXED_DEPTH_INTERPOLATION.md`; real-file correctness and full-domain resource
+  measurements are retained in
+  `benchmarks/results/fixed-depth-fvcom-2026-09-02.md`.
 - The pre-1.0 Rust API, NetCDF/JSON schema, and digest stability contracts are
   documented in `COMPATIBILITY.md`; compiled schema constants are checked
   against the versioned machine-readable feature matrix.

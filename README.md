@@ -77,8 +77,9 @@ ranking, and matching scalar reconstruction are available. Reconstruction
 supports arbitrary target times in the core API and an opt-in complete
 original-time series in the FVCOM command.
 Scalar `_FillValue` and `NaN` observations are omitted per series, with shared
-valid-time masks grouped before fitting. Depth-averaged and native sigma-layer
-vector currents use the same machinery with a joint `ua`/`va` or `u`/`v`
+valid-time masks grouped before fitting. Depth-averaged, native sigma-layer,
+and fixed-physical-depth vector currents use the same machinery with a joint
+`ua`/`va` or `u`/`v`
 validity mask and return current ellipses, all four linearized or Monte Carlo
 ellipse confidence intervals, SNR, PE, and optional eastward/northward
 reconstruction. The command-line application accepts either
@@ -97,7 +98,7 @@ nearby elements and traverse classic NetCDF record variables in file order;
 requested layer and element order is still preserved. Chunk-local masks are
 grouped exactly as before, and global Monte Carlo stream offsets make results
 independent of chunk size and worker scheduling. JSON reports and scalar/vector
-NetCDF schemas v15/v12 record the actual chunk count, series count, and maximum
+NetCDF schemas v15/v13 record the actual chunk count, series count, and maximum
 logical observation-buffer bytes.
 
 Cauchy robust fitting is available for scalar and vector analyses, including
@@ -369,6 +370,11 @@ native `u(time, siglay, nele)` and `v(time, siglay, nele)` instead. A sample is
 removed from both components when either is `_FillValue` or `NaN`; this preserves
 a single current ellipse fit on a joint time base.
 
+Use `--depths 5,20,50` instead to interpolate native currents to positive metres
+below the instantaneous free surface. Fixed depths require `siglay`, `h`,
+`zeta`, triangular `nv`, and the authoritative `wet_cells` mask in addition to
+`u`/`v`. Depths, layers, and layer counts are mutually exclusive.
+
 ```console
 cargo run --release --bin rutide -- analyze-vector \
   --input /path/to/fvcom.nc \
@@ -391,22 +397,49 @@ cargo run --release --bin rutide -- analyze-vector \
   --workers 64
 ```
 
+A fixed-physical-depth example is:
+
+```console
+cargo run --release --bin rutide -- analyze-vector \
+  --input /path/to/fvcom.nc \
+  --output fixed-depth-ellipses.nc \
+  --depths 5,20,50 \
+  --constituents M2,S2,N2,K1,O1 \
+  --workers 64
+```
+
 The output includes semi-major and signed semi-minor axes, inclination, the
 configured phase convention, PE, and—when enabled—the four ellipse CIs and SNR.
-Reconstruction is written as `eastward_reconstruction(time, series)` and
-`northward_reconstruction(time, series)`. Use `--element-count N` or
-`--elements 0,10,20` for subsets. Dynamic constituent selection and reconstruction
-filters behave as in scalar mode.
+Depth-averaged reconstruction is written as
+`eastward_reconstruction(time, series)` and
+`northward_reconstruction(time, series)`; resolved layouts are described below.
+Use `--element-count N` or `--elements 0,10,20` for subsets. Dynamic constituent
+selection and reconstruction filters behave as in scalar mode.
 
 Sigma-layer output preserves the selected geometry: coefficient and diagnostic
 variables use `(siglay, element[, constituent])`, while reconstruction uses
 `(time, siglay, element)`. `siglay_index` and `element_index` retain the exact
 zero-based requested source order. These are native terrain-following model
 layers, not fixed physical depths; physical depth varies with bathymetry and the
-free surface, so fixed-depth interpolation remains a separate future workflow.
+free surface.
 
-Sigma-layer results are written incrementally to a temporary NetCDF file and
-atomically installed only after all chunks and the canonical digest complete.
+Fixed-depth coefficient and diagnostic variables use
+`(depth, element[, constituent])`, while reconstruction uses
+`(time, depth, element)`. The layer-centre position is evaluated from all three
+nodes of each FVCOM triangle at every retained time, and both current components
+are linearly interpolated with one shared weight. Dry cells and missing geometry
+or bracket currents are jointly missing; targets above the shallowest or below
+the deepest physical layer centre are not extrapolated. Shallow or always-dry
+coordinates without enough observations remain in the rectangular product with
+`analysis_status=unavailable` and NaN harmonic fields. The complete frozen
+semantics are in
+[`FIXED_DEPTH_INTERPOLATION.md`](FIXED_DEPTH_INTERPOLATION.md).
+Real-file Python-oracle correctness and full-domain 10 m performance are
+recorded in
+[`benchmarks/results/fixed-depth-fvcom-2026-09-02.md`](benchmarks/results/fixed-depth-fvcom-2026-09-02.md).
+
+Vertically resolved results are written incrementally to a temporary NetCDF file
+and atomically installed only after all chunks and the canonical digest complete.
 This includes confidence fields, ragged robust weights/leverage, and complete
 reconstruction. The JSON report and NetCDF `result_output` attribute identify
 this path as `incremental`; depth-averaged output remains `buffered`. On the

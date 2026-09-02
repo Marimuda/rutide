@@ -75,19 +75,30 @@ def _read_output(path: Path) -> dict[str, Any]:
         latitudes = _finite(dataset.variables["latitude"][:], "output latitude")
         if vertical_mode == "sigma-layer":
             selected_layers = np.asarray(dataset.variables["siglay_index"][:], dtype=np.int64)
+            selected_depths: np.ndarray | None = None
             indices = np.tile(element_indices, len(selected_layers))
             series_layers: np.ndarray | None = np.repeat(selected_layers, len(element_indices))
+            series_depths: np.ndarray | None = None
             latitudes = np.tile(latitudes, len(selected_layers))
+        elif vertical_mode == "fixed-depth":
+            selected_layers = None
+            selected_depths = _finite(dataset.variables["depth"][:], "output depth")
+            indices = np.tile(element_indices, len(selected_depths))
+            series_layers = None
+            series_depths = np.repeat(selected_depths, len(element_indices))
+            latitudes = np.tile(latitudes, len(selected_depths))
         elif vertical_mode == "depth-averaged":
             selected_layers = None
+            selected_depths = None
             indices = element_indices
             series_layers = None
+            series_depths = None
         else:
             raise ValueError(f"unsupported vertical mode: {vertical_mode}")
 
         def series_values(name: str, description: str) -> np.ndarray:
             values = _finite(dataset.variables[name][:], description)
-            if vertical_mode == "sigma-layer":
+            if vertical_mode in {"sigma-layer", "fixed-depth"}:
                 return values.reshape((-1, *values.shape[2:]))
             return values
 
@@ -102,6 +113,7 @@ def _read_output(path: Path) -> dict[str, Any]:
             "vertical_mode": vertical_mode,
             "indices": indices,
             "layer_indices": series_layers,
+            "depths_meters": series_depths,
             "latitudes": latitudes,
             "observation_counts": series_values(
                 "observation_count", "output observation count"
@@ -140,17 +152,19 @@ def _validate_output_shapes(output: dict[str, Any]) -> None:
     constituent_count = len(output["names"])
     if series_count == 0:
         raise ValueError("vector series must be non-empty")
-    coordinates = list(
-        zip(
-            output["layer_indices"]
-            if output["layer_indices"] is not None
-            else np.full(series_count, -1, dtype=np.int64),
-            output["indices"],
-            strict=True,
-        )
+    vertical_coordinates = (
+        output["layer_indices"]
+        if output["layer_indices"] is not None
+        else output["depths_meters"]
+        if output["depths_meters"] is not None
+        else np.full(series_count, -1, dtype=np.int64)
     )
-    if len(set((int(layer), int(element)) for layer, element in coordinates)) != series_count:
-        raise ValueError("layer-element coordinates must be unique")
+    coordinates = list(zip(vertical_coordinates, output["indices"], strict=True))
+    if (
+        len(set((float(vertical), int(element)) for vertical, element in coordinates))
+        != series_count
+    ):
+        raise ValueError("vertical-element coordinates must be unique")
     if constituent_count == 0 or len(set(output["names"])) != constituent_count:
         raise ValueError("constituent names must be non-empty and unique")
     matrix_shape = (series_count, constituent_count)
@@ -203,6 +217,8 @@ def compare_vector_with_oracle(
         "rayleigh-auto-greenwich-nodal-vector-ols",
         "fixed-constituents-greenwich-nodal-sigma-layer-vector-ols",
         "rayleigh-auto-greenwich-nodal-sigma-layer-vector-ols",
+        "fixed-constituents-greenwich-nodal-fixed-depth-vector-ols",
+        "rayleigh-auto-greenwich-nodal-fixed-depth-vector-ols",
     }:
         raise ValueError("RUTide output uses an unsupported vector profile")
     options = _profile_options("fixed-constituents")
@@ -238,12 +254,22 @@ def compare_vector_with_oracle(
                 if output["layer_indices"] is not None
                 else None
             )
+            depth_meters = (
+                float(output["depths_meters"][position])
+                if output["depths_meters"] is not None
+                else None
+            )
             if not 0 <= element_index < element_count:
                 raise ValueError(f"element index is out of range: {element_index}")
             latitude = float(source.variables["latc"][element_index])
             if output["latitudes"][position] != latitude:
                 raise ValueError(f"latitude differs at element {element_index}")
-            if layer_index is None:
+            if depth_meters is not None:
+                eastward_source, northward_source = _fixed_depth_current(
+                    source, element_index, depth_meters
+                )
+                source_label = f"depth {depth_meters} m, element {element_index}"
+            elif layer_index is None:
                 eastward_source = source.variables["ua"][:, element_index]
                 northward_source = source.variables["va"][:, element_index]
                 source_label = f"element {element_index}"
@@ -407,6 +433,85 @@ def compare_vector_with_oracle(
         "metrics": metrics,
         "passed": passed,
     }
+
+
+def _fixed_depth_current(
+    source: netCDF4.Dataset,
+    element_index: int,
+    target_depth: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply the frozen RUTide FVCOM centroid/layer-centre interpolation."""
+    nodes = np.asarray(source.variables["nv"][:, element_index], dtype=np.int64) - 1
+    if nodes.shape != (3,) or np.any(nodes < 0) or np.any(nodes >= len(source.dimensions["node"])):
+        raise ValueError(f"invalid FVCOM connectivity at element {element_index}")
+    sigma = _observations_with_nan(
+        source.variables["siglay"][:, nodes], f"siglay at element {element_index}"
+    )
+    bathymetry = _observations_with_nan(
+        source.variables["h"][nodes], f"bathymetry at element {element_index}"
+    )
+    surface = _observations_with_nan(
+        source.variables["zeta"][:, nodes], f"surface at element {element_index}"
+    )
+    wet = _observations_with_nan(
+        source.variables["wet_cells"][:, element_index], f"wet mask at element {element_index}"
+    )
+    eastward_layers = _observations_with_nan(
+        source.variables["u"][:, :, element_index], f"eastward layers at element {element_index}"
+    )
+    northward_layers = _observations_with_nan(
+        source.variables["v"][:, :, element_index], f"northward layers at element {element_index}"
+    )
+    layer_depths = np.mean(
+        -sigma[None, :, :] * (bathymetry[None, None, :] + surface[:, None, :]), axis=2
+    )
+    eastward = np.full(layer_depths.shape[0], np.nan, dtype=np.float64)
+    northward = np.full(layer_depths.shape[0], np.nan, dtype=np.float64)
+    geometry_valid = np.isfinite(layer_depths).all(axis=1) & np.all(
+        np.diff(layer_depths, axis=1) > 0.0, axis=1
+    )
+    for layer in range(layer_depths.shape[1] - 1):
+        lower = layer_depths[:, layer]
+        upper = layer_depths[:, layer + 1]
+        selected = (
+            geometry_valid
+            & (wet == 1.0)
+            & (target_depth >= lower)
+            & (target_depth <= upper)
+            & ~np.isfinite(eastward)
+        )
+        weight = np.divide(
+            target_depth - lower,
+            upper - lower,
+            out=np.zeros_like(lower),
+            where=selected,
+        )
+        u0 = eastward_layers[:, layer]
+        u1 = eastward_layers[:, layer + 1]
+        v0 = northward_layers[:, layer]
+        v1 = northward_layers[:, layer + 1]
+        exact_lower = selected & (target_depth == lower) & np.isfinite(u0) & np.isfinite(v0)
+        exact_upper = selected & (target_depth == upper) & np.isfinite(u1) & np.isfinite(v1)
+        interpolated = (
+            selected
+            & ~exact_lower
+            & ~exact_upper
+            & np.isfinite(u0)
+            & np.isfinite(u1)
+            & np.isfinite(v0)
+            & np.isfinite(v1)
+        )
+        eastward[exact_lower] = u0[exact_lower]
+        northward[exact_lower] = v0[exact_lower]
+        eastward[exact_upper] = u1[exact_upper]
+        northward[exact_upper] = v1[exact_upper]
+        eastward[interpolated] = u0[interpolated] + weight[interpolated] * (
+            u1[interpolated] - u0[interpolated]
+        )
+        northward[interpolated] = v0[interpolated] + weight[interpolated] * (
+            v1[interpolated] - v0[interpolated]
+        )
+    return eastward, northward
 
 
 def parse_args(arguments: list[str] | None = None) -> argparse.Namespace:

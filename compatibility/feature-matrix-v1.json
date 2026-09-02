@@ -14,7 +14,7 @@
     },
     "netcdf": {
       "scalar_schema_version": 15,
-      "vector_schema_version": 12
+      "vector_schema_version": 13
     },
     "json_report": {
       "version_source": "matching-netcdf-schema"
@@ -212,7 +212,7 @@
     },
     {
       "id": "incremental-result-output",
-      "title": "Incremental result output for result-heavy layered fields",
+      "title": "Incremental result output for vertically resolved vector fields",
       "support": "supported",
       "scopes": ["fvcom-vector", "output"],
       "parity": "not-applicable",
@@ -222,11 +222,15 @@
     {
       "id": "fixed-depth-currents",
       "title": "Interpolation of native layers to fixed physical depths",
-      "support": "planned",
+      "support": "supported",
       "scopes": ["fvcom-vector", "output"],
-      "parity": "not-applicable",
-      "evidence": [],
-      "limitations": ["Requires explicit wet/dry and moving-free-surface interpolation semantics"]
+      "parity": "rust-extension",
+      "evidence": [
+        "FIXED_DEPTH_INTERPOLATION.md",
+        "benchmarks/results/fixed-depth-fvcom-2026-09-02.md",
+        "crates/rutide-cli/src/vector.rs"
+      ],
+      "limitations": ["No extrapolation beyond physical layer centres"]
     },
     {
       "id": "python-bindings",

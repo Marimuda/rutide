@@ -39,6 +39,7 @@ Options:
   --elements I,J,...  Analyze explicit zero-based element indices (vector mode)
   --layer-count N     Analyze the first N native sigma layers (vector mode)
   --layers I,J,...    Analyze explicit zero-based native sigma-layer indices
+  --depths D,D,...    Interpolate currents to positive metres below the free surface
   --constituents LIST Comma-separated names or 'auto' (default: M2,S2,N2,K1,O1)
   --rayleigh-min X    Automatic selection criterion (default with auto: 1.0)
   --order ORDER       Presentation: selection, pe, snr, frequency, or a full name list
@@ -153,6 +154,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let mut chunk_series = None;
     let mut selection = None;
     let mut layer_selection = None;
+    let mut fixed_depths_meters = None;
     let mut constituents = None;
     let mut rayleigh_minimum = None;
     let mut constituent_order = None;
@@ -233,8 +235,10 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                 if !vector {
                     return Err("--layer-count is only valid for analyze-vector".to_owned());
                 }
-                if layer_selection.is_some() {
-                    return Err("--layers and --layer-count are mutually exclusive".to_owned());
+                if layer_selection.is_some() || fixed_depths_meters.is_some() {
+                    return Err(
+                        "--layers, --layer-count, and --depths are mutually exclusive".to_owned(),
+                    );
                 }
                 let count = parse_positive_usize(&required_value(&mut arguments, option)?, option)?;
                 layer_selection = Some(NodeSelection::Prefix(count));
@@ -243,14 +247,30 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                 if !vector {
                     return Err("--layers is only valid for analyze-vector".to_owned());
                 }
-                if layer_selection.is_some() {
-                    return Err("--layers and --layer-count are mutually exclusive".to_owned());
+                if layer_selection.is_some() || fixed_depths_meters.is_some() {
+                    return Err(
+                        "--layers, --layer-count, and --depths are mutually exclusive".to_owned(),
+                    );
                 }
                 layer_selection = Some(parse_index_selection(
                     &required_value(&mut arguments, option)?,
                     option,
                     "layer",
                 )?);
+            }
+            "--depths" => {
+                if !vector {
+                    return Err("--depths is only valid for analyze-vector".to_owned());
+                }
+                if layer_selection.is_some() || fixed_depths_meters.is_some() {
+                    return Err(
+                        "--layers, --layer-count, and --depths are mutually exclusive".to_owned(),
+                    );
+                }
+                fixed_depths_meters = Some(parse_fixed_depths(&required_value(
+                    &mut arguments,
+                    option,
+                )?)?);
             }
             "--constituents" => {
                 if constituents.is_some() {
@@ -481,6 +501,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             report,
             elements: selection,
             layers: layer_selection,
+            fixed_depths_meters,
             constituent_selection,
             constituent_order,
             inference,
@@ -689,6 +710,27 @@ fn parse_positive_f64(value: &OsStr, option: &str) -> Result<f64, String> {
         return Err(format!("{option} requires a finite positive number"));
     }
     Ok(parsed)
+}
+
+fn parse_fixed_depths(value: &OsStr) -> Result<Vec<f64>, String> {
+    let text = value
+        .to_str()
+        .ok_or_else(|| "--depths value must be valid UTF-8".to_owned())?;
+    if text.is_empty() {
+        return Err("--depths requires a comma-separated depth list".to_owned());
+    }
+    let mut depths = Vec::new();
+    for item in text.split(',') {
+        let depth = parse_positive_f64(OsStr::new(item), "--depths")?;
+        if depths
+            .iter()
+            .any(|existing: &f64| existing.to_bits() == depth.to_bits())
+        {
+            return Err(format!("--depths contains duplicate depth {depth}"));
+        }
+        depths.push(depth);
+    }
+    Ok(depths)
 }
 
 fn parse_nonnegative_f64(value: &OsStr, option: &str) -> Result<f64, String> {
@@ -1040,6 +1082,7 @@ mod tests {
         };
         assert_eq!(config.elements, NodeSelection::Indices(vec![4, 1, 3]));
         assert_eq!(config.layers, Some(NodeSelection::Indices(vec![2, 0])));
+        assert_eq!(config.fixed_depths_meters, None);
         assert_eq!(
             config.confidence_interval,
             ConfidenceInterval::Linear(LinearConfidence::Colored)
@@ -1086,6 +1129,39 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn parses_fixed_depths_and_rejects_invalid_combinations() {
+        let Command::AnalyzeVector(fixed_depth) = parse_arguments(args(&[
+            "analyze-vector",
+            "--input",
+            "input.nc",
+            "--output",
+            "output.nc",
+            "--depths",
+            "5,12.5,30",
+        ]))
+        .expect("valid fixed-depth arguments") else {
+            panic!("expected fixed-depth vector command");
+        };
+        assert_eq!(fixed_depth.layers, None);
+        assert_eq!(fixed_depth.fixed_depths_meters, Some(vec![5.0, 12.5, 30.0]));
+        for arguments in [
+            vec!["--depths", "5", "--layers", "0"],
+            vec!["--depths", "5,5"],
+            vec!["--depths", "0"],
+        ] {
+            let mut command = vec![
+                "analyze-vector",
+                "--input",
+                "input.nc",
+                "--output",
+                "output.nc",
+            ];
+            command.extend(arguments);
+            assert!(parse_arguments(args(&command)).is_err());
+        }
     }
 
     #[test]

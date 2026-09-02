@@ -1,19 +1,19 @@
-//! FVCOM depth-averaged vector-current application path.
+//! FVCOM depth-averaged, sigma-layer, and fixed-depth vector-current path.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use netcdf::{FileMut, Variable};
-use rayon::ThreadPoolBuilder;
+use rayon::{ThreadPoolBuilder, prelude::*};
 use rutide_core::{
     AnalysisError, COLORED_NOISE_FREQUENCY_BANDS_CPH, Constituent, FitOptions, GreenwichNodalBatch,
     GreenwichNodalReconstructor, NodalCorrections, PhaseReference, ReconstructionFilter,
-    ResidualSpectrumMethod, SolverOptions, TidalConstituent, VectorInferenceBatch,
-    VectorReconstruction, VectorSolution,
+    ResidualSpectrumMethod, RobustDiagnostics, RobustTermination, SolverOptions, TidalConstituent,
+    VectorInferenceBatch, VectorReconstruction, VectorSolution,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -36,9 +36,9 @@ use super::{
 };
 
 /// `NetCDF` and JSON report schema emitted by vector-current analyses.
-pub const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 12;
+pub const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 13;
 
-/// Configuration for one depth-averaged or native sigma-layer FVCOM current analysis.
+/// Configuration for one FVCOM current analysis.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VectorAnalyzeConfig {
     /// Read-only source FVCOM `NetCDF` path.
@@ -51,6 +51,11 @@ pub struct VectorAnalyzeConfig {
     pub elements: NodeSelection,
     /// Native FVCOM sigma layers to analyze, or `None` for depth-averaged `ua`/`va`.
     pub layers: Option<NodeSelection>,
+    /// Fixed physical depths in metres below the instantaneous free surface.
+    ///
+    /// This is mutually exclusive with [`Self::layers`]. `None` selects either
+    /// native layers or depth-averaged currents according to [`Self::layers`].
+    pub fixed_depths_meters: Option<Vec<f64>>,
     /// Explicit or record-length-based constituent selection.
     pub constituent_selection: ConstituentSelection,
     /// Per-series constituent presentation ranking.
@@ -85,6 +90,11 @@ pub struct VectorSampleResult {
     /// Original zero-based FVCOM sigma-layer index for depth-resolved currents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layer_index: Option<usize>,
+    /// Requested metres below the instantaneous free surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depth_meters_below_surface: Option<f64>,
+    /// Whether this coordinate was fitted or lacked enough physical samples.
+    pub analysis_status: &'static str,
     /// Element-center latitude in degrees north.
     pub latitude_degrees_north: f64,
     /// Semi-major axes in constituent order.
@@ -145,7 +155,7 @@ pub struct VectorRunReport {
     pub input_path: String,
     /// Source container size, not bytes physically read.
     pub input_file_bytes: u64,
-    /// Logical payload bytes requested from the five input variables.
+    /// Logical payload bytes represented by the selected input coordinates.
     pub logical_input_bytes: u64,
     /// Output coefficient path.
     pub output_path: String,
@@ -159,15 +169,22 @@ pub struct VectorRunReport {
     pub source_time_count: usize,
     /// Number of missing source timestamps and corresponding rows discarded.
     pub discarded_timestamp_count: usize,
-    /// Number of analyzed current series (`elements × selected layers`).
+    /// Number of analyzed current series (`elements × selected vertical coordinates`).
     pub series_count: usize,
     /// Number of distinct selected FVCOM elements.
     pub element_count: usize,
-    /// Vertical source mode: `depth-averaged` or `sigma-layer`.
+    /// Vertical source mode: `depth-averaged`, `sigma-layer`, or `fixed-depth`.
     pub vertical_mode: &'static str,
     /// Selected zero-based native sigma-layer indices for depth-resolved currents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layer_indices: Option<Vec<usize>>,
+    /// Requested positive metres below the instantaneous free surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixed_depths_meters: Option<Vec<f64>>,
+    /// Number of vertical-element series fitted successfully.
+    pub fitted_series_count: usize,
+    /// Number of rectangular output rows without enough observations for the model.
+    pub unavailable_series_count: usize,
     /// Number of current series with at least one missing component sample.
     pub series_with_missing_observations: usize,
     /// Aggregate temporal and spectral coverage across fitted current series.
@@ -233,6 +250,7 @@ struct VectorInputData {
     discarded_timestamp_count: usize,
     element_indices: Vec<usize>,
     layer_indices: Option<Vec<usize>>,
+    fixed_depths_meters: Option<Vec<f64>>,
     latitudes: Vec<f64>,
     #[cfg(test)]
     eastward: Vec<f64>,
@@ -250,11 +268,24 @@ struct VectorInputMetadata {
     discarded_timestamp_count: usize,
     element_indices: Vec<usize>,
     layer_indices: Option<Vec<usize>>,
+    fixed_depths_meters: Option<Vec<f64>>,
+    fixed_depth_source: Option<FixedDepthSource>,
     latitudes: Vec<f64>,
     eastward_fill: Option<f32>,
     northward_fill: Option<f32>,
     input_file_bytes: u64,
     logical_input_bytes: u64,
+}
+
+struct FixedDepthSource {
+    source_layer_count: usize,
+    element_nodes: Vec<[usize; 3]>,
+    node_sigma: Vec<f64>,
+    node_bathymetry: Vec<f64>,
+    sigma_fill: Option<f32>,
+    bathymetry_fill: Option<f32>,
+    zeta_fill: Option<f32>,
+    wet_cells_fill: Option<i32>,
 }
 
 struct VectorInputChunk {
@@ -265,28 +296,57 @@ struct VectorInputChunk {
 
 impl VectorInputData {
     fn series_count(&self) -> usize {
-        self.element_indices.len() * self.layer_indices.as_ref().map_or(1, Vec::len)
+        self.element_indices.len() * self.vertical_count()
     }
 
-    fn series_coordinates(&self, series: usize) -> (Option<usize>, usize, f64) {
+    fn vertical_count(&self) -> usize {
+        self.layer_indices.as_ref().map_or_else(
+            || self.fixed_depths_meters.as_ref().map_or(1, Vec::len),
+            Vec::len,
+        )
+    }
+
+    fn series_coordinates(&self, series: usize) -> (Option<usize>, Option<f64>, usize, f64) {
         let element_position = series % self.element_indices.len();
+        let vertical_position = series / self.element_indices.len();
         let layer_index = self
             .layer_indices
             .as_ref()
-            .map(|layers| layers[series / self.element_indices.len()]);
+            .map(|layers| layers[vertical_position]);
+        let depth = self
+            .fixed_depths_meters
+            .as_ref()
+            .map(|depths| depths[vertical_position]);
         (
             layer_index,
+            depth,
             self.element_indices[element_position],
             self.latitudes[element_position],
         )
     }
 
     fn is_depth_resolved(&self) -> bool {
-        self.layer_indices.is_some()
+        self.layer_indices.is_some() || self.fixed_depths_meters.is_some()
+    }
+
+    fn is_fixed_depth(&self) -> bool {
+        self.fixed_depths_meters.is_some()
+    }
+
+    fn vertical_mode(&self) -> &'static str {
+        if self.fixed_depths_meters.is_some() {
+            "fixed-depth"
+        } else if self.layer_indices.is_some() {
+            "sigma-layer"
+        } else {
+            "depth-averaged"
+        }
     }
 
     fn series_dimensions(&self) -> &'static [&'static str] {
-        if self.is_depth_resolved() {
+        if self.fixed_depths_meters.is_some() {
+            &["depth", "element"]
+        } else if self.layer_indices.is_some() {
             &["siglay", "element"]
         } else {
             &["series"]
@@ -302,7 +362,18 @@ impl VectorInputData {
 
 impl VectorInputMetadata {
     fn series_count(&self) -> usize {
-        self.element_indices.len() * self.layer_indices.as_ref().map_or(1, Vec::len)
+        self.element_indices.len() * self.vertical_count()
+    }
+
+    fn vertical_count(&self) -> usize {
+        self.layer_indices.as_ref().map_or_else(
+            || self.fixed_depths_meters.as_ref().map_or(1, Vec::len),
+            Vec::len,
+        )
+    }
+
+    fn is_fixed_depth(&self) -> bool {
+        self.fixed_depths_meters.is_some()
     }
 
     fn chunk_latitudes(&self, series_range: std::ops::Range<usize>) -> Vec<f64> {
@@ -348,6 +419,9 @@ impl Default for SamplingSummaryAccumulator {
 impl SamplingSummaryAccumulator {
     fn extend(&mut self, diagnostics: &[CoreSamplingDiagnostics]) {
         for series in diagnostics {
+            if series.residual_spectrum_time_count == 0 {
+                continue;
+            }
             self.series_count += 1;
             self.minimum_observation_count =
                 self.minimum_observation_count.min(series.observation_count);
@@ -374,13 +448,32 @@ impl SamplingSummaryAccumulator {
         }
     }
 
-    fn finish(self) -> Result<SamplingSummary, AppError> {
+    fn finish(self) -> SamplingSummary {
         if self.series_count == 0 {
-            return Err(AppError::Invalid(
-                "sampling diagnostics require at least one spatial series".to_owned(),
-            ));
+            return SamplingSummary {
+                minimum_observation_count: 0,
+                maximum_observation_count: 0,
+                minimum_record_span_days: 0.0,
+                maximum_record_span_days: 0.0,
+                maximum_gap_hours: 0.0,
+                fft_series_count: 0,
+                lomb_scargle_series_count: 0,
+                spectral_bands: COLORED_NOISE_FREQUENCY_BANDS_CPH
+                    .iter()
+                    .copied()
+                    .map(
+                        |[lower_frequency_cph, upper_frequency_cph]| SpectralBandSummary {
+                            lower_frequency_cph,
+                            upper_frequency_cph,
+                            minimum_bin_count: 0,
+                            minimum_usable_bin_count: 0,
+                            series_without_usable_bins: 0,
+                        },
+                    )
+                    .collect(),
+            };
         }
-        Ok(SamplingSummary {
+        SamplingSummary {
             minimum_observation_count: self.minimum_observation_count,
             maximum_observation_count: self.maximum_observation_count,
             minimum_record_span_days: self.minimum_record_span_days,
@@ -402,7 +495,7 @@ impl SamplingSummaryAccumulator {
                     },
                 )
                 .collect(),
-        })
+        }
     }
 }
 
@@ -488,7 +581,7 @@ impl VectorAnalysisBatch {
     }
 }
 
-/// Analyze depth-averaged or native sigma-layer FVCOM currents.
+/// Analyze depth-averaged, native sigma-layer, or fixed-depth FVCOM currents.
 ///
 /// A time sample is omitted from both components when either source component
 /// is missing. Infinities remain hard input errors.
@@ -513,6 +606,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         &dataset,
         &config.elements,
         config.layers.as_ref(),
+        config.fixed_depths_meters.as_deref(),
     )?;
     let mut input_seconds = input_start.elapsed().as_secs_f64();
 
@@ -529,6 +623,20 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         config.phase_reference,
         config.nodal_corrections,
     )?;
+    let fitted_reference_count = batch.constituents().len().saturating_sub(
+        config
+            .inference
+            .as_ref()
+            .map_or(0, |value| value.relationships.len()),
+    );
+    let minimum_fit_observations = fitted_reference_count
+        .checked_mul(2)
+        // Mean, optional trend, and one residual degree of freedom: the core
+        // deliberately requires an overdetermined model.
+        .and_then(|value| value.checked_add(2 + usize::from(config.fit_options.trend)))
+        .ok_or_else(|| {
+            AppError::Invalid("minimum vector observation count overflows".to_owned())
+        })?;
     super::shared_constituent_order_indices(&config.constituent_order, batch.constituents())?;
     if let Some(filter) = &config.reconstruction {
         validate_reconstruction_filter(filter, batch.tidal_constituents())?;
@@ -537,27 +645,84 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
     // reconstruction can retain two more. Size automatic chunks by the largest
     // concurrently resident time-major result set, then report the actual two
     // promoted source-component buffers.
-    let resident_component_count =
-        if metadata.layer_indices.is_some() && config.analysis_method != AnalysisMethod::Ols {
-            4
-        } else {
-            2
-        };
-    let mut chunk_plan = spatial_chunk_plan(
-        config.chunk_series,
-        metadata.series_count(),
-        metadata.source_time_count,
-        resident_component_count,
-        config.workers,
-    )?;
-    chunk_plan.maximum_observation_buffer_bytes = u64::try_from(
-        chunk_plan
+    let (mut chunk_plan, fixed_depth_elements_per_chunk) = if metadata.is_fixed_depth() {
+        let depth_count = metadata.vertical_count();
+        let source_layer_count = metadata
+            .fixed_depth_source
+            .as_ref()
+            .map(|source| source.source_layer_count)
+            .ok_or_else(|| AppError::Invalid("fixed-depth geometry was not prepared".to_owned()))?;
+        let requested_elements = config
+            .chunk_series
+            .map(|series| {
+                if series < depth_count {
+                    return Err(AppError::Invalid(format!(
+                        "fixed-depth chunk series must be at least the requested depth count {depth_count}"
+                    )));
+                }
+                Ok(series / depth_count)
+            })
+            .transpose()?;
+        // Native u/v, interpolated u/v, worst-case three-node zeta, and wet mask
+        // coexist inside the reader. This makes the automatic 512 MiB budget
+        // conservative without charging for static geometry.
+        let component_count = source_layer_count
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(depth_count * 2 + 4))
+            .ok_or_else(|| {
+                AppError::Invalid("fixed-depth chunk budget exceeds usize".to_owned())
+            })?;
+        let element_plan = spatial_chunk_plan(
+            requested_elements,
+            metadata.element_indices.len(),
+            metadata.source_time_count,
+            component_count,
+            config.workers,
+        )?;
+        let series_per_chunk = element_plan
             .series_per_chunk
-            .checked_mul(metadata.source_time_count)
-            .and_then(|value| value.checked_mul(2 * std::mem::size_of::<f64>()))
-            .ok_or_else(|| AppError::Invalid("observation chunk size exceeds usize".to_owned()))?,
-    )
-    .map_err(|_| AppError::Invalid("observation chunk size exceeds u64".to_owned()))?;
+            .checked_mul(depth_count)
+            .ok_or_else(|| {
+                AppError::Invalid("fixed-depth chunk series exceeds usize".to_owned())
+            })?;
+        (
+            super::SpatialChunkPlan {
+                series_per_chunk,
+                chunk_count: element_plan.chunk_count,
+                maximum_observation_buffer_bytes: element_plan.maximum_observation_buffer_bytes,
+            },
+            Some(element_plan.series_per_chunk),
+        )
+    } else {
+        let resident_component_count =
+            if metadata.layer_indices.is_some() && config.analysis_method != AnalysisMethod::Ols {
+                4
+            } else {
+                2
+            };
+        (
+            spatial_chunk_plan(
+                config.chunk_series,
+                metadata.series_count(),
+                metadata.source_time_count,
+                resident_component_count,
+                config.workers,
+            )?,
+            None,
+        )
+    };
+    if !metadata.is_fixed_depth() {
+        chunk_plan.maximum_observation_buffer_bytes = u64::try_from(
+            chunk_plan
+                .series_per_chunk
+                .checked_mul(metadata.source_time_count)
+                .and_then(|value| value.checked_mul(2 * std::mem::size_of::<f64>()))
+                .ok_or_else(|| {
+                    AppError::Invalid("observation chunk size exceeds usize".to_owned())
+                })?,
+        )
+        .map_err(|_| AppError::Invalid("observation chunk size exceeds u64".to_owned()))?;
+    }
     let sampling_plan =
         rutide_core::SamplingDiagnosticsPlan::prepare(&metadata.modified_julian_days)?;
     let reconstructor = config
@@ -577,12 +742,17 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         discarded_timestamp_count: metadata.discarded_timestamp_count,
         element_indices: metadata.element_indices.clone(),
         layer_indices: metadata.layer_indices.clone(),
+        fixed_depths_meters: metadata.fixed_depths_meters.clone(),
         latitudes: metadata.latitudes.clone(),
         #[cfg(test)]
         eastward: Vec::new(),
         #[cfg(test)]
         northward: Vec::new(),
-        observation_counts: Vec::with_capacity(series_count),
+        observation_counts: if metadata.is_fixed_depth() {
+            vec![0; series_count]
+        } else {
+            Vec::with_capacity(series_count)
+        },
         input_file_bytes: metadata.input_file_bytes,
         logical_input_bytes: metadata.logical_input_bytes,
     };
@@ -611,7 +781,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             .map(|_| Vec::with_capacity(series_count))
     };
     let mut sampling_accumulator = SamplingSummaryAccumulator::default();
-    let mut sample_results = Vec::with_capacity(3);
+    let mut sample_results = Vec::<(usize, VectorSampleResult)>::with_capacity(3);
     let mut first_frequency = None::<Vec<f64>>;
     let mut frequency_varies_by_series = false;
     let mut first_constituent_order = None::<Vec<u16>>;
@@ -645,37 +815,99 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         None
     };
     output_seconds += output_start.elapsed().as_secs_f64();
-    for first_series in (0..series_count).step_by(chunk_plan.series_per_chunk) {
-        let end_series = (first_series + chunk_plan.series_per_chunk).min(series_count);
+    let mut next_regular_series = 0;
+    let mut next_fixed_element = 0;
+    let mut pending_fixed_depths = VecDeque::new();
+    loop {
         let read_start = Instant::now();
-        let chunk = read_fvcom_vector_chunk(&dataset, &metadata, first_series..end_series)?;
+        let next = if let Some(elements_per_chunk) = fixed_depth_elements_per_chunk {
+            if pending_fixed_depths.is_empty()
+                && next_fixed_element < metadata.element_indices.len()
+            {
+                let first_element = next_fixed_element;
+                let end_element =
+                    (first_element + elements_per_chunk).min(metadata.element_indices.len());
+                let chunks = read_fvcom_fixed_depth_element_chunk(
+                    &dataset,
+                    &metadata,
+                    first_element..end_element,
+                )?;
+                for (depth, chunk) in chunks.into_iter().enumerate() {
+                    let first_series = depth * metadata.element_indices.len() + first_element;
+                    pending_fixed_depths.push_back((first_series, chunk));
+                }
+                next_fixed_element = end_element;
+            }
+            pending_fixed_depths.pop_front()
+        } else if next_regular_series < series_count {
+            let first_series = next_regular_series;
+            let end_series = (first_series + chunk_plan.series_per_chunk).min(series_count);
+            next_regular_series = end_series;
+            Some((
+                first_series,
+                read_fvcom_vector_chunk(&dataset, &metadata, first_series..end_series)?,
+            ))
+        } else {
+            None
+        };
         input_seconds += read_start.elapsed().as_secs_f64();
+        let Some((first_series, chunk)) = next else {
+            break;
+        };
+        let end_series = first_series + chunk.observation_counts.len();
         let latitudes = metadata.chunk_latitudes(first_series..end_series);
 
         let solve_start = Instant::now();
-        let chunk_solutions = solve_vector_input(
-            &worker_pool,
-            &batch,
-            &chunk.eastward,
-            &chunk.northward,
-            &latitudes,
-            first_series,
-            config.analysis_method,
-            config.confidence_interval,
-        )?;
+        let chunk_solutions = if input.is_fixed_depth() {
+            solve_vector_input_with_unavailable(
+                &worker_pool,
+                &batch,
+                &chunk.eastward,
+                &chunk.northward,
+                &latitudes,
+                &chunk.observation_counts,
+                minimum_fit_observations,
+                first_series,
+                config.analysis_method,
+                config.confidence_interval,
+            )?
+        } else {
+            solve_vector_input(
+                &worker_pool,
+                &batch,
+                &chunk.eastward,
+                &chunk.northward,
+                &latitudes,
+                first_series,
+                config.analysis_method,
+                config.confidence_interval,
+            )?
+        };
         solve_seconds += solve_start.elapsed().as_secs_f64();
 
         let result_start = Instant::now();
         let chunk_frequency_cph = vector_solution_frequencies(&batch, &chunk_solutions)?;
-        let chunk_diagnostics = diagnose_sampling(
-            &worker_pool,
-            &sampling_plan,
-            &chunk_frequency_cph,
-            |time, series| {
-                let index = time * chunk_solutions.len() + series;
-                chunk.eastward[index].is_finite() && chunk.northward[index].is_finite()
-            },
-        )?;
+        let chunk_diagnostics = if input.is_fixed_depth() {
+            diagnose_vector_sampling_with_unavailable(
+                &worker_pool,
+                &sampling_plan,
+                &chunk_frequency_cph,
+                &chunk.eastward,
+                &chunk.northward,
+                &chunk.observation_counts,
+                minimum_fit_observations,
+            )?
+        } else {
+            diagnose_sampling(
+                &worker_pool,
+                &sampling_plan,
+                &chunk_frequency_cph,
+                |time, series| {
+                    let index = time * chunk_solutions.len() + series;
+                    chunk.eastward[index].is_finite() && chunk.northward[index].is_finite()
+                },
+            )?
+        };
         if chunk_diagnostics
             .iter()
             .zip(&chunk.observation_counts)
@@ -694,21 +926,37 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         let chunk_reconstruction = if let (Some(reconstructor), Some(filter)) =
             (reconstructor.as_ref(), config.reconstruction.as_ref())
         {
-            Some(worker_pool.install(|| {
-                reconstructor.reconstruct_many_vectors_series_major(
+            Some(if input.is_fixed_depth() {
+                reconstruct_vectors_with_unavailable(
+                    &worker_pool,
+                    reconstructor,
                     &chunk_solutions,
                     &latitudes,
                     filter,
-                )
-            })?)
+                    input.modified_julian_days.len(),
+                )?
+            } else {
+                worker_pool.install(|| {
+                    reconstructor.reconstruct_many_vectors_series_major(
+                        &chunk_solutions,
+                        &latitudes,
+                        filter,
+                    )
+                })?
+            })
         } else {
             None
         };
         reconstruction_seconds += reconstruction_start.elapsed().as_secs_f64();
 
-        input
-            .observation_counts
-            .extend_from_slice(&chunk_observation_counts);
+        if input.is_fixed_depth() {
+            input.observation_counts[first_series..end_series]
+                .copy_from_slice(&chunk_observation_counts);
+        } else {
+            input
+                .observation_counts
+                .extend_from_slice(&chunk_observation_counts);
+        }
         if incremental_results {
             let result_start = Instant::now();
             let chunk_order = constituent_order_indices(
@@ -727,7 +975,11 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                 &chunk_order,
                 &chunk_diagnostics,
             );
-            for frequency in &chunk_frequency_cph {
+            for (frequency, _) in chunk_frequency_cph
+                .iter()
+                .zip(&chunk_observation_counts)
+                .filter(|(_, count)| **count >= minimum_fit_observations)
+            {
                 if let Some(first) = &first_frequency {
                     frequency_varies_by_series |= first != frequency;
                 } else {
@@ -801,7 +1053,12 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             inference_report.as_ref(),
             config.reconstruction.as_ref(),
         )?;
-        let sampling_summary = sampling_accumulator.finish()?;
+        let sampling_summary = sampling_accumulator.finish();
+        sample_results.sort_unstable_by_key(|(series, _)| *series);
+        let sample_results = sample_results
+            .into_iter()
+            .map(|(_, sample)| sample)
+            .collect::<Vec<_>>();
         result_processing_seconds += result_start.elapsed().as_secs_f64();
 
         let output_start = Instant::now();
@@ -903,7 +1160,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         rutide_version: rutide_core::VERSION,
         profile: vector_profile(
             &selection,
-            input.is_depth_resolved(),
+            input.vertical_mode(),
             config.analysis_method,
             config.inference.is_some(),
             config.fit_options,
@@ -926,12 +1183,19 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         discarded_timestamp_count: input.discarded_timestamp_count,
         series_count: input.series_count(),
         element_count: input.element_indices.len(),
-        vertical_mode: if input.is_depth_resolved() {
-            "sigma-layer"
-        } else {
-            "depth-averaged"
-        },
+        vertical_mode: input.vertical_mode(),
         layer_indices: input.layer_indices.clone(),
+        fixed_depths_meters: input.fixed_depths_meters.clone(),
+        fitted_series_count: input
+            .observation_counts
+            .iter()
+            .filter(|count| **count >= minimum_fit_observations)
+            .count(),
+        unavailable_series_count: input
+            .observation_counts
+            .iter()
+            .filter(|count| **count < minimum_fit_observations)
+            .count(),
         series_with_missing_observations: input
             .observation_counts
             .iter()
@@ -1101,6 +1365,271 @@ fn solve_vector_input(
     })
 }
 
+fn unavailable_vector_solution(
+    constituent_count: usize,
+    analysis_method: AnalysisMethod,
+    confidence_interval: ConfidenceInterval,
+) -> VectorSolution {
+    let missing = vec![f64::NAN; constituent_count];
+    let confidence = (confidence_interval != ConfidenceInterval::None).then(|| missing.clone());
+    VectorSolution {
+        semi_major: missing.clone(),
+        semi_minor: missing.clone(),
+        inclination_degrees: missing.clone(),
+        phase_degrees: missing.clone(),
+        percent_energy: missing,
+        semi_major_ci: confidence.clone(),
+        semi_minor_ci: confidence.clone(),
+        inclination_ci_degrees: confidence.clone(),
+        phase_ci_degrees: confidence.clone(),
+        signal_to_noise: confidence,
+        eastward_mean: f64::NAN,
+        northward_mean: f64::NAN,
+        eastward_slope_per_day: f64::NAN,
+        northward_slope_per_day: f64::NAN,
+        reference_time_days: f64::NAN,
+        robust: (analysis_method != AnalysisMethod::Ols).then_some(RobustDiagnostics {
+            weights: Vec::new(),
+            leverage: Vec::new(),
+            iterations: 0,
+            termination: RobustTermination::ExactFit,
+            residual_scale: f64::NAN,
+            ols_rms_residual: f64::NAN,
+            rms_residual: f64::NAN,
+        }),
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "fixed-depth rectangular output needs explicit controls and two deterministic stream strategies"
+)]
+fn solve_vector_input_with_unavailable(
+    worker_pool: &rayon::ThreadPool,
+    batch: &VectorAnalysisBatch,
+    eastward: &[f64],
+    northward: &[f64],
+    latitudes: &[f64],
+    observation_counts: &[usize],
+    minimum_observations: usize,
+    series_offset: usize,
+    analysis_method: AnalysisMethod,
+    confidence_interval: ConfidenceInterval,
+) -> Result<Vec<VectorSolution>, AnalysisError> {
+    let series_count = latitudes.len();
+    if observation_counts.len() != series_count
+        || eastward.len() != northward.len()
+        || !eastward.len().is_multiple_of(series_count)
+    {
+        return Err(AnalysisError::SamplingMaskShape {
+            actual: observation_counts.len(),
+            expected: series_count,
+        });
+    }
+    if observation_counts
+        .iter()
+        .all(|count| *count >= minimum_observations)
+    {
+        return solve_vector_input(
+            worker_pool,
+            batch,
+            eastward,
+            northward,
+            latitudes,
+            series_offset,
+            analysis_method,
+            confidence_interval,
+        );
+    }
+    let time_count = eastward.len() / series_count;
+    let mut solutions = observation_counts
+        .iter()
+        .map(|_| None)
+        .collect::<Vec<Option<VectorSolution>>>();
+    for (series, count) in observation_counts.iter().copied().enumerate() {
+        if count < minimum_observations {
+            solutions[series] = Some(unavailable_vector_solution(
+                batch.constituents().len(),
+                analysis_method,
+                confidence_interval,
+            ));
+        }
+    }
+    if confidence_interval.monte_carlo_options().is_none() {
+        let active = observation_counts
+            .iter()
+            .enumerate()
+            .filter_map(|(series, count)| (*count >= minimum_observations).then_some(series))
+            .collect::<Vec<_>>();
+        if !active.is_empty() {
+            let mut active_eastward = Vec::with_capacity(time_count * active.len());
+            let mut active_northward = Vec::with_capacity(time_count * active.len());
+            for time in 0..time_count {
+                let row = time * series_count;
+                active_eastward.extend(active.iter().map(|series| eastward[row + series]));
+                active_northward.extend(active.iter().map(|series| northward[row + series]));
+            }
+            let active_latitudes = active
+                .iter()
+                .map(|series| latitudes[*series])
+                .collect::<Vec<_>>();
+            let active_solutions = solve_vector_input(
+                worker_pool,
+                batch,
+                &active_eastward,
+                &active_northward,
+                &active_latitudes,
+                0,
+                analysis_method,
+                confidence_interval,
+            )?;
+            for (series, solution) in active.into_iter().zip(active_solutions) {
+                solutions[series] = Some(solution);
+            }
+        }
+        return solutions
+            .into_iter()
+            .map(|solution| {
+                solution.ok_or(AnalysisError::InvalidSolutionShape {
+                    field: "fixed-depth solution",
+                    actual: 0,
+                    expected: 1,
+                })
+            })
+            .collect();
+    }
+    let mut first = 0;
+    while first < series_count {
+        if observation_counts[first] < minimum_observations {
+            first += 1;
+            continue;
+        }
+        let mut end = first + 1;
+        while end < series_count && observation_counts[end] >= minimum_observations {
+            end += 1;
+        }
+        let run_count = end - first;
+        let mut run_eastward = Vec::with_capacity(time_count * run_count);
+        let mut run_northward = Vec::with_capacity(time_count * run_count);
+        for time in 0..time_count {
+            let row = time * series_count;
+            run_eastward.extend_from_slice(&eastward[row + first..row + end]);
+            run_northward.extend_from_slice(&northward[row + first..row + end]);
+        }
+        let run_solutions = solve_vector_input(
+            worker_pool,
+            batch,
+            &run_eastward,
+            &run_northward,
+            &latitudes[first..end],
+            series_offset + first,
+            analysis_method,
+            confidence_interval,
+        )?;
+        for (position, solution) in (first..end).zip(run_solutions) {
+            solutions[position] = Some(solution);
+        }
+        first = end;
+    }
+    solutions
+        .into_iter()
+        .map(|solution| {
+            solution.ok_or(AnalysisError::InvalidSolutionShape {
+                field: "fixed-depth solution",
+                actual: 0,
+                expected: 1,
+            })
+        })
+        .collect()
+}
+
+fn diagnose_vector_sampling_with_unavailable(
+    worker_pool: &rayon::ThreadPool,
+    plan: &rutide_core::SamplingDiagnosticsPlan,
+    frequencies: &[Vec<f64>],
+    eastward: &[f64],
+    northward: &[f64],
+    observation_counts: &[usize],
+    minimum_observations: usize,
+) -> Result<Vec<CoreSamplingDiagnostics>, AnalysisError> {
+    let series_count = frequencies.len();
+    worker_pool.install(|| {
+        (0..series_count)
+            .into_par_iter()
+            .map(|series| {
+                if observation_counts[series] < minimum_observations {
+                    return Ok(CoreSamplingDiagnostics {
+                        observation_count: observation_counts[series],
+                        record_span_days: 0.0,
+                        mean_sample_interval_hours: 0.0,
+                        largest_gap_hours: 0.0,
+                        residual_spectrum_method: ResidualSpectrumMethod::Fft,
+                        residual_spectrum_time_count: 0,
+                        spectral_band_bin_count: [0; 9],
+                        spectral_band_usable_bin_count: [0; 9],
+                    });
+                }
+                plan.diagnose_with(&frequencies[series], |time| {
+                    let index = time * series_count + series;
+                    eastward[index].is_finite() && northward[index].is_finite()
+                })
+            })
+            .collect()
+    })
+}
+
+fn reconstruct_vectors_with_unavailable(
+    worker_pool: &rayon::ThreadPool,
+    reconstructor: &GreenwichNodalReconstructor,
+    solutions: &[VectorSolution],
+    latitudes: &[f64],
+    filter: &ReconstructionFilter,
+    time_count: usize,
+) -> Result<Vec<VectorReconstruction>, AnalysisError> {
+    if solutions
+        .iter()
+        .all(|solution| solution.reference_time_days.is_finite())
+    {
+        return worker_pool.install(|| {
+            reconstructor.reconstruct_many_vectors_series_major(solutions, latitudes, filter)
+        });
+    }
+    let mut values = vec![
+        VectorReconstruction {
+            eastward: vec![f64::NAN; time_count],
+            northward: vec![f64::NAN; time_count],
+        };
+        solutions.len()
+    ];
+    let active = solutions
+        .iter()
+        .enumerate()
+        .filter_map(|(series, solution)| solution.reference_time_days.is_finite().then_some(series))
+        .collect::<Vec<_>>();
+    if !active.is_empty() {
+        let active_solutions = active
+            .iter()
+            .map(|series| solutions[*series].clone())
+            .collect::<Vec<_>>();
+        let active_latitudes = active
+            .iter()
+            .map(|series| latitudes[*series])
+            .collect::<Vec<_>>();
+        let reconstruction = worker_pool.install(|| {
+            reconstructor.reconstruct_many_vectors_series_major(
+                &active_solutions,
+                &active_latitudes,
+                filter,
+            )
+        })?;
+        for (series, reconstruction) in active.into_iter().zip(reconstruction) {
+            values[series] = reconstruction;
+        }
+    }
+    Ok(values)
+}
+
 fn validate_vector_config(config: &VectorAnalyzeConfig) -> Result<(), AppError> {
     validate_config(&AnalyzeConfig {
         input: config.input.clone(),
@@ -1129,6 +1658,31 @@ fn validate_vector_config(config: &VectorAnalyzeConfig) -> Result<(), AppError> 
             "inference requires at least one relationship".to_owned(),
         ));
     }
+    if config.layers.is_some() && config.fixed_depths_meters.is_some() {
+        return Err(AppError::Invalid(
+            "native sigma layers and fixed physical depths are mutually exclusive".to_owned(),
+        ));
+    }
+    if let Some(depths) = &config.fixed_depths_meters {
+        if depths.is_empty() {
+            return Err(AppError::Invalid(
+                "fixed-depth analysis requires at least one depth".to_owned(),
+            ));
+        }
+        let mut bits = BTreeSet::new();
+        for depth in depths {
+            if !depth.is_finite() || *depth <= 0.0 {
+                return Err(AppError::Invalid(
+                    "fixed depths must be finite positive metres below the free surface".to_owned(),
+                ));
+            }
+            if !bits.insert(depth.to_bits()) {
+                return Err(AppError::Invalid(format!(
+                    "fixed depth {depth} appears more than once"
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1138,7 +1692,7 @@ fn validate_vector_config(config: &VectorAnalyzeConfig) -> Result<(), AppError> 
 )]
 fn vector_profile(
     selection: &ResolvedConstituentSelection,
-    depth_resolved: bool,
+    vertical_mode: &str,
     analysis_method: AnalysisMethod,
     inferred: bool,
     fit_options: FitOptions,
@@ -1154,10 +1708,11 @@ fn vector_profile(
     let inference = if inferred { "inference-" } else { "" };
     let ordering = order_profile_suffix(constituent_order);
     let trend = if fit_options.trend { "" } else { "-no-trend" };
-    let vertical = if depth_resolved {
-        "sigma-layer-vector"
-    } else {
-        "vector"
+    let vertical = match vertical_mode {
+        "depth-averaged" => "vector",
+        "sigma-layer" => "sigma-layer-vector",
+        "fixed-depth" => "fixed-depth-vector",
+        _ => unreachable!("vertical modes are constructed internally"),
     };
     format!(
         "{selection}-{}-{}-{vertical}-{inference}{}{ordering}{trend}",
@@ -1170,7 +1725,7 @@ fn vector_profile(
 #[cfg(test)]
 fn read_fvcom_vector(path: &Path, selection: &NodeSelection) -> Result<VectorInputData, AppError> {
     let dataset = netcdf::open(path)?;
-    let metadata = read_fvcom_vector_metadata(path, &dataset, selection, None)?;
+    let metadata = read_fvcom_vector_metadata(path, &dataset, selection, None, None)?;
     let chunk = read_fvcom_vector_chunk(&dataset, &metadata, 0..metadata.series_count())?;
     Ok(VectorInputData {
         modified_julian_days: metadata.modified_julian_days,
@@ -1178,6 +1733,7 @@ fn read_fvcom_vector(path: &Path, selection: &NodeSelection) -> Result<VectorInp
         discarded_timestamp_count: metadata.discarded_timestamp_count,
         element_indices: metadata.element_indices,
         layer_indices: metadata.layer_indices,
+        fixed_depths_meters: metadata.fixed_depths_meters,
         latitudes: metadata.latitudes,
         #[cfg(test)]
         eastward: chunk.eastward,
@@ -1189,25 +1745,39 @@ fn read_fvcom_vector(path: &Path, selection: &NodeSelection) -> Result<VectorInp
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one metadata pass validates both native and fixed-depth FVCOM schemas"
+)]
 fn read_fvcom_vector_metadata(
     path: &Path,
     dataset: &netcdf::File,
     selection: &NodeSelection,
     layer_selection: Option<&NodeSelection>,
+    fixed_depths_meters: Option<&[f64]>,
 ) -> Result<VectorInputMetadata, AppError> {
     let input_file_bytes = fs::metadata(path)?.len();
     let time_count = required_dimension_length(dataset, "time")?;
     let element_count = required_dimension_length(dataset, "nele")?;
     let element_indices = resolve_element_selection(selection, element_count)?;
+    let source_layer_count = (layer_selection.is_some() || fixed_depths_meters.is_some())
+        .then(|| required_dimension_length(dataset, "siglay"))
+        .transpose()?;
     let layer_indices = layer_selection
         .map(|selection| {
-            let layer_count = required_dimension_length(dataset, "siglay")?;
+            let layer_count = source_layer_count.ok_or_else(|| {
+                AppError::Invalid("source siglay dimension was not resolved".to_owned())
+            })?;
             resolve_layer_selection(selection, layer_count)
         })
         .transpose()?;
+    let fixed_depths_meters = fixed_depths_meters.map(<[f64]>::to_vec);
     let series_count = element_indices
         .len()
-        .checked_mul(layer_indices.as_ref().map_or(1, Vec::len))
+        .checked_mul(layer_indices.as_ref().map_or_else(
+            || fixed_depths_meters.as_ref().map_or(1, Vec::len),
+            Vec::len,
+        ))
         .ok_or_else(|| AppError::Invalid("vector series count exceeds usize".to_owned()))?;
 
     let (time_axis, time_element_bytes) = read_fvcom_time_axis(dataset, time_count)?;
@@ -1215,7 +1785,8 @@ fn read_fvcom_vector_metadata(
     let latitude_variable = required_variable(dataset, "latc")?;
     validate_dimensions(&latitude_variable, &[("nele", element_count)])?;
     let latitude_fill = latitude_variable.fill_value::<f32>()?;
-    let (eastward_name, northward_name) = if layer_indices.is_some() {
+    let depth_resolved = layer_indices.is_some() || fixed_depths_meters.is_some();
+    let (eastward_name, northward_name) = if depth_resolved {
         ("u", "v")
     } else {
         ("ua", "va")
@@ -1224,20 +1795,14 @@ fn read_fvcom_vector_metadata(
         dataset,
         eastward_name,
         time_count,
-        layer_indices
-            .as_ref()
-            .map(|_| required_dimension_length(dataset, "siglay"))
-            .transpose()?,
+        source_layer_count,
         element_count,
     )?;
     let northward_variable = required_vector_variable(
         dataset,
         northward_name,
         time_count,
-        layer_indices
-            .as_ref()
-            .map(|_| required_dimension_length(dataset, "siglay"))
-            .transpose()?,
+        source_layer_count,
         element_count,
     )?;
     let eastward_fill = eastward_variable.fill_value::<f32>()?;
@@ -1248,16 +1813,134 @@ fn read_fvcom_vector_metadata(
     for (series, value) in latitude_values.iter().copied().enumerate() {
         validate_source_value("latc", value, latitude_fill, series, 0)?;
     }
+    let source_current_series_count = if fixed_depths_meters.is_some() {
+        element_indices
+            .len()
+            .checked_mul(source_layer_count.unwrap_or(0))
+            .ok_or_else(|| {
+                AppError::Invalid("source current series count exceeds usize".to_owned())
+            })?
+    } else {
+        series_count
+    };
     let value_count = time_count
-        .checked_mul(series_count)
+        .checked_mul(source_current_series_count)
         .ok_or_else(|| AppError::Invalid("logical input size exceeds usize".to_owned()))?;
-    let logical_input_bytes = logical_input_bytes(&[
+    let mut logical_inputs = vec![
         (time_count, time_element_bytes[0]),
         (time_count, time_element_bytes[1]),
         (series_count, latitude_variable.vartype().size()),
         (value_count, eastward_variable.vartype().size()),
         (value_count, northward_variable.vartype().size()),
-    ])?;
+    ];
+    let fixed_depth_source = if fixed_depths_meters.is_some() {
+        let layer_count = source_layer_count
+            .ok_or_else(|| AppError::Invalid("fixed-depth input requires siglay".to_owned()))?;
+        if layer_count < 2 {
+            return Err(AppError::Invalid(
+                "fixed-depth interpolation requires at least two siglay layers".to_owned(),
+            ));
+        }
+        let node_count = required_dimension_length(dataset, "node")?;
+        let three_count = required_dimension_length(dataset, "three")?;
+        if three_count != 3 {
+            return Err(AppError::Invalid(format!(
+                "source three dimension must have length 3, received {three_count}"
+            )));
+        }
+        let sigma_variable = required_variable(dataset, "siglay")?;
+        validate_dimensions(
+            &sigma_variable,
+            &[("siglay", layer_count), ("node", node_count)],
+        )?;
+        let bathymetry_variable = required_variable(dataset, "h")?;
+        validate_dimensions(&bathymetry_variable, &[("node", node_count)])?;
+        let zeta_variable = required_variable(dataset, "zeta")?;
+        validate_dimensions(
+            &zeta_variable,
+            &[("time", time_count), ("node", node_count)],
+        )?;
+        let connectivity_variable = required_variable(dataset, "nv")?;
+        validate_dimensions(
+            &connectivity_variable,
+            &[("three", 3), ("nele", element_count)],
+        )?;
+        let wet_cells_variable = required_variable(dataset, "wet_cells")?;
+        validate_dimensions(
+            &wet_cells_variable,
+            &[("time", time_count), ("nele", element_count)],
+        )?;
+
+        let sigma_fill = sigma_variable.fill_value::<f32>()?;
+        let bathymetry_fill = bathymetry_variable.fill_value::<f32>()?;
+        let zeta_fill = zeta_variable.fill_value::<f32>()?;
+        let wet_cells_fill = wet_cells_variable.fill_value::<i32>()?;
+        let node_sigma = sigma_variable.get_values::<f64, _>(..)?;
+        let node_bathymetry = bathymetry_variable.get_values::<f64, _>(..)?;
+        let connectivity = connectivity_variable.get_values::<i32, _>(..)?;
+        let mut element_nodes = Vec::with_capacity(element_indices.len());
+        for &element in &element_indices {
+            let mut nodes = [0; 3];
+            for vertex in 0..3 {
+                let one_based = connectivity[vertex * element_count + element];
+                if one_based <= 0
+                    || usize::try_from(one_based).map_or(true, |node| node > node_count)
+                {
+                    return Err(AppError::Invalid(format!(
+                        "nv contains invalid one-based node {one_based} at vertex {vertex}, element {element}"
+                    )));
+                }
+                nodes[vertex] = usize::try_from(one_based - 1).map_err(|_| {
+                    AppError::Invalid("FVCOM connectivity index exceeds usize".to_owned())
+                })?;
+            }
+            element_nodes.push(nodes);
+        }
+        let selected_nodes = element_nodes
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len();
+        let selected_sigma_count = layer_count.checked_mul(selected_nodes).ok_or_else(|| {
+            AppError::Invalid("logical fixed-depth geometry size exceeds usize".to_owned())
+        })?;
+        logical_inputs.extend([
+            (selected_sigma_count, sigma_variable.vartype().size()),
+            (selected_nodes, bathymetry_variable.vartype().size()),
+            (
+                time_count.checked_mul(selected_nodes).ok_or_else(|| {
+                    AppError::Invalid("logical zeta size exceeds usize".to_owned())
+                })?,
+                zeta_variable.vartype().size(),
+            ),
+            (
+                element_indices.len() * 3,
+                connectivity_variable.vartype().size(),
+            ),
+            (
+                time_count
+                    .checked_mul(element_indices.len())
+                    .ok_or_else(|| {
+                        AppError::Invalid("logical wet-cell size exceeds usize".to_owned())
+                    })?,
+                wet_cells_variable.vartype().size(),
+            ),
+        ]);
+        Some(FixedDepthSource {
+            source_layer_count: layer_count,
+            element_nodes,
+            node_sigma,
+            node_bathymetry,
+            sigma_fill,
+            bathymetry_fill,
+            zeta_fill,
+            wet_cells_fill,
+        })
+    } else {
+        None
+    };
+    let logical_input_bytes = logical_input_bytes(&logical_inputs)?;
     let source_time_count = time_axis.source_count();
     let discarded_timestamp_count = time_axis.discarded_count();
     let (modified_julian_days, retained_time_indices) = time_axis.into_parts();
@@ -1268,6 +1951,8 @@ fn read_fvcom_vector_metadata(
         discarded_timestamp_count,
         element_indices,
         layer_indices,
+        fixed_depths_meters,
+        fixed_depth_source,
         latitudes: latitude_values,
         eastward_fill,
         northward_fill,
@@ -1281,6 +1966,11 @@ fn read_fvcom_vector_chunk(
     metadata: &VectorInputMetadata,
     series_range: std::ops::Range<usize>,
 ) -> Result<VectorInputChunk, AppError> {
+    if metadata.is_fixed_depth() {
+        return Err(AppError::Invalid(
+            "fixed-depth input must be read in element blocks".to_owned(),
+        ));
+    }
     if series_range.end > metadata.series_count() {
         return Err(AppError::Invalid(
             "vector chunk range exceeds selected series count".to_owned(),
@@ -1369,6 +2059,260 @@ fn read_fvcom_vector_chunk(
         northward,
         observation_counts,
     })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the fixed-depth reader keeps the joint geometry/current mask auditable"
+)]
+fn read_fvcom_fixed_depth_element_chunk(
+    dataset: &netcdf::File,
+    metadata: &VectorInputMetadata,
+    element_range: std::ops::Range<usize>,
+) -> Result<Vec<VectorInputChunk>, AppError> {
+    let depths = metadata.fixed_depths_meters.as_deref().ok_or_else(|| {
+        AppError::Invalid("fixed-depth reader requires requested depths".to_owned())
+    })?;
+    let source = metadata.fixed_depth_source.as_ref().ok_or_else(|| {
+        AppError::Invalid("fixed-depth reader requires FVCOM vertical geometry".to_owned())
+    })?;
+    if element_range.is_empty() || element_range.end > metadata.element_indices.len() {
+        return Err(AppError::Invalid(
+            "fixed-depth element chunk is empty or out of bounds".to_owned(),
+        ));
+    }
+    let selected_elements = &metadata.element_indices[element_range.clone()];
+    let source_element_nodes = &source.element_nodes[element_range.clone()];
+    let selected_nodes = source_element_nodes
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut local_element_nodes = Vec::with_capacity(selected_elements.len());
+    for nodes in source_element_nodes {
+        let mut local = [0; 3];
+        for (vertex, node) in nodes.iter().copied().enumerate() {
+            local[vertex] = selected_nodes.binary_search(&node).map_err(|_| {
+                AppError::Invalid("fixed-depth node map is inconsistent".to_owned())
+            })?;
+        }
+        local_element_nodes.push(local);
+    }
+
+    let all_layers = (0..source.source_layer_count).collect::<Vec<_>>();
+    let native_series_count = source
+        .source_layer_count
+        .checked_mul(selected_elements.len())
+        .ok_or_else(|| AppError::Invalid("fixed-depth source chunk exceeds usize".to_owned()))?;
+    let mut eastward = read_selected_layer_element_time_major(
+        &required_variable(dataset, "u")?,
+        metadata.source_time_count,
+        &all_layers,
+        selected_elements,
+        0..native_series_count,
+    )?;
+    let mut northward = read_selected_layer_element_time_major(
+        &required_variable(dataset, "v")?,
+        metadata.source_time_count,
+        &all_layers,
+        selected_elements,
+        0..native_series_count,
+    )?;
+    eastward = retain_time_major_rows(
+        eastward,
+        metadata.source_time_count,
+        native_series_count,
+        &metadata.retained_time_indices,
+    )?;
+    northward = retain_time_major_rows(
+        northward,
+        metadata.source_time_count,
+        native_series_count,
+        &metadata.retained_time_indices,
+    )?;
+    for index in 0..eastward.len() {
+        let native_series = index % native_series_count;
+        let time = index / native_series_count;
+        eastward[index] = normalize_source_observation(
+            "u",
+            eastward[index],
+            metadata.eastward_fill,
+            native_series,
+            time,
+        )?;
+        northward[index] = normalize_source_observation(
+            "v",
+            northward[index],
+            metadata.northward_fill,
+            native_series,
+            time,
+        )?;
+    }
+
+    let zeta_variable = required_variable(dataset, "zeta")?;
+    let mut zeta =
+        read_selected_time_major(&zeta_variable, metadata.source_time_count, &selected_nodes)?;
+    zeta = retain_time_major_rows(
+        zeta,
+        metadata.source_time_count,
+        selected_nodes.len(),
+        &metadata.retained_time_indices,
+    )?;
+    for (index, value) in zeta.iter_mut().enumerate() {
+        *value = normalize_source_observation(
+            "zeta",
+            *value,
+            source.zeta_fill,
+            index % selected_nodes.len(),
+            index / selected_nodes.len(),
+        )?;
+    }
+
+    let wet_variable = required_variable(dataset, "wet_cells")?;
+    let mut wet_cells =
+        read_selected_time_major(&wet_variable, metadata.source_time_count, selected_elements)?;
+    wet_cells = retain_time_major_rows(
+        wet_cells,
+        metadata.source_time_count,
+        selected_elements.len(),
+        &metadata.retained_time_indices,
+    )?;
+    for (index, value) in wet_cells.iter_mut().enumerate() {
+        if source
+            .wet_cells_fill
+            .is_some_and(|fill| value.to_bits() == f64::from(fill).to_bits())
+            || value.is_nan()
+        {
+            *value = f64::NAN;
+        } else if !value.is_finite()
+            || (value.to_bits() != 0.0_f64.to_bits() && value.to_bits() != 1.0_f64.to_bits())
+        {
+            return Err(AppError::Invalid(format!(
+                "wet_cells must contain only 0, 1, or its missing value; received {value} at selected element {}, retained time {}",
+                index % selected_elements.len(),
+                index / selected_elements.len(),
+            )));
+        }
+    }
+
+    let time_count = metadata.modified_julian_days.len();
+    let element_count = selected_elements.len();
+    let output_value_count = time_count
+        .checked_mul(element_count)
+        .ok_or_else(|| AppError::Invalid("fixed-depth output chunk exceeds usize".to_owned()))?;
+    let mut chunks = depths
+        .iter()
+        .map(|_| VectorInputChunk {
+            eastward: vec![f64::NAN; output_value_count],
+            northward: vec![f64::NAN; output_value_count],
+            observation_counts: vec![0; element_count],
+        })
+        .collect::<Vec<_>>();
+    let node_count = source.node_bathymetry.len();
+    let static_value = |name: &str,
+                        value: f64,
+                        fill: Option<f32>,
+                        node: usize,
+                        layer: Option<usize>|
+     -> Result<f64, AppError> {
+        if fill.is_some_and(|fill| value.to_bits() == f64::from(fill).to_bits()) || value.is_nan() {
+            return Ok(f64::NAN);
+        }
+        if !value.is_finite() {
+            return Err(AppError::Invalid(format!(
+                "{name} contains an infinite value at node {node}{}",
+                layer.map_or_else(String::new, |layer| format!(", layer {layer}")),
+            )));
+        }
+        Ok(value)
+    };
+    let mut layer_depths = vec![0.0; source.source_layer_count];
+    for time in 0..time_count {
+        for element in 0..element_count {
+            if wet_cells[time * element_count + element].to_bits() != 1.0_f64.to_bits() {
+                continue;
+            }
+            let nodes = source_element_nodes[element];
+            let local_nodes = local_element_nodes[element];
+            let mut geometry_valid = true;
+            for (layer, layer_depth) in layer_depths.iter_mut().enumerate() {
+                let mut total = 0.0;
+                for vertex in 0..3 {
+                    let node = nodes[vertex];
+                    let sigma = static_value(
+                        "siglay",
+                        source.node_sigma[layer * node_count + node],
+                        source.sigma_fill,
+                        node,
+                        Some(layer),
+                    )?;
+                    let bathymetry = static_value(
+                        "h",
+                        source.node_bathymetry[node],
+                        source.bathymetry_fill,
+                        node,
+                        None,
+                    )?;
+                    let surface = zeta[time * selected_nodes.len() + local_nodes[vertex]];
+                    if !sigma.is_finite() || !bathymetry.is_finite() || !surface.is_finite() {
+                        geometry_valid = false;
+                        break;
+                    }
+                    total += -sigma * (bathymetry + surface);
+                }
+                *layer_depth = total / 3.0;
+            }
+            if !geometry_valid
+                || layer_depths
+                    .windows(2)
+                    .any(|pair| !pair[0].is_finite() || pair[1] <= pair[0])
+            {
+                continue;
+            }
+            for (depth_position, target) in depths.iter().copied().enumerate() {
+                let Some(lower_layer) = layer_depths
+                    .windows(2)
+                    .position(|pair| target >= pair[0] && target <= pair[1])
+                else {
+                    continue;
+                };
+                let upper_layer = lower_layer + 1;
+                let lower_depth = layer_depths[lower_layer];
+                let weight = (target - lower_depth) / (layer_depths[upper_layer] - lower_depth);
+                let lower_series = lower_layer * element_count + element;
+                let upper_series = upper_layer * element_count + element;
+                let source_row = time * native_series_count;
+                let u0 = eastward[source_row + lower_series];
+                let u1 = eastward[source_row + upper_series];
+                let v0 = northward[source_row + lower_series];
+                let v1 = northward[source_row + upper_series];
+                let interpolated = if target.to_bits() == lower_depth.to_bits() {
+                    u0.is_finite()
+                        .then_some((u0, v0))
+                        .filter(|(_, v)| v.is_finite())
+                } else if target.to_bits() == layer_depths[upper_layer].to_bits() {
+                    u1.is_finite()
+                        .then_some((u1, v1))
+                        .filter(|(_, v)| v.is_finite())
+                } else if u0.is_finite() && u1.is_finite() && v0.is_finite() && v1.is_finite() {
+                    Some((u0 + weight * (u1 - u0), v0 + weight * (v1 - v0)))
+                } else {
+                    None
+                };
+                let Some((interpolated_u, interpolated_v)) = interpolated else {
+                    continue;
+                };
+                let destination = time * element_count + element;
+                let chunk = &mut chunks[depth_position];
+                chunk.eastward[destination] = interpolated_u;
+                chunk.northward[destination] = interpolated_v;
+                chunk.observation_counts[element] += 1;
+            }
+        }
+    }
+    Ok(chunks)
 }
 
 fn read_selected_layer_element_time_major(
@@ -1616,6 +2560,9 @@ fn vector_solution_frequencies(
     solutions
         .iter()
         .map(|solution| {
+            if !solution.reference_time_days.is_finite() {
+                return Ok(vec![f64::NAN; batch.constituents().len()]);
+            }
             batch
                 .constituents_at_reference_modified_julian_day(solution.reference_time_days)
                 .map(|constituents| {
@@ -1685,7 +2632,9 @@ fn vector_result_digest(
     reconstruction: Option<(&ReconstructionFilter, &[VectorReconstruction])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    if input.is_depth_resolved() {
+    if input.is_fixed_depth() {
+        digest.update(b"rutide-vector-fixed-depth-v13\0");
+    } else if input.is_depth_resolved() {
         digest.update(b"rutide-vector-sampling-v12\0");
     } else {
         digest.update(b"rutide-vector-sampling-v10\0");
@@ -1696,6 +2645,11 @@ fn vector_result_digest(
     digest.update(nodal_corrections.name().as_bytes());
     digest.update([0]);
     update_constituent_order_digest(&mut digest, constituent_order, constituent_index_by_rank);
+    if input.is_fixed_depth() {
+        for solution in solutions {
+            digest.update([u8::from(!solution.reference_time_days.is_finite())]);
+        }
+    }
     update_sampling_digest(&mut digest, sampling_diagnostics)?;
     digest.update(analysis_method.name().as_bytes());
     if let AnalysisMethod::Robust(options) = analysis_method {
@@ -1732,13 +2686,16 @@ fn vector_result_digest(
     for (series, (frequency_cph, solution)) in
         series_frequency_cph.iter().zip(solutions).enumerate()
     {
-        let (layer_index, element_index, latitude) = input.series_coordinates(series);
+        let (layer_index, depth, element_index, latitude) = input.series_coordinates(series);
         if let Some(layer) = layer_index {
             digest.update(
                 u64::try_from(layer)
                     .map_err(|_| AppError::Invalid("layer index exceeds u64".to_owned()))?
                     .to_le_bytes(),
             );
+        }
+        if let Some(depth) = depth {
+            digest.update(depth.to_bits().to_le_bytes());
         }
         digest.update(
             u64::try_from(element_index)
@@ -1813,6 +2770,7 @@ fn read_layered_series_values<T: netcdf::NcTypeDescriptor + Copy>(
     row_count: usize,
     row_width: usize,
 ) -> Result<Vec<T>, AppError> {
+    let has_trailing_dimension = variable.dimensions().len() == 3;
     let mut values = Vec::with_capacity(row_count * row_width);
     let mut local_first = 0;
     while local_first < row_count {
@@ -1824,7 +2782,7 @@ fn read_layered_series_values<T: netcdf::NcTypeDescriptor + Copy>(
             netcdf::Extent::Index(layer),
             netcdf::Extent::from(element..element + rows),
         ];
-        if row_width > 1 {
+        if has_trailing_dimension {
             extents.push(netcdf::Extent::from(..));
         }
         values.extend(variable.get_values::<T, _>(extents)?);
@@ -1855,6 +2813,46 @@ fn digest_nonnegative_i64(
     Ok(())
 }
 
+fn read_ragged_output_rows(
+    variable: &Variable<'_>,
+    row_starts: &[i64],
+    row_sizes: &[i64],
+) -> Result<Vec<f64>, AppError> {
+    if row_starts.len() != row_sizes.len() {
+        return Err(AppError::Invalid(
+            "robust row starts and sizes differ in length".to_owned(),
+        ));
+    }
+    let mut values = Vec::new();
+    let mut first = 0;
+    while first < row_starts.len() {
+        let source_start = usize::try_from(row_starts[first])
+            .map_err(|_| AppError::Invalid("negative robust row start in output".to_owned()))?;
+        let first_size = usize::try_from(row_sizes[first])
+            .map_err(|_| AppError::Invalid("negative robust row size in output".to_owned()))?;
+        let mut source_end = source_start
+            .checked_add(first_size)
+            .ok_or_else(|| AppError::Invalid("robust row extent overflows".to_owned()))?;
+        let mut end = first + 1;
+        while end < row_starts.len() {
+            let next_start = usize::try_from(row_starts[end])
+                .map_err(|_| AppError::Invalid("negative robust row start in output".to_owned()))?;
+            if next_start != source_end {
+                break;
+            }
+            source_end = source_end
+                .checked_add(usize::try_from(row_sizes[end]).map_err(|_| {
+                    AppError::Invalid("negative robust row size in output".to_owned())
+                })?)
+                .ok_or_else(|| AppError::Invalid("robust row extent overflows".to_owned()))?;
+            end += 1;
+        }
+        values.extend(variable.get_values::<f64, _>(source_start..source_end)?);
+        first = end;
+    }
+    Ok(values)
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1878,7 +2876,7 @@ fn vector_result_digest_from_incremental_output(
 
     if !input.is_depth_resolved() {
         return Err(AppError::Invalid(
-            "incremental vector digest requires native sigma layers".to_owned(),
+            "incremental vector digest requires a resolved vertical coordinate".to_owned(),
         ));
     }
     let output = netcdf::open(path)?;
@@ -1886,7 +2884,11 @@ fn vector_result_digest_from_incremental_output(
     let series_count = input.series_count();
     let constituent_count = constituents.len();
     let mut digest = Sha256::new();
-    digest.update(b"rutide-vector-sampling-v12\0");
+    if input.is_fixed_depth() {
+        digest.update(b"rutide-vector-fixed-depth-v13\0");
+    } else {
+        digest.update(b"rutide-vector-sampling-v12\0");
+    }
     digest.update([u8::from(fit_options.trend)]);
     digest.update(phase_reference.name().as_bytes());
     digest.update([0]);
@@ -1915,6 +2917,7 @@ fn vector_result_digest_from_incremental_output(
         }
     }
 
+    let analysis_status = required_output_variable(&output, "analysis_status")?;
     let observation_count = required_output_variable(&output, "observation_count")?;
     let record_span = required_output_variable(&output, "sampling_record_span")?;
     let mean_interval = required_output_variable(&output, "sampling_mean_interval")?;
@@ -1925,6 +2928,13 @@ fn vector_result_digest_from_incremental_output(
     let usable_band_count = required_output_variable(&output, "spectral_band_usable_bin_count")?;
     for first_series in (0..series_count).step_by(DIGEST_SERIES_CHUNK) {
         let rows = (series_count - first_series).min(DIGEST_SERIES_CHUNK);
+        let statuses = read_layered_series_values::<i64>(
+            &analysis_status,
+            element_count,
+            first_series,
+            rows,
+            1,
+        )?;
         let observations = read_layered_series_values::<i64>(
             &observation_count,
             element_count,
@@ -1967,6 +2977,17 @@ fn vector_result_digest_from_incremental_output(
             9,
         )?;
         for series in 0..rows {
+            if input.is_fixed_depth() {
+                digest.update([match statuses[series] {
+                    0 => 0,
+                    1 => 1,
+                    value => {
+                        return Err(AppError::Invalid(format!(
+                            "invalid analysis status {value} in output"
+                        )));
+                    }
+                }]);
+            }
             digest_nonnegative_i64(&mut digest, observations[series], "observation count")?;
             digest.update(spans[series].to_bits().to_le_bytes());
             digest.update(intervals[series].to_bits().to_le_bytes());
@@ -2054,6 +3075,7 @@ fn vector_result_digest_from_incremental_output(
         None
     } else {
         Some((
+            required_output_variable(&output, "robust_weight_row_start")?,
             required_output_variable(&output, "robust_weight_row_size")?,
             required_output_variable(&output, "robust_iterations")?,
             required_output_variable(&output, "robust_termination")?,
@@ -2064,7 +3086,6 @@ fn vector_result_digest_from_incremental_output(
             required_output_variable(&output, "robust_leverage")?,
         ))
     };
-    let mut robust_offset = 0_usize;
     for first_series in (0..series_count).step_by(DIGEST_SERIES_CHUNK) {
         let rows = (series_count - first_series).min(DIGEST_SERIES_CHUNK);
         let reference_times = read_layered_series_values::<f64>(
@@ -2167,6 +3188,7 @@ fn vector_result_digest_from_incremental_output(
             .as_ref()
             .map(
                 |(
+                    row_start,
                     row_size,
                     iterations,
                     termination,
@@ -2176,6 +3198,13 @@ fn vector_result_digest_from_incremental_output(
                     weights,
                     leverage,
                 )| {
+                    let row_starts = read_layered_series_values::<i64>(
+                        row_start,
+                        element_count,
+                        first_series,
+                        rows,
+                        1,
+                    )?;
                     let row_sizes = read_layered_series_values::<i64>(
                         row_size,
                         element_count,
@@ -2183,18 +3212,9 @@ fn vector_result_digest_from_incremental_output(
                         rows,
                         1,
                     )?;
-                    let total = row_sizes.iter().try_fold(0_usize, |total, count| {
-                        total
-                            .checked_add(usize::try_from(*count).map_err(|_| {
-                                AppError::Invalid("negative robust row size in output".to_owned())
-                            })?)
-                            .ok_or_else(|| {
-                                AppError::Invalid("robust row-size sum overflows".to_owned())
-                            })
-                    })?;
-                    let end = robust_offset.checked_add(total).ok_or_else(|| {
-                        AppError::Invalid("robust digest offset overflows".to_owned())
-                    })?;
+                    let weight_values = read_ragged_output_rows(weights, &row_starts, &row_sizes)?;
+                    let leverage_values =
+                        read_ragged_output_rows(leverage, &row_starts, &row_sizes)?;
                     Ok::<_, AppError>((
                         row_sizes,
                         read_layered_series_values::<i64>(
@@ -2232,8 +3252,8 @@ fn vector_result_digest_from_incremental_output(
                             rows,
                             1,
                         )?,
-                        weights.get_values::<f64, _>(robust_offset..end)?,
-                        leverage.get_values::<f64, _>(robust_offset..end)?,
+                        weight_values,
+                        leverage_values,
                     ))
                 },
             )
@@ -2241,13 +3261,16 @@ fn vector_result_digest_from_incremental_output(
         let mut robust_local_offset = 0;
         for local_series in 0..rows {
             let series = first_series + local_series;
-            let (layer_index, element_index, latitude) = input.series_coordinates(series);
+            let (layer_index, depth, element_index, latitude) = input.series_coordinates(series);
             if let Some(layer) = layer_index {
                 digest.update(
                     u64::try_from(layer)
                         .map_err(|_| AppError::Invalid("layer index exceeds u64".to_owned()))?
                         .to_le_bytes(),
                 );
+            }
+            if let Some(depth) = depth {
+                digest.update(depth.to_bits().to_le_bytes());
             }
             digest.update(
                 u64::try_from(element_index)
@@ -2310,7 +3333,6 @@ fn vector_result_digest_from_incremental_output(
                 robust_local_offset = row_end;
             }
         }
-        robust_offset += robust_local_offset;
     }
 
     if let Some(filter) = reconstruction {
@@ -2361,11 +3383,17 @@ fn retained_vector_samples(
         .enumerate()
         .take(3)
         .map(|(series, (observation_count, solution))| {
-            let (layer_index, element_index, latitude_degrees_north) =
+            let (layer_index, depth_meters_below_surface, element_index, latitude_degrees_north) =
                 input.series_coordinates(series);
             VectorSampleResult {
                 element_index,
                 layer_index,
+                depth_meters_below_surface,
+                analysis_status: if solution.reference_time_days.is_finite() {
+                    "fitted"
+                } else {
+                    "unavailable"
+                },
                 latitude_degrees_north,
                 semi_major: solution.semi_major.clone(),
                 semi_minor: solution.semi_minor.clone(),
@@ -2396,7 +3424,7 @@ fn retained_vector_samples(
 }
 
 fn extend_retained_vector_samples(
-    retained: &mut Vec<VectorSampleResult>,
+    retained: &mut Vec<(usize, VectorSampleResult)>,
     input: &VectorInputData,
     first_series: usize,
     observation_counts: &[usize],
@@ -2404,39 +3432,51 @@ fn extend_retained_vector_samples(
     constituent_index_by_rank: &ConstituentOrderMap,
     sampling_diagnostics: &[CoreSamplingDiagnostics],
 ) {
-    let remaining = 3_usize.saturating_sub(retained.len());
-    for local_series in 0..solutions.len().min(remaining) {
+    for local_series in 0..solutions.len() {
         let series = first_series + local_series;
+        if series >= 3 {
+            continue;
+        }
         let solution = &solutions[local_series];
-        let (layer_index, element_index, latitude_degrees_north) = input.series_coordinates(series);
-        retained.push(VectorSampleResult {
-            element_index,
-            layer_index,
-            latitude_degrees_north,
-            semi_major: solution.semi_major.clone(),
-            semi_minor: solution.semi_minor.clone(),
-            inclination_degrees: solution.inclination_degrees.clone(),
-            phase_degrees: solution.phase_degrees.clone(),
-            percent_energy: solution.percent_energy.clone(),
-            constituent_index_by_rank: constituent_index_by_rank
-                .row(local_series)
-                .iter()
-                .copied()
-                .map(usize::from)
-                .collect(),
-            semi_major_ci: solution.semi_major_ci.clone(),
-            semi_minor_ci: solution.semi_minor_ci.clone(),
-            inclination_ci_degrees: solution.inclination_ci_degrees.clone(),
-            phase_ci_degrees: solution.phase_ci_degrees.clone(),
-            signal_to_noise: solution.signal_to_noise.clone(),
-            eastward_mean: solution.eastward_mean,
-            northward_mean: solution.northward_mean,
-            eastward_slope_per_day: solution.eastward_slope_per_day,
-            northward_slope_per_day: solution.northward_slope_per_day,
-            observation_count: observation_counts[local_series],
-            sampling: SeriesSamplingDiagnostics::from(&sampling_diagnostics[local_series]),
-            reference_time_modified_julian_day: solution.reference_time_days,
-        });
+        let (layer_index, depth_meters_below_surface, element_index, latitude_degrees_north) =
+            input.series_coordinates(series);
+        retained.push((
+            series,
+            VectorSampleResult {
+                element_index,
+                layer_index,
+                depth_meters_below_surface,
+                analysis_status: if solution.reference_time_days.is_finite() {
+                    "fitted"
+                } else {
+                    "unavailable"
+                },
+                latitude_degrees_north,
+                semi_major: solution.semi_major.clone(),
+                semi_minor: solution.semi_minor.clone(),
+                inclination_degrees: solution.inclination_degrees.clone(),
+                phase_degrees: solution.phase_degrees.clone(),
+                percent_energy: solution.percent_energy.clone(),
+                constituent_index_by_rank: constituent_index_by_rank
+                    .row(local_series)
+                    .iter()
+                    .copied()
+                    .map(usize::from)
+                    .collect(),
+                semi_major_ci: solution.semi_major_ci.clone(),
+                semi_minor_ci: solution.semi_minor_ci.clone(),
+                inclination_ci_degrees: solution.inclination_ci_degrees.clone(),
+                phase_ci_degrees: solution.phase_ci_degrees.clone(),
+                signal_to_noise: solution.signal_to_noise.clone(),
+                eastward_mean: solution.eastward_mean,
+                northward_mean: solution.northward_mean,
+                eastward_slope_per_day: solution.eastward_slope_per_day,
+                northward_slope_per_day: solution.northward_slope_per_day,
+                observation_count: observation_counts[local_series],
+                sampling: SeriesSamplingDiagnostics::from(&sampling_diagnostics[local_series]),
+                reference_time_modified_julian_day: solution.reference_time_days,
+            },
+        ));
     }
 }
 
@@ -2488,7 +3528,10 @@ fn create_vector_output_base(
 ) -> Result<FileMut, AppError> {
     let input = data.input;
     let mut output = netcdf::create(path)?;
-    if let Some(layers) = &input.layer_indices {
+    if let Some(depths) = &input.fixed_depths_meters {
+        output.add_dimension("depth", depths.len())?;
+        output.add_dimension("element", input.element_indices.len())?;
+    } else if let Some(layers) = &input.layer_indices {
         output.add_dimension("siglay", layers.len())?;
         output.add_dimension("element", input.element_indices.len())?;
     } else {
@@ -2505,7 +3548,9 @@ fn create_vector_output_base(
     }
     output.add_attribute(
         "title",
-        if input.is_depth_resolved() {
+        if input.is_fixed_depth() {
+            "RUTide fixed-physical-depth current ellipses"
+        } else if input.is_depth_resolved() {
             "RUTide native sigma-layer current ellipses"
         } else {
             "RUTide depth-averaged current ellipses"
@@ -2544,7 +3589,7 @@ fn create_vector_output_base(
     )?;
     let profile = vector_profile(
         data.selection,
-        input.is_depth_resolved(),
+        input.vertical_mode(),
         data.analysis_method,
         data.inference.is_some(),
         data.fit_options,
@@ -2570,14 +3615,7 @@ fn create_vector_output_base(
                 .map_err(|_| AppError::Invalid("robust iteration limit exceeds i64".to_owned()))?,
         )?;
     }
-    output.add_attribute(
-        "vertical_mode",
-        if input.is_depth_resolved() {
-            "sigma-layer"
-        } else {
-            "depth-averaged"
-        },
-    )?;
+    output.add_attribute("vertical_mode", input.vertical_mode())?;
     output.add_attribute(
         "source_eastward_variable",
         if input.is_depth_resolved() { "u" } else { "ua" },
@@ -2586,7 +3624,17 @@ fn create_vector_output_base(
         "source_northward_variable",
         if input.is_depth_resolved() { "v" } else { "va" },
     )?;
-    if input.is_depth_resolved() {
+    if input.is_fixed_depth() {
+        output.add_attribute("source_vertical_dimension", "siglay")?;
+        output.add_attribute("vertical_interpolation", "linear-layer-centres")?;
+        output.add_attribute("vertical_extrapolation", "none")?;
+        output.add_attribute("vertical_reference", "instantaneous-free-surface")?;
+        output.add_attribute("wet_dry_mask", "wet_cells")?;
+        output.add_attribute(
+            "vertical_coordinate_note",
+            "positive metres below the instantaneous free surface at FVCOM element centroids",
+        )?;
+    } else if input.is_depth_resolved() {
         output.add_attribute("source_vertical_dimension", "siglay")?;
         output.add_attribute(
             "vertical_coordinate_note",
@@ -2673,6 +3721,13 @@ fn create_vector_output_base(
             "1",
         )?;
     }
+    if let Some(depths) = &input.fixed_depths_meters {
+        let mut variable = output.add_variable::<f64>("depth", &["depth"])?;
+        variable.put_attribute("units", "m")?;
+        variable.put_attribute("positive", "down")?;
+        variable.put_attribute("long_name", "depth below instantaneous free surface")?;
+        variable.put_values(depths, ..)?;
+    }
     Ok(output)
 }
 
@@ -2693,7 +3748,7 @@ impl IncrementalVectorOutput {
     fn create(destination: &Path, data: &VectorOutputDefinition<'_>) -> Result<Self, AppError> {
         if !data.input.is_depth_resolved() {
             return Err(AppError::Invalid(
-                "incremental vector output currently requires native sigma layers".to_owned(),
+                "incremental vector output requires a resolved vertical coordinate".to_owned(),
             ));
         }
         let temporary = temporary_sibling(destination)?;
@@ -2816,6 +3871,10 @@ fn define_incremental_vector_variables(
     let series_dimensions = data.input.series_dimensions();
     let solution_dimensions = data.input.solution_dimensions();
     add_variable_with_units::<i64>(output, "observation_count", series_dimensions, "1")?;
+    let mut status = output.add_variable::<i64>("analysis_status", series_dimensions)?;
+    status.put_attribute("units", "1")?;
+    status.put_attribute("flag_values", vec![0_i64, 1])?;
+    status.put_attribute("flag_meanings", "fitted unavailable")?;
     add_variable_with_units::<f64>(
         output,
         "reference_time",
@@ -2901,7 +3960,11 @@ fn define_incremental_vector_variables(
 
     if data.analysis_method != AnalysisMethod::Ols {
         output.add_unlimited_dimension("robust_observation")?;
-        for name in ["robust_weight_row_size", "robust_iterations"] {
+        for name in [
+            "robust_weight_row_start",
+            "robust_weight_row_size",
+            "robust_iterations",
+        ] {
             add_variable_with_units::<i64>(output, name, series_dimensions, "1")?;
         }
         output
@@ -2949,11 +4012,16 @@ fn define_incremental_vector_variables(
             &data.input.modified_julian_days,
             "days since 1858-11-17 00:00:00 UTC",
         )?;
+        let vertical_dimension = if data.input.is_fixed_depth() {
+            "depth"
+        } else {
+            "siglay"
+        };
         for name in ["eastward_reconstruction", "northward_reconstruction"] {
             add_variable_with_units::<f64>(
                 output,
                 name,
-                &["time", "siglay", "element"],
+                &["time", vertical_dimension, "element"],
                 "source velocity units",
             )?;
         }
@@ -2974,6 +4042,12 @@ fn put_layered_series_values<T: netcdf::NcTypeDescriptor + Copy>(
             "invalid incremental shape for {variable_name}"
         )));
     }
+    let has_trailing_dimension = output
+        .variable(variable_name)
+        .ok_or_else(|| AppError::Invalid(format!("missing output variable {variable_name}")))?
+        .dimensions()
+        .len()
+        == 3;
     let row_count = values.len() / row_width;
     let mut local_first = 0;
     while local_first < row_count {
@@ -2987,7 +4061,7 @@ fn put_layered_series_values<T: netcdf::NcTypeDescriptor + Copy>(
             netcdf::Extent::Index(layer),
             netcdf::Extent::from(element..element + rows),
         ];
-        if row_width > 1 {
+        if has_trailing_dimension {
             extents.push(netcdf::Extent::from(..));
         }
         output
@@ -3136,6 +4210,18 @@ fn write_incremental_vector_chunk(
                 .map_err(|_| AppError::Invalid("observation count exceeds i64".to_owned()))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let analysis_status = solutions
+        .iter()
+        .map(|solution| i64::from(!solution.reference_time_days.is_finite()))
+        .collect::<Vec<_>>();
+    put_layered_series_values(
+        output,
+        "analysis_status",
+        element_count,
+        first_series,
+        1,
+        &analysis_status,
+    )?;
     put_layered_series_values(
         output,
         "observation_count",
@@ -3394,6 +4480,7 @@ fn write_incremental_vector_chunk(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let mut row_start = Vec::with_capacity(series_count);
         let mut row_size = Vec::with_capacity(series_count);
         let mut iterations = Vec::with_capacity(series_count);
         let mut termination = Vec::with_capacity(series_count);
@@ -3404,15 +4491,24 @@ fn write_incremental_vector_chunk(
             .iter()
             .map(|diagnostics| diagnostics.weights.len())
             .sum();
+        let mut next_row_start = *robust_observation_offset;
         for diagnostics in &diagnostics {
             if diagnostics.weights.len() != diagnostics.leverage.len() {
                 return Err(AppError::Invalid(
                     "robust weight and leverage lengths differ".to_owned(),
                 ));
             }
+            row_start.push(i64::try_from(next_row_start).map_err(|_| {
+                AppError::Invalid("robust observation start exceeds i64".to_owned())
+            })?);
             row_size.push(i64::try_from(diagnostics.weights.len()).map_err(|_| {
                 AppError::Invalid("robust observation count exceeds i64".to_owned())
             })?);
+            next_row_start = next_row_start
+                .checked_add(diagnostics.weights.len())
+                .ok_or_else(|| {
+                    AppError::Invalid("robust observation offset overflows".to_owned())
+                })?;
             iterations.push(
                 i64::try_from(diagnostics.iterations).map_err(|_| {
                     AppError::Invalid("robust iteration count exceeds i64".to_owned())
@@ -3423,6 +4519,14 @@ fn write_incremental_vector_chunk(
             ols_rms_residual.push(diagnostics.ols_rms_residual);
             rms_residual.push(diagnostics.rms_residual);
         }
+        put_layered_series_values(
+            output,
+            "robust_weight_row_start",
+            element_count,
+            first_series,
+            1,
+            &row_start,
+        )?;
         for (name, values) in [
             ("robust_weight_row_size", &row_size),
             ("robust_iterations", &iterations),
@@ -3530,6 +4634,16 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
         &observation_counts,
         "1",
     )?;
+    let analysis_status = data
+        .solutions
+        .iter()
+        .map(|solution| i64::from(!solution.reference_time_days.is_finite()))
+        .collect::<Vec<_>>();
+    let mut status = output.add_variable::<i64>("analysis_status", input.series_dimensions())?;
+    status.put_attribute("units", "1")?;
+    status.put_attribute("flag_values", vec![0_i64, 1])?;
+    status.put_attribute("flag_meanings", "fitted unavailable")?;
+    status.put_values(&analysis_status, ..)?;
     let reference_times = data
         .solutions
         .iter()
@@ -3689,6 +4803,10 @@ fn write_vector_solution_variables(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the buffered robust schema is kept together to mirror incremental output"
+)]
 fn write_vector_robust_variables(
     output: &mut FileMut,
     solutions: &[VectorSolution],
@@ -3717,6 +4835,7 @@ fn write_vector_robust_variables(
         .map(|diagnostics| diagnostics.weights.len())
         .sum();
     output.add_dimension("robust_observation", total_observations)?;
+    let mut row_start = Vec::with_capacity(diagnostics.len());
     let mut row_size = Vec::with_capacity(diagnostics.len());
     let mut iterations = Vec::with_capacity(diagnostics.len());
     let mut termination = Vec::with_capacity(diagnostics.len());
@@ -3725,17 +4844,26 @@ fn write_vector_robust_variables(
     let mut rms_residual = Vec::with_capacity(diagnostics.len());
     let mut weights = Vec::with_capacity(total_observations);
     let mut leverage = Vec::with_capacity(total_observations);
+    let mut next_row_start = 0_usize;
     for diagnostics in diagnostics {
         if diagnostics.weights.len() != diagnostics.leverage.len() {
             return Err(AppError::Invalid(
                 "robust weight and leverage lengths differ".to_owned(),
             ));
         }
+        row_start.push(
+            i64::try_from(next_row_start).map_err(|_| {
+                AppError::Invalid("robust observation start exceeds i64".to_owned())
+            })?,
+        );
         row_size.push(
             i64::try_from(diagnostics.weights.len()).map_err(|_| {
                 AppError::Invalid("robust observation count exceeds i64".to_owned())
             })?,
         );
+        next_row_start = next_row_start
+            .checked_add(diagnostics.weights.len())
+            .ok_or_else(|| AppError::Invalid("robust observation offset overflows".to_owned()))?;
         iterations.push(
             i64::try_from(diagnostics.iterations)
                 .map_err(|_| AppError::Invalid("robust iteration count exceeds i64".to_owned()))?,
@@ -3747,6 +4875,11 @@ fn write_vector_robust_variables(
         weights.extend_from_slice(&diagnostics.weights);
         leverage.extend_from_slice(&diagnostics.leverage);
     }
+    write_variable(
+        &mut output.add_variable::<i64>("robust_weight_row_start", series_dimensions)?,
+        &row_start,
+        "1",
+    )?;
     for (name, values) in [
         ("robust_weight_row_size", &row_size),
         ("robust_iterations", &iterations),
@@ -3830,7 +4963,9 @@ fn write_vector_reconstruction_variables(
         ("eastward_reconstruction", true),
         ("northward_reconstruction", false),
     ] {
-        let dimensions = if input.is_depth_resolved() {
+        let dimensions = if input.is_fixed_depth() {
+            vec!["time", "depth", "element"]
+        } else if input.is_depth_resolved() {
             vec!["time", "siglay", "element"]
         } else {
             vec!["time", "series"]
@@ -3869,9 +5004,384 @@ mod tests {
 
     use super::{
         AnalysisMethod, ConfidenceInterval, ConstituentOrder, ConstituentSelection, NodeSelection,
-        VectorAnalyzeConfig, VectorInferenceConfig, analyze_vector, read_fvcom_vector,
+        VectorAnalyzeConfig, VectorInferenceConfig, analyze_vector,
+        read_fvcom_fixed_depth_element_chunk, read_fvcom_vector, read_fvcom_vector_metadata,
         temporary_sibling,
     };
+
+    #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::too_many_lines,
+        reason = "the f32 FVCOM fixture freezes physical interpolation and masking semantics"
+    )]
+    fn fixed_depth_interpolation_is_physical_masked_and_chunk_invariant() {
+        let input_path =
+            temporary_sibling(&std::env::temp_dir().join("rutide-fixed-depth-input-test.nc"))
+                .expect("valid fixed-depth input path");
+        let output_path =
+            temporary_sibling(&std::env::temp_dir().join("rutide-fixed-depth-output-test.nc"))
+                .expect("valid fixed-depth output path");
+        let chunked_output_path = temporary_sibling(
+            &std::env::temp_dir().join("rutide-fixed-depth-chunked-output-test.nc"),
+        )
+        .expect("valid fixed-depth chunked output path");
+        let unavailable_output_path = temporary_sibling(
+            &std::env::temp_dir().join("rutide-fixed-depth-unavailable-output-test.nc"),
+        )
+        .expect("valid unavailable output path");
+        let mixed_output_path = temporary_sibling(
+            &std::env::temp_dir().join("rutide-fixed-depth-mixed-output-test.nc"),
+        )
+        .expect("valid mixed output path");
+        let mixed_chunked_output_path = temporary_sibling(
+            &std::env::temp_dir().join("rutide-fixed-depth-mixed-chunked-output-test.nc"),
+        )
+        .expect("valid mixed chunked output path");
+        let time_count = 72_usize;
+        let element_count = 2_usize;
+        let node_count = 6_usize;
+        let layer_count = 3_usize;
+        let fill = -999.0_f32;
+        let mut dataset = netcdf::create(&input_path).expect("create fixed-depth fixture");
+        for (name, length) in [
+            ("time", time_count),
+            ("nele", element_count),
+            ("node", node_count),
+            ("siglay", layer_count),
+            ("three", 3),
+        ] {
+            dataset.add_dimension(name, length).expect("add dimension");
+        }
+        dataset
+            .add_variable::<i32>("Itime", &["time"])
+            .expect("add Itime")
+            .put_values(&vec![58_113_i32; time_count], ..)
+            .expect("write Itime");
+        dataset
+            .add_variable::<i32>("Itime2", &["time"])
+            .expect("add Itime2")
+            .put_values(
+                &(0..time_count)
+                    .map(|time| i32::try_from(time).expect("small time") * 3_600_000)
+                    .collect::<Vec<_>>(),
+                ..,
+            )
+            .expect("write Itime2");
+        dataset
+            .add_variable::<f32>("latc", &["nele"])
+            .expect("add latc")
+            .put_values(&[60.0, 61.0], ..)
+            .expect("write latc");
+        dataset
+            .add_variable::<i32>("nv", &["three", "nele"])
+            .expect("add nv")
+            .put_values(&[1, 4, 2, 5, 3, 6], ..)
+            .expect("write nv");
+        {
+            let mut variable = dataset.add_variable::<f32>("h", &["node"]).expect("add h");
+            variable.set_fill_value(fill).expect("set h fill");
+            variable
+                .put_values(&[20.0, 20.0, 20.0, 30.0, 30.0, 30.0], ..)
+                .expect("write h");
+        }
+        {
+            let mut variable = dataset
+                .add_variable::<f32>("siglay", &["siglay", "node"])
+                .expect("add siglay");
+            variable.set_fill_value(fill).expect("set sigma fill");
+            let sigma = [-0.25_f32, -0.5, -0.75]
+                .into_iter()
+                .flat_map(|sigma| std::iter::repeat_n(sigma, node_count))
+                .collect::<Vec<_>>();
+            variable.put_values(&sigma, ..).expect("write siglay");
+        }
+        let mut zeta = Vec::with_capacity(time_count * node_count);
+        let mut wet_cells = vec![1_i32; time_count * element_count];
+        let mut eastward = Vec::with_capacity(time_count * layer_count * element_count);
+        let mut northward = Vec::with_capacity(time_count * layer_count * element_count);
+        for time in 0..time_count {
+            let position = f64::from(u32::try_from(time).expect("small time"));
+            let surface = 0.4 * (position / 9.0).sin();
+            zeta.extend(std::iter::repeat_n(surface as f32, node_count));
+            for layer_fraction in [0.25_f64, 0.5, 0.75] {
+                for element_depth in [20.0_f64, 30.0] {
+                    let layer_depth = layer_fraction * (element_depth + surface);
+                    let eastward_base = 0.3 + (position / 5.0).sin();
+                    let northward_base = -0.2 + (position / 7.0).cos();
+                    eastward.push((eastward_base + 2.0 * layer_depth) as f32);
+                    northward.push((northward_base - 0.5 * layer_depth) as f32);
+                }
+            }
+        }
+        wet_cells[6 * element_count + 1] = 0;
+        zeta[7 * node_count + 3] = fill;
+        eastward[0] = fill;
+        northward[(5 * layer_count + 1) * element_count] = fill;
+        {
+            let mut variable = dataset
+                .add_variable::<f32>("zeta", &["time", "node"])
+                .expect("add zeta");
+            variable.set_fill_value(fill).expect("set zeta fill");
+            variable.put_values(&zeta, ..).expect("write zeta");
+        }
+        dataset
+            .add_variable::<i32>("wet_cells", &["time", "nele"])
+            .expect("add wet cells")
+            .put_values(&wet_cells, ..)
+            .expect("write wet cells");
+        for (name, values) in [("u", &eastward), ("v", &northward)] {
+            let mut variable = dataset
+                .add_variable::<f32>(name, &["time", "siglay", "nele"])
+                .expect("add current component");
+            variable.set_fill_value(fill).expect("set current fill");
+            variable.put_values(values, ..).expect("write current");
+        }
+        dataset.close().expect("close fixed-depth fixture");
+
+        let source = netcdf::open(&input_path).expect("open fixed-depth fixture");
+        let metadata = read_fvcom_vector_metadata(
+            &input_path,
+            &source,
+            &NodeSelection::All,
+            None,
+            Some(&[8.0, 12.0]),
+        )
+        .expect("read fixed-depth metadata");
+        let chunks = read_fvcom_fixed_depth_element_chunk(&source, &metadata, 0..2)
+            .expect("interpolate fixed depths");
+        assert_eq!(chunks.len(), 2);
+        for (depth_position, target) in [8.0_f64, 12.0].into_iter().enumerate() {
+            let chunk = &chunks[depth_position];
+            assert_eq!(
+                chunk.observation_counts,
+                if depth_position == 0 {
+                    [70, 70]
+                } else {
+                    [71, 70]
+                }
+            );
+            for time in 0..time_count {
+                let position = f64::from(u32::try_from(time).expect("small time"));
+                for element in 0..element_count {
+                    let value = time * element_count + element;
+                    let missing = (time == 5 && element == 0)
+                        || (depth_position == 0 && time == 0 && element == 0)
+                        || ((time == 6 || time == 7) && element == 1);
+                    if missing {
+                        assert!(chunk.eastward[value].is_nan());
+                        assert!(chunk.northward[value].is_nan());
+                    } else {
+                        let expected_u = 0.3 + (position / 5.0).sin() + 2.0 * target;
+                        let expected_v = -0.2 + (position / 7.0).cos() - 0.5 * target;
+                        assert!(
+                            (chunk.eastward[value] - expected_u).abs() < 1e-5,
+                            "u mismatch at depth {target}, time {time}, element {element}: {} versus {expected_u}",
+                            chunk.eastward[value],
+                        );
+                        assert!(
+                            (chunk.northward[value] - expected_v).abs() < 3e-6,
+                            "v mismatch at depth {target}, time {time}, element {element}: {} versus {expected_v}",
+                            chunk.northward[value],
+                        );
+                    }
+                }
+            }
+        }
+        let exact_metadata = read_fvcom_vector_metadata(
+            &input_path,
+            &source,
+            &NodeSelection::All,
+            None,
+            Some(&[10.0]),
+        )
+        .expect("read exact-layer fixed-depth metadata");
+        let exact = read_fvcom_fixed_depth_element_chunk(&source, &exact_metadata, 0..2)
+            .expect("interpolate exact layer depth");
+        assert_eq!(exact[0].observation_counts, [71, 70]);
+        assert!(exact[0].eastward[0].is_finite());
+        drop(source);
+
+        let config = VectorAnalyzeConfig {
+            input: input_path.clone(),
+            output: output_path.clone(),
+            report: None,
+            elements: NodeSelection::All,
+            layers: None,
+            fixed_depths_meters: Some(vec![8.0, 12.0]),
+            constituent_selection: ConstituentSelection::Explicit(vec![TidalConstituent::M2]),
+            constituent_order: ConstituentOrder::Selection,
+            inference: None,
+            fit_options: FitOptions { trend: false },
+            phase_reference: PhaseReference::Raw,
+            nodal_corrections: NodalCorrections::Disabled,
+            confidence_interval: ConfidenceInterval::MonteCarlo {
+                options: MonteCarloOptions {
+                    realizations: 32,
+                    seed: 17,
+                },
+                noise: LinearConfidence::White,
+            },
+            analysis_method: AnalysisMethod::Robust(RobustOptions {
+                tolerance: 0.01,
+                ..RobustOptions::default()
+            }),
+            reconstruction: Some(ReconstructionFilter::All),
+            workers: 2,
+            chunk_series: None,
+            overwrite: false,
+        };
+        let report = analyze_vector(&config).expect("analyze fixed-depth fixture");
+        let mut chunked_config = config.clone();
+        chunked_config.output = chunked_output_path.clone();
+        chunked_config.chunk_series = Some(2);
+        let chunked_report =
+            analyze_vector(&chunked_config).expect("analyze one-element fixed-depth chunks");
+        assert_eq!(report.vertical_mode, "fixed-depth");
+        assert_eq!(report.fixed_depths_meters, Some(vec![8.0, 12.0]));
+        assert_eq!(report.series_count, 4);
+        assert_eq!(report.result_output, "incremental");
+        assert_eq!(report.result_sha256, chunked_report.result_sha256);
+        assert_eq!(chunked_report.chunk_series, 2);
+        assert_eq!(chunked_report.chunk_count, 2);
+        assert_eq!(
+            report.sample_results[0].depth_meters_below_surface,
+            Some(8.0)
+        );
+
+        let output = netcdf::open(&output_path).expect("open fixed-depth output");
+        assert_eq!(
+            output
+                .variable("depth")
+                .expect("depth coordinate")
+                .get_values::<f64, _>(..)
+                .expect("read depth coordinate"),
+            [8.0, 12.0]
+        );
+        assert_eq!(
+            output
+                .variable("semi_major")
+                .expect("fixed-depth semi-major")
+                .dimensions()
+                .iter()
+                .map(netcdf::Dimension::name)
+                .collect::<Vec<_>>(),
+            ["depth", "element", "constituent"]
+        );
+        assert_eq!(
+            output
+                .variable("eastward_reconstruction")
+                .expect("fixed-depth reconstruction")
+                .dimensions()
+                .iter()
+                .map(netcdf::Dimension::name)
+                .collect::<Vec<_>>(),
+            ["time", "depth", "element"]
+        );
+        assert_eq!(
+            output
+                .variable("observation_count")
+                .expect("fixed-depth observation count")
+                .get_values::<i64, _>(..)
+                .expect("read fixed-depth observation count"),
+            [70, 70, 71, 70]
+        );
+        let chunked_output =
+            netcdf::open(&chunked_output_path).expect("open chunked fixed-depth output");
+        assert_eq!(
+            chunked_output
+                .variable("robust_weight_row_start")
+                .expect("chunked robust row starts")
+                .get_values::<i64, _>(..)
+                .expect("read chunked row starts"),
+            [0, 141, 70, 211]
+        );
+        for name in ["semi_major", "semi_minor", "inclination", "phase"] {
+            assert_eq!(
+                output
+                    .variable(name)
+                    .expect("whole fixed-depth variable")
+                    .get_values::<f64, _>(..)
+                    .expect("read whole fixed-depth variable"),
+                chunked_output
+                    .variable(name)
+                    .expect("chunked fixed-depth variable")
+                    .get_values::<f64, _>(..)
+                    .expect("read chunked fixed-depth variable"),
+                "chunked fixed-depth {name} differs"
+            );
+        }
+        drop(output);
+        drop(chunked_output);
+
+        let mut unavailable_config = config.clone();
+        unavailable_config.output = unavailable_output_path.clone();
+        unavailable_config.fixed_depths_meters = Some(vec![100.0]);
+        unavailable_config.analysis_method = AnalysisMethod::Ols;
+        unavailable_config.reconstruction = None;
+        let unavailable =
+            analyze_vector(&unavailable_config).expect("retain unavailable fixed-depth rows");
+        assert_eq!(unavailable.fitted_series_count, 0);
+        assert_eq!(unavailable.unavailable_series_count, 2);
+        assert_eq!(unavailable.sampling.minimum_observation_count, 0);
+        let unavailable_output =
+            netcdf::open(&unavailable_output_path).expect("open unavailable output");
+        assert_eq!(
+            unavailable_output
+                .variable("analysis_status")
+                .expect("analysis status")
+                .get_values::<i64, _>(..)
+                .expect("read analysis status"),
+            [1, 1]
+        );
+        assert!(
+            unavailable_output
+                .variable("semi_major")
+                .expect("unavailable semi-major")
+                .get_values::<f64, _>(..)
+                .expect("read unavailable semi-major")
+                .iter()
+                .all(|value| value.is_nan())
+        );
+        drop(unavailable_output);
+
+        let mut mixed_config = config.clone();
+        mixed_config.output = mixed_output_path.clone();
+        mixed_config.fixed_depths_meters = Some(vec![20.0]);
+        mixed_config.reconstruction = None;
+        let mixed = analyze_vector(&mixed_config).expect("analyze mixed fixed-depth rows");
+        let mut mixed_chunked_config = mixed_config.clone();
+        mixed_chunked_config.output = mixed_chunked_output_path.clone();
+        mixed_chunked_config.chunk_series = Some(1);
+        let mixed_chunked = analyze_vector(&mixed_chunked_config)
+            .expect("analyze mixed rows one element at a time");
+        assert_eq!(mixed.fitted_series_count, 1);
+        assert_eq!(mixed.unavailable_series_count, 1);
+        assert_eq!(mixed.result_sha256, mixed_chunked.result_sha256);
+        let mixed_output = netcdf::open(&mixed_output_path).expect("open mixed output");
+        assert_eq!(
+            mixed_output
+                .variable("analysis_status")
+                .expect("mixed analysis status")
+                .get_values::<i64, _>(..)
+                .expect("read mixed analysis status"),
+            [1, 0]
+        );
+        let mixed_major = mixed_output
+            .variable("semi_major")
+            .expect("mixed semi-major")
+            .get_values::<f64, _>(..)
+            .expect("read mixed semi-major");
+        assert!(mixed_major[0].is_nan());
+        assert!(mixed_major[1].is_finite());
+        drop(mixed_output);
+        fs::remove_file(input_path).expect("remove fixed-depth input");
+        fs::remove_file(output_path).expect("remove fixed-depth output");
+        fs::remove_file(chunked_output_path).expect("remove chunked fixed-depth output");
+        fs::remove_file(unavailable_output_path).expect("remove unavailable fixed-depth output");
+        fs::remove_file(mixed_output_path).expect("remove mixed fixed-depth output");
+        fs::remove_file(mixed_chunked_output_path).expect("remove mixed chunked output");
+    }
 
     #[test]
     #[allow(
@@ -4019,6 +5529,7 @@ mod tests {
             report: None,
             elements: NodeSelection::Indices(vec![1, 0]),
             layers: None,
+            fixed_depths_meters: None,
             constituent_selection: ConstituentSelection::Explicit(vec![
                 TidalConstituent::M2,
                 TidalConstituent::K1,
@@ -4320,6 +5831,7 @@ mod tests {
             report: None,
             elements: NodeSelection::Indices(vec![1, 0]),
             layers: None,
+            fixed_depths_meters: None,
             constituent_selection: ConstituentSelection::Explicit(vec![
                 TidalConstituent::M2,
                 TidalConstituent::K1,
