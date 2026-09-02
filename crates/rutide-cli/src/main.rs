@@ -32,6 +32,7 @@ Usage:
 Options:
   --report PATH       Write the machine-readable JSON run report
   --workers N         Outer spatial workers (default: available CPUs)
+  --chunk-series N    Spatial series held in memory per chunk (default: automatic)
   --node-count N      Analyze the first N nodes
   --nodes I,J,...     Analyze explicit zero-based node indices
   --element-count N   Analyze the first N elements (vector mode)
@@ -147,6 +148,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let mut output = None;
     let mut report = None;
     let mut workers = std::thread::available_parallelism().map_or(1, usize::from);
+    let mut chunk_series = None;
     let mut selection = None;
     let mut constituents = None;
     let mut rayleigh_minimum = None;
@@ -180,6 +182,15 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             "--report" => report = Some(PathBuf::from(required_value(&mut arguments, option)?)),
             "--workers" => {
                 workers = parse_positive_usize(&required_value(&mut arguments, option)?, option)?;
+            }
+            "--chunk-series" => {
+                if chunk_series.is_some() {
+                    return Err("--chunk-series may only be supplied once".to_owned());
+                }
+                chunk_series = Some(parse_positive_usize(
+                    &required_value(&mut arguments, option)?,
+                    option,
+                )?);
             }
             "--node-count" => {
                 if vector {
@@ -449,6 +460,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             analysis_method,
             reconstruction,
             workers,
+            chunk_series,
             overwrite,
         }))
     } else {
@@ -472,6 +484,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             analysis_method,
             reconstruction,
             workers,
+            chunk_series,
             overwrite,
         }))
     }
@@ -894,6 +907,8 @@ mod tests {
             "4,1,3",
             "--workers",
             "8",
+            "--chunk-series",
+            "1024",
         ]))
         .expect("valid arguments");
         let Command::AnalyzeScalar(config) = command else {
@@ -910,6 +925,7 @@ mod tests {
         assert_eq!(config.nodal_corrections, NodalCorrections::Exact);
         assert_eq!(config.constituent_order, ConstituentOrder::Selection);
         assert_eq!(config.workers, 8);
+        assert_eq!(config.chunk_series, Some(1024));
     }
 
     #[test]

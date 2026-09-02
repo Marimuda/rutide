@@ -31,7 +31,8 @@ mod vector;
 pub use vector::{VectorAnalyzeConfig, VectorRunReport, VectorSampleResult, analyze_vector};
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
-const OUTPUT_SCHEMA_VERSION: u32 = 14;
+const OUTPUT_SCHEMA_VERSION: u32 = 15;
+const DEFAULT_OBSERVATION_CHUNK_BYTES: usize = 512 * 1024 * 1024;
 /// Backward-compatible benchmark constituent set used when none is specified.
 pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -467,6 +468,8 @@ pub struct AnalyzeConfig {
     pub reconstruction: Option<ReconstructionFilter>,
     /// Number of outer spatial worker threads.
     pub workers: usize,
+    /// Maximum spatial series read and solved together, or automatic when absent.
+    pub chunk_series: Option<usize>,
     /// Permit replacing existing output and report files.
     pub overwrite: bool,
 }
@@ -740,6 +743,12 @@ pub struct RunReport {
     pub sampling: SamplingSummary,
     /// Number of outer spatial workers.
     pub workers: usize,
+    /// Actual maximum number of spatial series held in one input chunk.
+    pub chunk_series: usize,
+    /// Number of spatial chunks processed.
+    pub chunk_count: usize,
+    /// Maximum logical bytes occupied by chunk-local promoted observation arrays.
+    pub maximum_observation_buffer_bytes: u64,
     /// Least-squares method: `ols` or `robust`.
     pub analysis_method: &'static str,
     /// Whether a linear trend was included alongside the fitted mean.
@@ -894,10 +903,75 @@ struct InputData {
     discarded_timestamp_count: usize,
     node_indices: Vec<usize>,
     latitudes: Vec<f64>,
+    #[cfg(test)]
     observations: Vec<f64>,
     observation_counts: Vec<usize>,
     input_file_bytes: u64,
     logical_input_bytes: u64,
+}
+
+struct ScalarInputMetadata {
+    modified_julian_days: Vec<f64>,
+    retained_time_indices: Vec<usize>,
+    source_time_count: usize,
+    discarded_timestamp_count: usize,
+    node_indices: Vec<usize>,
+    latitudes: Vec<f64>,
+    zeta_fill: Option<f32>,
+    input_file_bytes: u64,
+    logical_input_bytes: u64,
+}
+
+struct ScalarInputChunk {
+    observations: Vec<f64>,
+    observation_counts: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SpatialChunkPlan {
+    series_per_chunk: usize,
+    chunk_count: usize,
+    maximum_observation_buffer_bytes: u64,
+}
+
+fn spatial_chunk_plan(
+    requested: Option<usize>,
+    series_count: usize,
+    source_time_count: usize,
+    component_count: usize,
+    workers: usize,
+) -> Result<SpatialChunkPlan, AppError> {
+    if series_count == 0 || source_time_count == 0 || component_count == 0 {
+        return Err(AppError::Invalid(
+            "chunk planning requires non-empty time, series, and component dimensions".to_owned(),
+        ));
+    }
+    if requested == Some(0) {
+        return Err(AppError::Invalid(
+            "chunk series count must be greater than zero".to_owned(),
+        ));
+    }
+    let bytes_per_series = source_time_count
+        .checked_mul(component_count)
+        .and_then(|value| value.checked_mul(size_of::<f64>()))
+        .ok_or_else(|| AppError::Invalid("observation chunk size exceeds usize".to_owned()))?;
+    let automatic = (DEFAULT_OBSERVATION_CHUNK_BYTES / bytes_per_series).max(1);
+    let mut series_per_chunk = requested.unwrap_or(automatic).min(series_count);
+    if requested.is_none() && series_per_chunk < series_count && series_per_chunk >= workers {
+        series_per_chunk = (series_per_chunk / workers) * workers;
+    }
+    series_per_chunk = series_per_chunk.max(1);
+    let maximum_observation_buffer_bytes = u64::try_from(
+        series_per_chunk
+            .checked_mul(bytes_per_series)
+            .ok_or_else(|| AppError::Invalid("observation chunk size exceeds usize".to_owned()))?,
+    )
+    .map_err(|_| AppError::Invalid("observation chunk size exceeds u64".to_owned()))?;
+    Ok(SpatialChunkPlan {
+        series_per_chunk,
+        chunk_count: series_count.div_ceil(series_per_chunk),
+        maximum_observation_buffer_bytes,
+    })
 }
 
 enum ScalarAnalysisBatch {
@@ -1048,14 +1122,17 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
     let total_start = Instant::now();
 
     let input_start = Instant::now();
-    let input = read_fvcom_scalar(&config.input, &config.nodes)?;
-    let input_seconds = input_start.elapsed().as_secs_f64();
+    let dataset = netcdf::open(&config.input)?;
+    let metadata = read_fvcom_scalar_metadata(&config.input, &dataset, &config.nodes)?;
+    let mut input_seconds = input_start.elapsed().as_secs_f64();
 
     let preparation_start = Instant::now();
-    let selection =
-        resolve_constituent_selection(&config.constituent_selection, &input.modified_julian_days)?;
+    let selection = resolve_constituent_selection(
+        &config.constituent_selection,
+        &metadata.modified_julian_days,
+    )?;
     let batch = ScalarAnalysisBatch::prepare(
-        &input.modified_julian_days,
+        &metadata.modified_julian_days,
         &selection.constituents,
         config.inference.as_ref(),
         config.fit_options,
@@ -1066,48 +1143,106 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
     if let Some(filter) = &config.reconstruction {
         validate_reconstruction_filter(filter, batch.tidal_constituents())?;
     }
+    let chunk_plan = spatial_chunk_plan(
+        config.chunk_series,
+        metadata.node_indices.len(),
+        metadata.source_time_count,
+        1,
+        config.workers,
+    )?;
+    let sampling_plan = SamplingDiagnosticsPlan::prepare(&metadata.modified_julian_days)?;
+    let reconstructor = config
+        .reconstruction
+        .as_ref()
+        .map(|_| batch.reconstructor_modified_julian_days(&metadata.modified_julian_days))
+        .transpose()?;
     let preparation_seconds = preparation_start.elapsed().as_secs_f64();
 
     let worker_pool = ThreadPoolBuilder::new()
         .num_threads(config.workers)
         .build()?;
-    let solve_start = Instant::now();
-    let solutions = solve_input(
-        &worker_pool,
-        &batch,
-        &input,
-        config.analysis_method,
-        config.confidence_interval,
-    )?;
-    let solve_seconds = solve_start.elapsed().as_secs_f64();
+    let series_count = metadata.node_indices.len();
+    let mut solutions = Vec::with_capacity(series_count);
+    let mut series_frequency_cph = Vec::with_capacity(series_count);
+    let mut sampling_diagnostics = Vec::with_capacity(series_count);
+    let mut observation_counts = Vec::with_capacity(series_count);
+    let mut reconstruction = config
+        .reconstruction
+        .as_ref()
+        .map(|_| Vec::with_capacity(series_count));
+    let mut solve_seconds = 0.0;
+    let mut reconstruction_seconds = 0.0;
+    let mut result_processing_seconds = 0.0;
+    for first_series in (0..series_count).step_by(chunk_plan.series_per_chunk) {
+        let end_series = (first_series + chunk_plan.series_per_chunk).min(series_count);
+        let read_start = Instant::now();
+        let chunk = read_fvcom_scalar_chunk(&dataset, &metadata, first_series..end_series)?;
+        input_seconds += read_start.elapsed().as_secs_f64();
+        let latitudes = &metadata.latitudes[first_series..end_series];
 
-    let reconstruction_start = Instant::now();
-    let reconstruction = reconstruct_input(
-        &worker_pool,
-        &batch,
-        &input,
-        &solutions,
-        config.reconstruction.as_ref(),
-    )?;
-    let reconstruction_seconds = reconstruction_start.elapsed().as_secs_f64();
+        let solve_start = Instant::now();
+        let chunk_solutions = solve_input(
+            &worker_pool,
+            &batch,
+            &chunk.observations,
+            latitudes,
+            first_series,
+            config.analysis_method,
+            config.confidence_interval,
+        )?;
+        solve_seconds += solve_start.elapsed().as_secs_f64();
+
+        let reconstruction_start = Instant::now();
+        if let (Some(reconstructor), Some(filter), Some(values)) = (
+            reconstructor.as_ref(),
+            config.reconstruction.as_ref(),
+            reconstruction.as_mut(),
+        ) {
+            values.extend(worker_pool.install(|| {
+                reconstructor.reconstruct_many_series_major(&chunk_solutions, latitudes, filter)
+            })?);
+        }
+        reconstruction_seconds += reconstruction_start.elapsed().as_secs_f64();
+
+        let result_start = Instant::now();
+        let chunk_frequency_cph = solution_frequencies(&batch, &chunk_solutions)?;
+        let chunk_diagnostics = diagnose_sampling(
+            &worker_pool,
+            &sampling_plan,
+            &chunk_frequency_cph,
+            |time, series| chunk.observations[time * chunk_solutions.len() + series].is_finite(),
+        )?;
+        if chunk_diagnostics
+            .iter()
+            .zip(&chunk.observation_counts)
+            .any(|(diagnostics, count)| diagnostics.observation_count != *count)
+        {
+            return Err(AppError::Invalid(
+                "sampling diagnostic observation counts differ from fitted inputs".to_owned(),
+            ));
+        }
+        observation_counts.extend_from_slice(&chunk.observation_counts);
+        series_frequency_cph.extend(chunk_frequency_cph);
+        sampling_diagnostics.extend(chunk_diagnostics);
+        solutions.extend(chunk_solutions);
+        result_processing_seconds += result_start.elapsed().as_secs_f64();
+    }
+    drop(dataset);
+
+    let input = InputData {
+        modified_julian_days: metadata.modified_julian_days,
+        source_time_count: metadata.source_time_count,
+        discarded_timestamp_count: metadata.discarded_timestamp_count,
+        node_indices: metadata.node_indices,
+        latitudes: metadata.latitudes,
+        #[cfg(test)]
+        observations: Vec::new(),
+        observation_counts,
+        input_file_bytes: metadata.input_file_bytes,
+        logical_input_bytes: metadata.logical_input_bytes,
+    };
 
     let result_start = Instant::now();
-    let series_frequency_cph = solution_frequencies(&batch, &solutions)?;
-    let sampling_diagnostics = diagnose_sampling(
-        &worker_pool,
-        &input.modified_julian_days,
-        &series_frequency_cph,
-        |time, series| input.observations[time * input.node_indices.len() + series].is_finite(),
-    )?;
-    if sampling_diagnostics
-        .iter()
-        .zip(&input.observation_counts)
-        .any(|(diagnostics, count)| diagnostics.observation_count != *count)
-    {
-        return Err(AppError::Invalid(
-            "sampling diagnostic observation counts differ from fitted inputs".to_owned(),
-        ));
-    }
     let sampling_summary = summarize_sampling(&sampling_diagnostics)?;
     let constituent_index_by_rank = constituent_order_indices(
         &config.constituent_order,
@@ -1147,7 +1282,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         &constituent_index_by_rank,
         &sampling_diagnostics,
     );
-    let result_processing_seconds = result_start.elapsed().as_secs_f64();
+    result_processing_seconds += result_start.elapsed().as_secs_f64();
 
     let output_start = Instant::now();
     write_output(
@@ -1173,6 +1308,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             nodal_corrections: config.nodal_corrections,
             analysis_method: config.analysis_method,
             confidence_interval: config.confidence_interval,
+            chunk_plan,
             modified_julian_days: &input.modified_julian_days,
             reference_time_modified_julian_day: batch.reference_time_modified_julian_day(),
             reconstruction: config
@@ -1217,6 +1353,9 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             .count(),
         sampling: sampling_summary,
         workers: config.workers,
+        chunk_series: chunk_plan.series_per_chunk,
+        chunk_count: chunk_plan.chunk_count,
+        maximum_observation_buffer_bytes: chunk_plan.maximum_observation_buffer_bytes,
         analysis_method: config.analysis_method.name(),
         trend_enabled: config.fit_options.trend,
         phase_reference: config.phase_reference.name(),
@@ -1279,38 +1418,39 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
 fn solve_input(
     worker_pool: &rayon::ThreadPool,
     batch: &ScalarAnalysisBatch,
-    input: &InputData,
+    observations: &[f64],
+    latitudes: &[f64],
+    series_offset: usize,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
 ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+    let stream_offset = u64::try_from(series_offset).expect("usize is representable as u64");
     worker_pool.install(|| match batch {
         ScalarAnalysisBatch::Standard(batch) => match (analysis_method, confidence_interval) {
             (AnalysisMethod::Ols, ConfidenceInterval::None) => {
-                batch.solve_time_major_with_missing(&input.observations, &input.latitudes)
+                batch.solve_time_major_with_missing(observations, latitudes)
             }
             (AnalysisMethod::Ols, ConfidenceInterval::Linear(noise)) => batch
                 .solve_time_major_with_missing_and_linear_confidence(
-                    &input.observations,
-                    &input.latitudes,
+                    observations,
+                    latitudes,
                     noise,
                 ),
             (AnalysisMethod::Ols, ConfidenceInterval::MonteCarlo { options, noise }) => batch
-                .solve_time_major_with_missing_and_monte_carlo_confidence(
-                    &input.observations,
-                    &input.latitudes,
+                .solve_time_major_with_missing_and_monte_carlo_confidence_with_stream_offset(
+                    observations,
+                    latitudes,
                     options,
                     noise,
+                    stream_offset,
                 ),
-            (AnalysisMethod::Robust(options), ConfidenceInterval::None) => batch
-                .solve_time_major_with_missing_robust(
-                    &input.observations,
-                    &input.latitudes,
-                    options,
-                ),
+            (AnalysisMethod::Robust(options), ConfidenceInterval::None) => {
+                batch.solve_time_major_with_missing_robust(observations, latitudes, options)
+            }
             (AnalysisMethod::Robust(options), ConfidenceInterval::Linear(noise)) => batch
                 .solve_time_major_with_missing_robust_and_linear_confidence(
-                    &input.observations,
-                    &input.latitudes,
+                    observations,
+                    latitudes,
                     options,
                     noise,
                 ),
@@ -1320,41 +1460,41 @@ fn solve_input(
                     options: monte_carlo_options,
                     noise,
                 },
-            ) => batch.solve_time_major_with_missing_robust_and_monte_carlo_confidence(
-                &input.observations,
-                &input.latitudes,
-                robust_options,
-                monte_carlo_options,
-                noise,
-            ),
+            ) => batch
+                .solve_time_major_with_missing_robust_and_monte_carlo_confidence_with_stream_offset(
+                    observations,
+                    latitudes,
+                    robust_options,
+                    monte_carlo_options,
+                    noise,
+                    stream_offset,
+                ),
         },
         ScalarAnalysisBatch::Inferred(batch) => match (analysis_method, confidence_interval) {
             (AnalysisMethod::Ols, ConfidenceInterval::None) => {
-                batch.solve_time_major_with_missing(&input.observations, &input.latitudes)
+                batch.solve_time_major_with_missing(observations, latitudes)
             }
             (AnalysisMethod::Ols, ConfidenceInterval::Linear(noise)) => batch
                 .solve_time_major_with_missing_and_linear_confidence(
-                    &input.observations,
-                    &input.latitudes,
+                    observations,
+                    latitudes,
                     noise,
                 ),
             (AnalysisMethod::Ols, ConfidenceInterval::MonteCarlo { options, noise }) => batch
-                .solve_time_major_with_missing_and_monte_carlo_confidence(
-                    &input.observations,
-                    &input.latitudes,
+                .solve_time_major_with_missing_and_monte_carlo_confidence_with_stream_offset(
+                    observations,
+                    latitudes,
                     options,
                     noise,
+                    stream_offset,
                 ),
-            (AnalysisMethod::Robust(options), ConfidenceInterval::None) => batch
-                .solve_time_major_with_missing_robust(
-                    &input.observations,
-                    &input.latitudes,
-                    options,
-                ),
+            (AnalysisMethod::Robust(options), ConfidenceInterval::None) => {
+                batch.solve_time_major_with_missing_robust(observations, latitudes, options)
+            }
             (AnalysisMethod::Robust(options), ConfidenceInterval::Linear(noise)) => batch
                 .solve_time_major_with_missing_robust_and_linear_confidence(
-                    &input.observations,
-                    &input.latitudes,
+                    observations,
+                    latitudes,
                     options,
                     noise,
                 ),
@@ -1364,13 +1504,15 @@ fn solve_input(
                     options: monte_carlo_options,
                     noise,
                 },
-            ) => batch.solve_time_major_with_missing_robust_and_monte_carlo_confidence(
-                &input.observations,
-                &input.latitudes,
-                robust_options,
-                monte_carlo_options,
-                noise,
-            ),
+            ) => batch
+                .solve_time_major_with_missing_robust_and_monte_carlo_confidence_with_stream_offset(
+                    observations,
+                    latitudes,
+                    robust_options,
+                    monte_carlo_options,
+                    noise,
+                    stream_offset,
+                ),
         },
     })
 }
@@ -1396,14 +1538,13 @@ fn solution_frequencies(
 
 fn diagnose_sampling<F>(
     worker_pool: &rayon::ThreadPool,
-    modified_julian_days: &[f64],
+    plan: &SamplingDiagnosticsPlan,
     series_frequency_cph: &[Vec<f64>],
     observation_is_finite: F,
 ) -> Result<Vec<CoreSamplingDiagnostics>, AnalysisError>
 where
     F: Fn(usize, usize) -> bool + Sync,
 {
-    let plan = SamplingDiagnosticsPlan::prepare(modified_julian_days)?;
     worker_pool.install(|| {
         (0..series_frequency_cph.len())
             .into_par_iter()
@@ -1479,30 +1620,13 @@ fn summarize_sampling(
     })
 }
 
-fn reconstruct_input(
-    worker_pool: &rayon::ThreadPool,
-    batch: &ScalarAnalysisBatch,
-    input: &InputData,
-    solutions: &[ScalarSolution],
-    filter: Option<&ReconstructionFilter>,
-) -> Result<Option<Vec<Vec<f64>>>, AnalysisError> {
-    let Some(filter) = filter else {
-        return Ok(None);
-    };
-    let reconstructor = batch.reconstructor_modified_julian_days(&input.modified_julian_days)?;
-    worker_pool
-        .install(|| {
-            reconstructor.reconstruct_many_series_major(solutions, &input.latitudes, filter)
-        })
-        .map(Some)
-}
-
 fn validate_config(config: &AnalyzeConfig) -> Result<(), AppError> {
     if config.workers == 0 {
         return Err(AppError::Invalid(
             "worker count must be greater than zero".to_owned(),
         ));
     }
+    validate_chunk_series(config.chunk_series)?;
     if config.input == config.output {
         return Err(AppError::Invalid(
             "input and output paths must differ".to_owned(),
@@ -1593,6 +1717,15 @@ fn validate_config(config: &AnalyzeConfig) -> Result<(), AppError> {
         if report.exists() && !config.overwrite {
             return Err(AppError::DestinationExists(report.clone()));
         }
+    }
+    Ok(())
+}
+
+fn validate_chunk_series(chunk_series: Option<usize>) -> Result<(), AppError> {
+    if chunk_series == Some(0) {
+        return Err(AppError::Invalid(
+            "chunk series count must be greater than zero".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1801,74 +1934,54 @@ fn resolve_constituent_selection(
     }
 }
 
+#[cfg(test)]
 fn read_fvcom_scalar(path: &Path, selection: &NodeSelection) -> Result<InputData, AppError> {
-    let input_file_bytes = fs::metadata(path)?.len();
     let dataset = netcdf::open(path)?;
-    let time_count = required_dimension_length(&dataset, "time")?;
-    let node_count = required_dimension_length(&dataset, "node")?;
+    let metadata = read_fvcom_scalar_metadata(path, &dataset, selection)?;
+    let chunk = read_fvcom_scalar_chunk(&dataset, &metadata, 0..metadata.node_indices.len())?;
+    Ok(InputData {
+        modified_julian_days: metadata.modified_julian_days,
+        source_time_count: metadata.source_time_count,
+        discarded_timestamp_count: metadata.discarded_timestamp_count,
+        node_indices: metadata.node_indices,
+        latitudes: metadata.latitudes,
+        #[cfg(test)]
+        observations: chunk.observations,
+        observation_counts: chunk.observation_counts,
+        input_file_bytes: metadata.input_file_bytes,
+        logical_input_bytes: metadata.logical_input_bytes,
+    })
+}
+
+fn read_fvcom_scalar_metadata(
+    path: &Path,
+    dataset: &netcdf::File,
+    selection: &NodeSelection,
+) -> Result<ScalarInputMetadata, AppError> {
+    let input_file_bytes = fs::metadata(path)?.len();
+    let time_count = required_dimension_length(dataset, "time")?;
+    let node_count = required_dimension_length(dataset, "node")?;
     let node_indices = resolve_node_selection(selection, node_count)?;
     let series_count = node_indices.len();
 
-    let (time_axis, time_element_bytes) = read_fvcom_time_axis(&dataset, time_count)?;
+    let (time_axis, time_element_bytes) = read_fvcom_time_axis(dataset, time_count)?;
 
-    let latitude_variable = required_variable(&dataset, "lat")?;
+    let latitude_variable = required_variable(dataset, "lat")?;
     validate_dimensions(&latitude_variable, &[("node", node_count)])?;
     let latitude_fill = latitude_variable.fill_value::<f32>()?;
 
-    let zeta_variable = required_variable(&dataset, "zeta")?;
+    let zeta_variable = required_variable(dataset, "zeta")?;
     validate_dimensions(
         &zeta_variable,
         &[("time", time_count), ("node", node_count)],
     )?;
     let zeta_fill = zeta_variable.fill_value::<f32>()?;
 
-    let is_prefix = node_indices.iter().copied().eq(0..node_indices.len());
-    let (latitude_values, observation_values) = if is_prefix {
-        (
-            latitude_variable.get_values::<f64, _>(0..series_count)?,
-            zeta_variable.get_values::<f64, _>((.., 0..series_count))?,
-        )
-    } else {
-        let mut latitude_values = Vec::with_capacity(series_count);
-        let mut observation_values = vec![0.0_f64; time_count * series_count];
-        for (series, node) in node_indices.iter().copied().enumerate() {
-            latitude_values.push(latitude_variable.get_value::<f64, _>(node)?);
-            let column = zeta_variable.get_values::<f64, _>((.., node))?;
-            for (time, value) in column.into_iter().enumerate() {
-                observation_values[time * series_count + series] = value;
-            }
-        }
-        (latitude_values, observation_values)
-    };
-    let mut observation_values = retain_time_major_rows(
-        observation_values,
-        time_count,
-        series_count,
-        time_axis.retained_indices(),
-    )?;
+    let latitude_values = read_selected_1d(&latitude_variable, &node_indices)?;
 
     for (series, value) in latitude_values.iter().copied().enumerate() {
         validate_source_value("lat", value, latitude_fill, series, 0)?;
     }
-    for (index, value) in observation_values.iter_mut().enumerate() {
-        *value = normalize_source_observation(
-            "zeta",
-            *value,
-            zeta_fill,
-            index % series_count,
-            index / series_count,
-        )?;
-    }
-    let observation_counts = (0..series_count)
-        .map(|series| {
-            observation_values
-                .iter()
-                .skip(series)
-                .step_by(series_count)
-                .filter(|value| value.is_finite())
-                .count()
-        })
-        .collect();
 
     let observation_count = time_count
         .checked_mul(series_count)
@@ -1892,20 +2005,131 @@ fn read_fvcom_scalar(path: &Path, selection: &NodeSelection) -> Result<InputData
             .ok_or_else(|| AppError::Invalid("logical input byte count overflows u64".to_owned()))
     })?;
 
-    let discarded_timestamp_count = time_axis.discarded_count();
     let source_time_count = time_axis.source_count();
-    let (modified_julian_days, _) = time_axis.into_parts();
-    Ok(InputData {
+    let discarded_timestamp_count = time_axis.discarded_count();
+    let (modified_julian_days, retained_time_indices) = time_axis.into_parts();
+    Ok(ScalarInputMetadata {
         modified_julian_days,
+        retained_time_indices,
         source_time_count,
         discarded_timestamp_count,
         node_indices,
         latitudes: latitude_values,
-        observations: observation_values,
-        observation_counts,
+        zeta_fill,
         input_file_bytes,
         logical_input_bytes,
     })
+}
+
+fn read_fvcom_scalar_chunk(
+    dataset: &netcdf::File,
+    metadata: &ScalarInputMetadata,
+    series_range: std::ops::Range<usize>,
+) -> Result<ScalarInputChunk, AppError> {
+    let node_indices = metadata
+        .node_indices
+        .get(series_range.clone())
+        .ok_or_else(|| {
+            AppError::Invalid("scalar chunk range exceeds selected node count".to_owned())
+        })?;
+    let series_count = node_indices.len();
+    if series_count == 0 {
+        return Err(AppError::Invalid("scalar input chunk is empty".to_owned()));
+    }
+    let variable = required_variable(dataset, "zeta")?;
+    let source_time_count = metadata.source_time_count;
+    let mut observations = read_selected_time_major(&variable, source_time_count, node_indices)?;
+    observations = retain_time_major_rows(
+        observations,
+        source_time_count,
+        series_count,
+        &metadata.retained_time_indices,
+    )?;
+    let mut observation_counts = vec![0; series_count];
+    for (index, value) in observations.iter_mut().enumerate() {
+        let series = index % series_count;
+        let time = index / series_count;
+        *value = normalize_source_observation(
+            "zeta",
+            *value,
+            metadata.zeta_fill,
+            series_range.start + series,
+            time,
+        )?;
+        observation_counts[series] += usize::from(value.is_finite());
+    }
+    Ok(ScalarInputChunk {
+        observations,
+        observation_counts,
+    })
+}
+
+fn read_selected_1d(
+    variable: &Variable<'_>,
+    selected_indices: &[usize],
+) -> Result<Vec<f64>, AppError> {
+    if selected_indices
+        .windows(2)
+        .all(|pair| pair[1] == pair[0] + 1)
+    {
+        return Ok(variable.get_values::<f64, _>(
+            selected_indices[0]..selected_indices[selected_indices.len() - 1] + 1,
+        )?);
+    }
+    let mut values = Vec::with_capacity(selected_indices.len());
+    let mut first = 0;
+    while first < selected_indices.len() {
+        let mut end = first + 1;
+        while end < selected_indices.len() && selected_indices[end] == selected_indices[end - 1] + 1
+        {
+            end += 1;
+        }
+        values.extend(
+            variable
+                .get_values::<f64, _>(selected_indices[first]..selected_indices[end - 1] + 1)?,
+        );
+        first = end;
+    }
+    Ok(values)
+}
+
+fn read_selected_time_major(
+    variable: &Variable<'_>,
+    time_count: usize,
+    selected_indices: &[usize],
+) -> Result<Vec<f64>, AppError> {
+    let series_count = selected_indices.len();
+    if selected_indices
+        .windows(2)
+        .all(|pair| pair[1] == pair[0] + 1)
+    {
+        return Ok(variable.get_values::<f64, _>((
+            ..,
+            selected_indices[0]..selected_indices[series_count - 1] + 1,
+        ))?);
+    }
+    let value_count = time_count
+        .checked_mul(series_count)
+        .ok_or_else(|| AppError::Invalid("observation chunk shape exceeds usize".to_owned()))?;
+    let mut values = vec![0.0; value_count];
+    let mut first = 0;
+    while first < series_count {
+        let mut end = first + 1;
+        while end < series_count && selected_indices[end] == selected_indices[end - 1] + 1 {
+            end += 1;
+        }
+        let run_length = end - first;
+        let source = variable
+            .get_values::<f64, _>((.., selected_indices[first]..selected_indices[end - 1] + 1))?;
+        for time in 0..time_count {
+            let source_start = time * run_length;
+            let destination_start = time * series_count + first;
+            values[destination_start..destination_start + run_length]
+                .copy_from_slice(&source[source_start..source_start + run_length]);
+        }
+        first = end;
+    }
+    Ok(values)
 }
 
 fn read_fvcom_time_axis(
@@ -1943,7 +2167,7 @@ fn read_fvcom_time_axis(
 }
 
 fn retain_time_major_rows(
-    values: Vec<f64>,
+    mut values: Vec<f64>,
     source_time_count: usize,
     series_count: usize,
     retained_time_indices: &[usize],
@@ -1969,20 +2193,23 @@ fn retain_time_major_rows(
         .len()
         .checked_mul(series_count)
         .ok_or_else(|| AppError::Invalid("retained observation shape exceeds usize".to_owned()))?;
-    let mut retained = Vec::with_capacity(retained_len);
-    for &time in retained_time_indices {
-        let start = time
+    for (destination_time, &source_time) in retained_time_indices.iter().enumerate() {
+        let source_start = source_time
             .checked_mul(series_count)
             .ok_or_else(|| AppError::Invalid("source row offset exceeds usize".to_owned()))?;
-        let end = start + series_count;
-        let row = values.get(start..end).ok_or_else(|| {
-            AppError::Invalid(format!(
-                "retained timestamp index {time} exceeds source shape"
-            ))
-        })?;
-        retained.extend_from_slice(row);
+        let source_end = source_start + series_count;
+        if values.get(source_start..source_end).is_none() {
+            return Err(AppError::Invalid(format!(
+                "retained timestamp index {source_time} exceeds source shape"
+            )));
+        }
+        let destination_start = destination_time * series_count;
+        if destination_start != source_start {
+            values.copy_within(source_start..source_end, destination_start);
+        }
     }
-    Ok(retained)
+    values.truncate(retained_len);
+    Ok(values)
 }
 
 fn required_dimension_length(dataset: &netcdf::File, name: &str) -> Result<usize, AppError> {
@@ -2455,6 +2682,7 @@ struct OutputData<'data> {
     nodal_corrections: NodalCorrections,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
+    chunk_plan: SpatialChunkPlan,
     modified_julian_days: &'data [f64],
     reference_time_modified_julian_day: f64,
     reconstruction: Option<(&'data ReconstructionFilter, &'data [Vec<f64>])>,
@@ -2500,6 +2728,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         nodal_corrections,
         analysis_method,
         confidence_interval,
+        chunk_plan,
         modified_julian_days,
         reference_time_modified_julian_day,
         reconstruction,
@@ -2526,6 +2755,20 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
             .map_err(|_| AppError::Invalid("discarded timestamp count exceeds i64".to_owned()))?,
     )?;
     output.add_attribute("time_epoch", "modified-julian-day")?;
+    output.add_attribute(
+        "chunk_series",
+        u64::try_from(chunk_plan.series_per_chunk)
+            .map_err(|_| AppError::Invalid("chunk series count exceeds u64".to_owned()))?,
+    )?;
+    output.add_attribute(
+        "chunk_count",
+        u64::try_from(chunk_plan.chunk_count)
+            .map_err(|_| AppError::Invalid("chunk count exceeds u64".to_owned()))?,
+    )?;
+    output.add_attribute(
+        "maximum_observation_buffer_bytes",
+        chunk_plan.maximum_observation_buffer_bytes,
+    )?;
     let profile = selection.profile(
         analysis_method,
         inference.is_some(),
@@ -3123,7 +3366,7 @@ mod tests {
     use super::{
         ConstituentOrder, NodeSelection, ScalarInferenceConfig, constituent_order_indices,
         encode_hex, normalize_source_observation, read_fvcom_scalar, resolve_node_selection,
-        summarize_sampling, temporary_sibling, write_inference_metadata,
+        spatial_chunk_plan, summarize_sampling, temporary_sibling, write_inference_metadata,
         write_reconstruction_variables, write_sampling_diagnostics,
     };
     use rutide_core::{
@@ -3148,6 +3391,24 @@ mod tests {
     #[test]
     fn selection_rejects_empty_source_dimension() {
         assert!(resolve_node_selection(&NodeSelection::All, 0).is_err());
+    }
+
+    #[test]
+    fn chunk_plan_is_bounded_capped_and_worker_aligned() {
+        let automatic = spatial_chunk_plan(None, 144_860, 745, 2, 64)
+            .expect("valid automatic vector chunk plan");
+        assert!(automatic.series_per_chunk.is_multiple_of(64));
+        assert!(automatic.maximum_observation_buffer_bytes <= 512 * 1024 * 1024);
+        assert_eq!(
+            automatic.chunk_count,
+            144_860_usize.div_ceil(automatic.series_per_chunk)
+        );
+
+        let explicit =
+            spatial_chunk_plan(Some(200_000), 75_160, 745, 1, 64).expect("valid explicit plan");
+        assert_eq!(explicit.series_per_chunk, 75_160);
+        assert_eq!(explicit.chunk_count, 1);
+        assert!(spatial_chunk_plan(Some(0), 1, 1, 1, 1).is_err());
     }
 
     #[test]

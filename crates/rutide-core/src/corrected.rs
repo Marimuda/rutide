@@ -3145,7 +3145,7 @@ impl ScalarInferenceBatch {
         observations: &[f64],
         latitudes: &[f64],
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_impl(observations, latitudes, None, None, false)
+        self.solve_time_major_impl(observations, latitudes, None, None, false, 0)
     }
 
     /// Fit complete scalar series with linear confidence intervals.
@@ -3165,6 +3165,7 @@ impl ScalarInferenceBatch {
             Some(BatchConfidence::Linear(noise)),
             None,
             false,
+            0,
         )
     }
 
@@ -3187,6 +3188,7 @@ impl ScalarInferenceBatch {
             Some(BatchConfidence::MonteCarlo { options, noise }),
             None,
             false,
+            0,
         )
     }
 
@@ -3201,7 +3203,7 @@ impl ScalarInferenceBatch {
         latitudes: &[f64],
         options: RobustOptions,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_impl(observations, latitudes, None, Some(options), false)
+        self.solve_time_major_impl(observations, latitudes, None, Some(options), false, 0)
     }
 
     /// Robustly fit complete scalar series with linear confidence intervals.
@@ -3222,6 +3224,7 @@ impl ScalarInferenceBatch {
             Some(BatchConfidence::Linear(noise)),
             Some(options),
             false,
+            0,
         )
     }
 
@@ -3249,6 +3252,7 @@ impl ScalarInferenceBatch {
             }),
             Some(robust_options),
             false,
+            0,
         )
     }
 
@@ -3263,7 +3267,7 @@ impl ScalarInferenceBatch {
         observations: &[f64],
         latitudes: &[f64],
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_impl(observations, latitudes, None, None, true)
+        self.solve_time_major_impl(observations, latitudes, None, None, true, 0)
     }
 
     /// Fit gappy scalar series with linear confidence intervals.
@@ -3283,6 +3287,7 @@ impl ScalarInferenceBatch {
             Some(BatchConfidence::Linear(noise)),
             None,
             true,
+            0,
         )
     }
 
@@ -3300,12 +3305,35 @@ impl ScalarInferenceBatch {
         options: MonteCarloOptions,
         noise: LinearConfidence,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_with_missing_and_monte_carlo_confidence_with_stream_offset(
+            observations,
+            latitudes,
+            options,
+            noise,
+            0,
+        )
+    }
+
+    /// Fit gappy inferred scalar series with globally offset Monte Carlo streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid inputs or covariance failure.
+    pub fn solve_time_major_with_missing_and_monte_carlo_confidence_with_stream_offset(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+        stream_offset: u64,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         self.solve_time_major_impl(
             observations,
             latitudes,
             Some(BatchConfidence::MonteCarlo { options, noise }),
             None,
             true,
+            stream_offset,
         )
     }
 
@@ -3320,7 +3348,7 @@ impl ScalarInferenceBatch {
         latitudes: &[f64],
         options: RobustOptions,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_impl(observations, latitudes, None, Some(options), true)
+        self.solve_time_major_impl(observations, latitudes, None, Some(options), true, 0)
     }
 
     /// Robustly fit gappy scalar series with linear confidence intervals.
@@ -3341,6 +3369,7 @@ impl ScalarInferenceBatch {
             Some(BatchConfidence::Linear(noise)),
             Some(options),
             true,
+            0,
         )
     }
 
@@ -3359,6 +3388,30 @@ impl ScalarInferenceBatch {
         monte_carlo_options: MonteCarloOptions,
         noise: LinearConfidence,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_with_missing_robust_and_monte_carlo_confidence_with_stream_offset(
+            observations,
+            latitudes,
+            robust_options,
+            monte_carlo_options,
+            noise,
+            0,
+        )
+    }
+
+    /// Robustly fit gappy inferred scalar series with globally offset Monte Carlo streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid inputs, fitting, or covariance failure.
+    pub fn solve_time_major_with_missing_robust_and_monte_carlo_confidence_with_stream_offset(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+        stream_offset: u64,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         self.solve_time_major_impl(
             observations,
             latitudes,
@@ -3368,6 +3421,7 @@ impl ScalarInferenceBatch {
             }),
             Some(robust_options),
             true,
+            stream_offset,
         )
     }
 
@@ -3378,6 +3432,7 @@ impl ScalarInferenceBatch {
         confidence: Option<BatchConfidence>,
         robust: Option<RobustOptions>,
         allow_missing: bool,
+        stream_offset: u64,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         validate_batch_shape_and_latitudes(self.time_count(), observations, latitudes)?;
         let series_count = latitudes.len();
@@ -3440,7 +3495,9 @@ impl ScalarInferenceBatch {
                     .copied()
                     .map(|time| observations[time * series_count + series])
                     .collect::<Vec<_>>();
-                let stream = u64::try_from(series).expect("series index is representable as u64");
+                let stream = stream_offset.wrapping_add(
+                    u64::try_from(series).expect("series index is representable as u64"),
+                );
                 match (robust, confidence) {
                     (Some(options), Some(BatchConfidence::Linear(noise))) => {
                         model.solve_robust_with_linear_confidence(&values, options, noise)
@@ -3639,7 +3696,7 @@ impl VectorInferenceBatch {
         northward: &[f64],
         latitudes: &[f64],
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
-        self.solve_vector_time_major_impl(eastward, northward, latitudes, None, None, false)
+        self.solve_vector_time_major_impl(eastward, northward, latitudes, None, None, false, 0)
     }
 
     /// Fit complete current series with linear ellipse confidence intervals.
@@ -3661,6 +3718,7 @@ impl VectorInferenceBatch {
             Some(BatchConfidence::Linear(noise)),
             None,
             false,
+            0,
         )
     }
 
@@ -3685,6 +3743,7 @@ impl VectorInferenceBatch {
             Some(BatchConfidence::MonteCarlo { options, noise }),
             None,
             false,
+            0,
         )
     }
 
@@ -3707,6 +3766,7 @@ impl VectorInferenceBatch {
             None,
             Some(options),
             false,
+            0,
         )
     }
 
@@ -3730,6 +3790,7 @@ impl VectorInferenceBatch {
             Some(BatchConfidence::Linear(noise)),
             Some(options),
             false,
+            0,
         )
     }
 
@@ -3759,6 +3820,7 @@ impl VectorInferenceBatch {
             }),
             Some(robust_options),
             false,
+            0,
         )
     }
 
@@ -3775,7 +3837,7 @@ impl VectorInferenceBatch {
         northward: &[f64],
         latitudes: &[f64],
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
-        self.solve_vector_time_major_impl(eastward, northward, latitudes, None, None, true)
+        self.solve_vector_time_major_impl(eastward, northward, latitudes, None, None, true, 0)
     }
 
     /// Fit gappy currents with linear ellipse confidence intervals.
@@ -3797,6 +3859,7 @@ impl VectorInferenceBatch {
             Some(BatchConfidence::Linear(noise)),
             None,
             true,
+            0,
         )
     }
 
@@ -3815,6 +3878,25 @@ impl VectorInferenceBatch {
         options: MonteCarloOptions,
         noise: LinearConfidence,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_with_missing_and_monte_carlo_confidence_with_stream_offset(
+            eastward, northward, latitudes, options, noise, 0,
+        )
+    }
+
+    /// Fit gappy inferred currents with globally offset Monte Carlo streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid inputs or covariance failure.
+    pub fn solve_vector_time_major_with_missing_and_monte_carlo_confidence_with_stream_offset(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+        stream_offset: u64,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
         self.solve_vector_time_major_impl(
             eastward,
             northward,
@@ -3822,6 +3904,7 @@ impl VectorInferenceBatch {
             Some(BatchConfidence::MonteCarlo { options, noise }),
             None,
             true,
+            stream_offset,
         )
     }
 
@@ -3837,7 +3920,15 @@ impl VectorInferenceBatch {
         latitudes: &[f64],
         options: RobustOptions,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
-        self.solve_vector_time_major_impl(eastward, northward, latitudes, None, Some(options), true)
+        self.solve_vector_time_major_impl(
+            eastward,
+            northward,
+            latitudes,
+            None,
+            Some(options),
+            true,
+            0,
+        )
     }
 
     /// Robustly fit gappy inferred currents with linear ellipse intervals.
@@ -3860,6 +3951,7 @@ impl VectorInferenceBatch {
             Some(BatchConfidence::Linear(noise)),
             Some(options),
             true,
+            0,
         )
     }
 
@@ -3879,6 +3971,36 @@ impl VectorInferenceBatch {
         monte_carlo_options: MonteCarloOptions,
         noise: LinearConfidence,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_with_missing_robust_and_monte_carlo_confidence_with_stream_offset(
+            eastward,
+            northward,
+            latitudes,
+            robust_options,
+            monte_carlo_options,
+            noise,
+            0,
+        )
+    }
+
+    /// Robustly fit inferred currents with globally offset Monte Carlo streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid inputs, fitting, or covariance failure.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "vector data, robust options, Monte Carlo options, and stream identity are independent inputs"
+    )]
+    pub fn solve_vector_time_major_with_missing_robust_and_monte_carlo_confidence_with_stream_offset(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+        stream_offset: u64,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
         self.solve_vector_time_major_impl(
             eastward,
             northward,
@@ -3889,9 +4011,14 @@ impl VectorInferenceBatch {
             }),
             Some(robust_options),
             true,
+            stream_offset,
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared vector batch implementation receives orthogonal solver controls"
+    )]
     fn solve_vector_time_major_impl(
         &self,
         eastward: &[f64],
@@ -3900,6 +4027,7 @@ impl VectorInferenceBatch {
         confidence: Option<BatchConfidence>,
         robust: Option<RobustOptions>,
         allow_missing: bool,
+        stream_offset: u64,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
         validate_batch_shape_and_latitudes(self.time_count(), eastward, latitudes)?;
         if northward.len() != eastward.len() {
@@ -3977,7 +4105,9 @@ impl VectorInferenceBatch {
                     .copied()
                     .map(|time| northward[time * series_count + series])
                     .collect::<Vec<_>>();
-                let stream = u64::try_from(series).expect("series index is representable as u64");
+                let stream = stream_offset.wrapping_add(
+                    u64::try_from(series).expect("series index is representable as u64"),
+                );
                 solve_vector_inference_with_batch_confidence(
                     &model,
                     &eastward_values,
@@ -4152,7 +4282,7 @@ impl GreenwichNodalBatch {
         observations: &[f64],
         latitudes: &[f64],
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_impl(observations, latitudes, None, None)
+        self.solve_time_major_impl(observations, latitudes, None, None, 0)
     }
 
     /// Fit varying-latitude series with linearized confidence intervals and SNR.
@@ -4172,6 +4302,7 @@ impl GreenwichNodalBatch {
             latitudes,
             Some(BatchConfidence::Linear(noise)),
             None,
+            0,
         )
     }
 
@@ -4196,6 +4327,7 @@ impl GreenwichNodalBatch {
             latitudes,
             Some(BatchConfidence::MonteCarlo { options, noise }),
             None,
+            0,
         )
     }
 
@@ -4210,7 +4342,7 @@ impl GreenwichNodalBatch {
         latitudes: &[f64],
         options: RobustOptions,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_impl(observations, latitudes, None, Some(options))
+        self.solve_time_major_impl(observations, latitudes, None, Some(options), 0)
     }
 
     /// Robustly fit complete scalar series with linear confidence intervals.
@@ -4230,6 +4362,7 @@ impl GreenwichNodalBatch {
             latitudes,
             Some(BatchConfidence::Linear(noise)),
             Some(options),
+            0,
         )
     }
 
@@ -4256,6 +4389,7 @@ impl GreenwichNodalBatch {
                 noise,
             }),
             Some(robust_options),
+            0,
         )
     }
 
@@ -4274,7 +4408,7 @@ impl GreenwichNodalBatch {
         observations: &[f64],
         latitudes: &[f64],
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_with_missing_impl(observations, latitudes, None, None)
+        self.solve_time_major_with_missing_impl(observations, latitudes, None, None, 0)
     }
 
     /// Fit possibly gappy scalar series with linearized confidence intervals.
@@ -4297,6 +4431,7 @@ impl GreenwichNodalBatch {
             latitudes,
             Some(BatchConfidence::Linear(noise)),
             None,
+            0,
         )
     }
 
@@ -4313,12 +4448,38 @@ impl GreenwichNodalBatch {
         options: MonteCarloOptions,
         noise: LinearConfidence,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_with_missing_and_monte_carlo_confidence_with_stream_offset(
+            observations,
+            latitudes,
+            options,
+            noise,
+            0,
+        )
+    }
+
+    /// Fit gappy scalar series with Monte Carlo streams beginning at a global offset.
+    ///
+    /// This is useful for bounded spatial chunks that must reproduce a single
+    /// whole-field batch exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid inputs or covariance failure.
+    pub fn solve_time_major_with_missing_and_monte_carlo_confidence_with_stream_offset(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+        stream_offset: u64,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         options.validate()?;
         self.solve_time_major_with_missing_impl(
             observations,
             latitudes,
             Some(BatchConfidence::MonteCarlo { options, noise }),
             None,
+            stream_offset,
         )
     }
 
@@ -4333,7 +4494,7 @@ impl GreenwichNodalBatch {
         latitudes: &[f64],
         options: RobustOptions,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
-        self.solve_time_major_with_missing_impl(observations, latitudes, None, Some(options))
+        self.solve_time_major_with_missing_impl(observations, latitudes, None, Some(options), 0)
     }
 
     /// Robustly fit gappy scalar series with linear confidence intervals.
@@ -4353,6 +4514,7 @@ impl GreenwichNodalBatch {
             latitudes,
             Some(BatchConfidence::Linear(noise)),
             Some(options),
+            0,
         )
     }
 
@@ -4370,6 +4532,30 @@ impl GreenwichNodalBatch {
         monte_carlo_options: MonteCarloOptions,
         noise: LinearConfidence,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
+        self.solve_time_major_with_missing_robust_and_monte_carlo_confidence_with_stream_offset(
+            observations,
+            latitudes,
+            robust_options,
+            monte_carlo_options,
+            noise,
+            0,
+        )
+    }
+
+    /// Robustly fit gappy scalar series with globally offset Monte Carlo streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid inputs, fitting, or covariance failure.
+    pub fn solve_time_major_with_missing_robust_and_monte_carlo_confidence_with_stream_offset(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+        stream_offset: u64,
+    ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         monte_carlo_options.validate()?;
         self.solve_time_major_with_missing_impl(
             observations,
@@ -4379,6 +4565,7 @@ impl GreenwichNodalBatch {
                 noise,
             }),
             Some(robust_options),
+            stream_offset,
         )
     }
 
@@ -4397,7 +4584,9 @@ impl GreenwichNodalBatch {
         northward: &[f64],
         latitudes: &[f64],
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
-        self.solve_vector_time_major_with_missing_impl(eastward, northward, latitudes, None, None)
+        self.solve_vector_time_major_with_missing_impl(
+            eastward, northward, latitudes, None, None, 0,
+        )
     }
 
     /// Jointly fit gappy currents with linearized ellipse confidence intervals.
@@ -4418,6 +4607,7 @@ impl GreenwichNodalBatch {
             latitudes,
             Some(BatchConfidence::Linear(noise)),
             None,
+            0,
         )
     }
 
@@ -4435,6 +4625,25 @@ impl GreenwichNodalBatch {
         options: MonteCarloOptions,
         noise: LinearConfidence,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_with_missing_and_monte_carlo_confidence_with_stream_offset(
+            eastward, northward, latitudes, options, noise, 0,
+        )
+    }
+
+    /// Fit gappy currents with globally offset Monte Carlo streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid inputs or covariance failure.
+    pub fn solve_vector_time_major_with_missing_and_monte_carlo_confidence_with_stream_offset(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        options: MonteCarloOptions,
+        noise: LinearConfidence,
+        stream_offset: u64,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
         options.validate()?;
         self.solve_vector_time_major_with_missing_impl(
             eastward,
@@ -4442,6 +4651,7 @@ impl GreenwichNodalBatch {
             latitudes,
             Some(BatchConfidence::MonteCarlo { options, noise }),
             None,
+            stream_offset,
         )
     }
 
@@ -4463,6 +4673,7 @@ impl GreenwichNodalBatch {
             latitudes,
             None,
             Some(options),
+            0,
         )
     }
 
@@ -4481,6 +4692,36 @@ impl GreenwichNodalBatch {
         monte_carlo_options: MonteCarloOptions,
         noise: LinearConfidence,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
+        self.solve_vector_time_major_with_missing_robust_and_monte_carlo_confidence_with_stream_offset(
+            eastward,
+            northward,
+            latitudes,
+            robust_options,
+            monte_carlo_options,
+            noise,
+            0,
+        )
+    }
+
+    /// Robustly fit gappy currents with globally offset Monte Carlo streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid inputs, fitting, or covariance failure.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "vector data, robust options, Monte Carlo options, and stream identity are independent inputs"
+    )]
+    pub fn solve_vector_time_major_with_missing_robust_and_monte_carlo_confidence_with_stream_offset(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        robust_options: RobustOptions,
+        monte_carlo_options: MonteCarloOptions,
+        noise: LinearConfidence,
+        stream_offset: u64,
+    ) -> Result<Vec<VectorSolution>, AnalysisError> {
         monte_carlo_options.validate()?;
         self.solve_vector_time_major_with_missing_impl(
             eastward,
@@ -4491,6 +4732,7 @@ impl GreenwichNodalBatch {
                 noise,
             }),
             Some(robust_options),
+            stream_offset,
         )
     }
 
@@ -4513,6 +4755,7 @@ impl GreenwichNodalBatch {
             latitudes,
             Some(BatchConfidence::Linear(noise)),
             Some(options),
+            0,
         )
     }
 
@@ -4523,6 +4766,7 @@ impl GreenwichNodalBatch {
         latitudes: &[f64],
         confidence: Option<BatchConfidence>,
         robust: Option<RobustOptions>,
+        stream_offset: u64,
     ) -> Result<Vec<VectorSolution>, AnalysisError> {
         validate_batch_shape_and_latitudes(self.time_count(), eastward, latitudes)?;
         if northward.len() != eastward.len() {
@@ -4595,7 +4839,9 @@ impl GreenwichNodalBatch {
                     &component_values,
                     robust,
                     confidence,
-                    u64::try_from(series).expect("series index is representable as u64"),
+                    stream_offset.wrapping_add(
+                        u64::try_from(series).expect("series index is representable as u64"),
+                    ),
                 )
             })
             .collect()
@@ -4607,6 +4853,7 @@ impl GreenwichNodalBatch {
         latitudes: &[f64],
         confidence: Option<BatchConfidence>,
         robust: Option<RobustOptions>,
+        stream_offset: u64,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         validate_batch_shape_and_latitudes(self.time_count(), observations, latitudes)?;
         for (index, value) in observations.iter().copied().enumerate() {
@@ -4618,7 +4865,13 @@ impl GreenwichNodalBatch {
             }
         }
         if observations.iter().all(|value| value.is_finite()) {
-            return self.solve_time_major_impl(observations, latitudes, confidence, robust);
+            return self.solve_time_major_impl(
+                observations,
+                latitudes,
+                confidence,
+                robust,
+                stream_offset,
+            );
         }
 
         let series_count = latitudes.len();
@@ -4674,7 +4927,9 @@ impl GreenwichNodalBatch {
                     &series_observations,
                     robust,
                     confidence,
-                    u64::try_from(series).expect("series index is representable as u64"),
+                    stream_offset.wrapping_add(
+                        u64::try_from(series).expect("series index is representable as u64"),
+                    ),
                 )
             })
             .collect()
@@ -4686,6 +4941,7 @@ impl GreenwichNodalBatch {
         latitudes: &[f64],
         confidence: Option<BatchConfidence>,
         robust: Option<RobustOptions>,
+        stream_offset: u64,
     ) -> Result<Vec<ScalarSolution>, AnalysisError> {
         validate_batch_shape_and_latitudes(self.time_count(), observations, latitudes)?;
         let series_count = latitudes.len();
@@ -4723,7 +4979,9 @@ impl GreenwichNodalBatch {
                     &series_observations,
                     robust,
                     confidence,
-                    u64::try_from(series).expect("series index is representable as u64"),
+                    stream_offset.wrapping_add(
+                        u64::try_from(series).expect("series index is representable as u64"),
+                    ),
                 )
             })
             .collect()
@@ -5835,7 +6093,7 @@ mod tests {
         GreenwichNodalBatch, GreenwichNodalOls, NodalCorrections, PhaseReference, SolverOptions,
         shared_lomb_plan_groups, usize_to_f64,
     };
-    use crate::{AnalysisError, FitOptions, LinearConfidence, TidalConstituent};
+    use crate::{AnalysisError, FitOptions, LinearConfidence, MonteCarloOptions, TidalConstituent};
 
     fn times() -> Vec<f64> {
         (0_u32..745)
@@ -6073,5 +6331,71 @@ mod tests {
                 .solve_vector(&retained_eastward, &retained_northward)
                 .expect("valid retained vector");
         assert_eq!(actual, [individual]);
+    }
+
+    #[test]
+    fn monte_carlo_stream_offsets_reproduce_a_whole_scalar_batch() {
+        let time = times();
+        let batch = GreenwichNodalBatch::prepare_modified_julian_days(
+            &time,
+            &[TidalConstituent::M2, TidalConstituent::K1],
+        )
+        .expect("valid batch");
+        let latitudes = [59.0, 60.0, 61.0];
+        let mut observations = Vec::with_capacity(time.len() * latitudes.len());
+        for sample in 0_u32..u32::try_from(time.len()).expect("small fixture") {
+            let position = f64::from(sample);
+            observations.extend([
+                (position / 11.0).sin(),
+                0.2 + (position / 13.0).cos(),
+                -0.1 + (position / 17.0).sin(),
+            ]);
+        }
+        observations[7 * 3 + 1] = f64::NAN;
+        let options = MonteCarloOptions {
+            realizations: 32,
+            seed: 123,
+        };
+        let whole = batch
+            .solve_time_major_with_missing_and_monte_carlo_confidence(
+                &observations,
+                &latitudes,
+                options,
+                LinearConfidence::White,
+            )
+            .expect("valid whole batch");
+        let first_chunk = observations
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|row| [row[0], row[1]])
+            .collect::<Vec<_>>();
+        let final_chunk = observations
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|row| row[2])
+            .collect::<Vec<_>>();
+        let mut chunked = batch
+            .solve_time_major_with_missing_and_monte_carlo_confidence_with_stream_offset(
+                &first_chunk,
+                &latitudes[..2],
+                options,
+                LinearConfidence::White,
+                0,
+            )
+            .expect("valid first chunk");
+        chunked.extend(
+            batch
+                .solve_time_major_with_missing_and_monte_carlo_confidence_with_stream_offset(
+                    &final_chunk,
+                    &latitudes[2..],
+                    options,
+                    LinearConfidence::White,
+                    2,
+                )
+                .expect("valid final chunk"),
+        );
+        assert_eq!(chunked, whole);
     }
 }

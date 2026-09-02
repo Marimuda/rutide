@@ -24,16 +24,17 @@ use super::{
     RobustOptionsReport, SamplingSummary, SeriesSamplingDiagnostics, StageTimings,
     VectorInferenceConfig, constituent_order_indices, diagnose_sampling, encode_hex,
     nodal_profile_component, normalize_source_observation, order_profile_suffix,
-    read_fvcom_time_axis, reconstruction_report, required_dimension_length, required_variable,
-    resolve_constituent_selection, retain_time_major_rows, robust_termination_code,
-    summarize_sampling, temporary_sibling, update_constituent_order_digest,
-    update_inference_digest, update_reconstruction_filter_digest, update_sampling_digest,
-    validate_config, validate_dimensions, validate_reconstruction_filter, validate_source_value,
+    read_fvcom_time_axis, read_selected_1d, read_selected_time_major, reconstruction_report,
+    required_dimension_length, required_variable, resolve_constituent_selection,
+    retain_time_major_rows, robust_termination_code, spatial_chunk_plan, summarize_sampling,
+    temporary_sibling, update_constituent_order_digest, update_inference_digest,
+    update_reconstruction_filter_digest, update_sampling_digest, validate_config,
+    validate_dimensions, validate_reconstruction_filter, validate_source_value,
     write_constituent_order_indices, write_inference_metadata, write_json_report,
     write_robust_schema_metadata, write_sampling_diagnostics, write_variable,
 };
 
-const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 10;
+const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 11;
 
 /// Configuration for one depth-averaged FVCOM current analysis.
 #[derive(Clone, Debug, PartialEq)]
@@ -66,6 +67,8 @@ pub struct VectorAnalyzeConfig {
     pub reconstruction: Option<ReconstructionFilter>,
     /// Number of outer spatial worker threads.
     pub workers: usize,
+    /// Maximum spatial series read and solved together, or automatic when absent.
+    pub chunk_series: Option<usize>,
     /// Permit replacing existing output and report files.
     pub overwrite: bool,
 }
@@ -155,6 +158,12 @@ pub struct VectorRunReport {
     pub sampling: SamplingSummary,
     /// Number of outer spatial workers.
     pub workers: usize,
+    /// Actual maximum number of spatial series held in one input chunk.
+    pub chunk_series: usize,
+    /// Number of spatial chunks processed.
+    pub chunk_count: usize,
+    /// Maximum logical bytes occupied by chunk-local promoted component arrays.
+    pub maximum_observation_buffer_bytes: u64,
     /// Least-squares method: `ols` or `robust`.
     pub analysis_method: &'static str,
     /// Whether a linear trend was included alongside the fitted mean.
@@ -208,11 +217,32 @@ struct VectorInputData {
     discarded_timestamp_count: usize,
     element_indices: Vec<usize>,
     latitudes: Vec<f64>,
+    #[cfg(test)]
     eastward: Vec<f64>,
+    #[cfg(test)]
     northward: Vec<f64>,
     observation_counts: Vec<usize>,
     input_file_bytes: u64,
     logical_input_bytes: u64,
+}
+
+struct VectorInputMetadata {
+    modified_julian_days: Vec<f64>,
+    retained_time_indices: Vec<usize>,
+    source_time_count: usize,
+    discarded_timestamp_count: usize,
+    element_indices: Vec<usize>,
+    latitudes: Vec<f64>,
+    eastward_fill: Option<f32>,
+    northward_fill: Option<f32>,
+    input_file_bytes: u64,
+    logical_input_bytes: u64,
+}
+
+struct VectorInputChunk {
+    eastward: Vec<f64>,
+    northward: Vec<f64>,
+    observation_counts: Vec<usize>,
 }
 
 enum VectorAnalysisBatch {
@@ -316,14 +346,17 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
     let total_start = Instant::now();
 
     let input_start = Instant::now();
-    let input = read_fvcom_vector(&config.input, &config.elements)?;
-    let input_seconds = input_start.elapsed().as_secs_f64();
+    let dataset = netcdf::open(&config.input)?;
+    let metadata = read_fvcom_vector_metadata(&config.input, &dataset, &config.elements)?;
+    let mut input_seconds = input_start.elapsed().as_secs_f64();
 
     let preparation_start = Instant::now();
-    let selection =
-        resolve_constituent_selection(&config.constituent_selection, &input.modified_julian_days)?;
+    let selection = resolve_constituent_selection(
+        &config.constituent_selection,
+        &metadata.modified_julian_days,
+    )?;
     let batch = VectorAnalysisBatch::prepare(
-        &input.modified_julian_days,
+        &metadata.modified_julian_days,
         &selection.constituents,
         config.inference.as_ref(),
         config.fit_options,
@@ -334,160 +367,118 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
     if let Some(filter) = &config.reconstruction {
         validate_reconstruction_filter(filter, batch.tidal_constituents())?;
     }
+    let chunk_plan = spatial_chunk_plan(
+        config.chunk_series,
+        metadata.element_indices.len(),
+        metadata.source_time_count,
+        2,
+        config.workers,
+    )?;
+    let sampling_plan =
+        rutide_core::SamplingDiagnosticsPlan::prepare(&metadata.modified_julian_days)?;
+    let reconstructor = config
+        .reconstruction
+        .as_ref()
+        .map(|_| batch.reconstructor_modified_julian_days(&metadata.modified_julian_days))
+        .transpose()?;
     let preparation_seconds = preparation_start.elapsed().as_secs_f64();
 
     let worker_pool = ThreadPoolBuilder::new()
         .num_threads(config.workers)
         .build()?;
-    let solve_start = Instant::now();
-    let solutions = worker_pool.install(|| match &batch {
-        VectorAnalysisBatch::Standard(batch) => {
-            match (config.analysis_method, config.confidence_interval) {
-                (AnalysisMethod::Ols, ConfidenceInterval::None) => batch
-                    .solve_vector_time_major_with_missing(
-                        &input.eastward,
-                        &input.northward,
-                        &input.latitudes,
-                    ),
-                (AnalysisMethod::Ols, ConfidenceInterval::Linear(noise)) => batch
-                    .solve_vector_time_major_with_missing_and_linear_confidence(
-                        &input.eastward,
-                        &input.northward,
-                        &input.latitudes,
-                        noise,
-                    ),
-                (AnalysisMethod::Ols, ConfidenceInterval::MonteCarlo { options, noise }) => batch
-                    .solve_vector_time_major_with_missing_and_monte_carlo_confidence(
-                        &input.eastward,
-                        &input.northward,
-                        &input.latitudes,
-                        options,
-                        noise,
-                    ),
-                (AnalysisMethod::Robust(options), ConfidenceInterval::None) => batch
-                    .solve_vector_time_major_with_missing_robust(
-                        &input.eastward,
-                        &input.northward,
-                        &input.latitudes,
-                        options,
-                    ),
-                (AnalysisMethod::Robust(options), ConfidenceInterval::Linear(noise)) => batch
-                    .solve_vector_time_major_with_missing_robust_and_linear_confidence(
-                        &input.eastward,
-                        &input.northward,
-                        &input.latitudes,
-                        options,
-                        noise,
-                    ),
-                (
-                    AnalysisMethod::Robust(robust_options),
-                    ConfidenceInterval::MonteCarlo {
-                        options: monte_carlo_options,
-                        noise,
-                    },
-                ) => batch.solve_vector_time_major_with_missing_robust_and_monte_carlo_confidence(
-                    &input.eastward,
-                    &input.northward,
-                    &input.latitudes,
-                    robust_options,
-                    monte_carlo_options,
-                    noise,
-                ),
-            }
-        }
-        VectorAnalysisBatch::Inferred(batch) => {
-            match (config.analysis_method, config.confidence_interval) {
-                (AnalysisMethod::Ols, ConfidenceInterval::None) => batch
-                    .solve_vector_time_major_with_missing(
-                        &input.eastward,
-                        &input.northward,
-                        &input.latitudes,
-                    ),
-                (AnalysisMethod::Ols, ConfidenceInterval::Linear(noise)) => batch
-                    .solve_vector_time_major_with_missing_and_linear_confidence(
-                        &input.eastward,
-                        &input.northward,
-                        &input.latitudes,
-                        noise,
-                    ),
-                (AnalysisMethod::Ols, ConfidenceInterval::MonteCarlo { options, noise }) => batch
-                    .solve_vector_time_major_with_missing_and_monte_carlo_confidence(
-                        &input.eastward,
-                        &input.northward,
-                        &input.latitudes,
-                        options,
-                        noise,
-                    ),
-                (AnalysisMethod::Robust(options), ConfidenceInterval::None) => batch
-                    .solve_vector_time_major_with_missing_robust(
-                        &input.eastward,
-                        &input.northward,
-                        &input.latitudes,
-                        options,
-                    ),
-                (AnalysisMethod::Robust(options), ConfidenceInterval::Linear(noise)) => batch
-                    .solve_vector_time_major_with_missing_robust_and_linear_confidence(
-                        &input.eastward,
-                        &input.northward,
-                        &input.latitudes,
-                        options,
-                        noise,
-                    ),
-                (
-                    AnalysisMethod::Robust(robust_options),
-                    ConfidenceInterval::MonteCarlo {
-                        options: monte_carlo_options,
-                        noise,
-                    },
-                ) => batch.solve_vector_time_major_with_missing_robust_and_monte_carlo_confidence(
-                    &input.eastward,
-                    &input.northward,
-                    &input.latitudes,
-                    robust_options,
-                    monte_carlo_options,
-                    noise,
-                ),
-            }
-        }
-    })?;
-    let solve_seconds = solve_start.elapsed().as_secs_f64();
+    let series_count = metadata.element_indices.len();
+    let mut solutions = Vec::with_capacity(series_count);
+    let mut series_frequency_cph = Vec::with_capacity(series_count);
+    let mut sampling_diagnostics = Vec::with_capacity(series_count);
+    let mut observation_counts = Vec::with_capacity(series_count);
+    let mut reconstruction = config
+        .reconstruction
+        .as_ref()
+        .map(|_| Vec::with_capacity(series_count));
+    let mut solve_seconds = 0.0;
+    let mut reconstruction_seconds = 0.0;
+    let mut result_processing_seconds = 0.0;
+    for first_series in (0..series_count).step_by(chunk_plan.series_per_chunk) {
+        let end_series = (first_series + chunk_plan.series_per_chunk).min(series_count);
+        let read_start = Instant::now();
+        let chunk = read_fvcom_vector_chunk(&dataset, &metadata, first_series..end_series)?;
+        input_seconds += read_start.elapsed().as_secs_f64();
+        let latitudes = &metadata.latitudes[first_series..end_series];
 
-    let reconstruction_start = Instant::now();
-    let reconstruction = if let Some(filter) = config.reconstruction.as_ref() {
-        let reconstructor =
-            batch.reconstructor_modified_julian_days(&input.modified_julian_days)?;
-        Some(worker_pool.install(|| {
-            reconstructor.reconstruct_many_vectors_series_major(
-                &solutions,
-                &input.latitudes,
-                filter,
-            )
-        })?)
-    } else {
-        None
+        let solve_start = Instant::now();
+        let chunk_solutions = solve_vector_input(
+            &worker_pool,
+            &batch,
+            &chunk.eastward,
+            &chunk.northward,
+            latitudes,
+            first_series,
+            config.analysis_method,
+            config.confidence_interval,
+        )?;
+        solve_seconds += solve_start.elapsed().as_secs_f64();
+
+        let reconstruction_start = Instant::now();
+        if let (Some(reconstructor), Some(filter), Some(values)) = (
+            reconstructor.as_ref(),
+            config.reconstruction.as_ref(),
+            reconstruction.as_mut(),
+        ) {
+            values.extend(worker_pool.install(|| {
+                reconstructor.reconstruct_many_vectors_series_major(
+                    &chunk_solutions,
+                    latitudes,
+                    filter,
+                )
+            })?);
+        }
+        reconstruction_seconds += reconstruction_start.elapsed().as_secs_f64();
+
+        let result_start = Instant::now();
+        let chunk_frequency_cph = vector_solution_frequencies(&batch, &chunk_solutions)?;
+        let chunk_diagnostics = diagnose_sampling(
+            &worker_pool,
+            &sampling_plan,
+            &chunk_frequency_cph,
+            |time, series| {
+                let index = time * chunk_solutions.len() + series;
+                chunk.eastward[index].is_finite() && chunk.northward[index].is_finite()
+            },
+        )?;
+        if chunk_diagnostics
+            .iter()
+            .zip(&chunk.observation_counts)
+            .any(|(diagnostics, count)| diagnostics.observation_count != *count)
+        {
+            return Err(AppError::Invalid(
+                "sampling diagnostic observation counts differ from fitted vector inputs"
+                    .to_owned(),
+            ));
+        }
+        observation_counts.extend_from_slice(&chunk.observation_counts);
+        series_frequency_cph.extend(chunk_frequency_cph);
+        sampling_diagnostics.extend(chunk_diagnostics);
+        solutions.extend(chunk_solutions);
+        result_processing_seconds += result_start.elapsed().as_secs_f64();
+    }
+    drop(dataset);
+
+    let input = VectorInputData {
+        modified_julian_days: metadata.modified_julian_days,
+        source_time_count: metadata.source_time_count,
+        discarded_timestamp_count: metadata.discarded_timestamp_count,
+        element_indices: metadata.element_indices,
+        latitudes: metadata.latitudes,
+        #[cfg(test)]
+        eastward: Vec::new(),
+        #[cfg(test)]
+        northward: Vec::new(),
+        observation_counts,
+        input_file_bytes: metadata.input_file_bytes,
+        logical_input_bytes: metadata.logical_input_bytes,
     };
-    let reconstruction_seconds = reconstruction_start.elapsed().as_secs_f64();
 
     let result_start = Instant::now();
-    let series_frequency_cph = vector_solution_frequencies(&batch, &solutions)?;
-    let sampling_diagnostics = diagnose_sampling(
-        &worker_pool,
-        &input.modified_julian_days,
-        &series_frequency_cph,
-        |time, series| {
-            let index = time * input.element_indices.len() + series;
-            input.eastward[index].is_finite() && input.northward[index].is_finite()
-        },
-    )?;
-    if sampling_diagnostics
-        .iter()
-        .zip(&input.observation_counts)
-        .any(|(diagnostics, count)| diagnostics.observation_count != *count)
-    {
-        return Err(AppError::Invalid(
-            "sampling diagnostic observation counts differ from fitted vector inputs".to_owned(),
-        ));
-    }
     let sampling_summary = summarize_sampling(&sampling_diagnostics)?;
     let constituent_index_by_rank = constituent_order_indices(
         &config.constituent_order,
@@ -525,7 +516,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         &constituent_index_by_rank,
         &sampling_diagnostics,
     );
-    let result_processing_seconds = result_start.elapsed().as_secs_f64();
+    result_processing_seconds += result_start.elapsed().as_secs_f64();
 
     let output_start = Instant::now();
     write_vector_output(
@@ -547,6 +538,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             nodal_corrections: config.nodal_corrections,
             analysis_method: config.analysis_method,
             confidence_interval: config.confidence_interval,
+            chunk_plan,
             reference_time_modified_julian_day: batch.reference_time_modified_julian_day(),
             reconstruction: config
                 .reconstruction
@@ -590,6 +582,9 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             .count(),
         sampling: sampling_summary,
         workers: config.workers,
+        chunk_series: chunk_plan.series_per_chunk,
+        chunk_count: chunk_plan.chunk_count,
+        maximum_observation_buffer_bytes: chunk_plan.maximum_observation_buffer_bytes,
         analysis_method: config.analysis_method.name(),
         trend_enabled: config.fit_options.trend,
         phase_reference: config.phase_reference.name(),
@@ -648,6 +643,109 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
     Ok(report)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the batch solver needs both vector components and explicit execution options"
+)]
+fn solve_vector_input(
+    worker_pool: &rayon::ThreadPool,
+    batch: &VectorAnalysisBatch,
+    eastward: &[f64],
+    northward: &[f64],
+    latitudes: &[f64],
+    series_offset: usize,
+    analysis_method: AnalysisMethod,
+    confidence_interval: ConfidenceInterval,
+) -> Result<Vec<VectorSolution>, AnalysisError> {
+    let stream_offset = u64::try_from(series_offset).expect("usize is representable as u64");
+    worker_pool.install(|| match batch {
+        VectorAnalysisBatch::Standard(batch) => match (analysis_method, confidence_interval) {
+            (AnalysisMethod::Ols, ConfidenceInterval::None) => {
+                batch.solve_vector_time_major_with_missing(eastward, northward, latitudes)
+            }
+            (AnalysisMethod::Ols, ConfidenceInterval::Linear(noise)) => batch
+                .solve_vector_time_major_with_missing_and_linear_confidence(
+                    eastward, northward, latitudes, noise,
+                ),
+            (AnalysisMethod::Ols, ConfidenceInterval::MonteCarlo { options, noise }) => batch
+                .solve_vector_time_major_with_missing_and_monte_carlo_confidence_with_stream_offset(
+                    eastward,
+                    northward,
+                    latitudes,
+                    options,
+                    noise,
+                    stream_offset,
+                ),
+            (AnalysisMethod::Robust(options), ConfidenceInterval::None) => batch
+                .solve_vector_time_major_with_missing_robust(
+                    eastward, northward, latitudes, options,
+                ),
+            (AnalysisMethod::Robust(options), ConfidenceInterval::Linear(noise)) => batch
+                .solve_vector_time_major_with_missing_robust_and_linear_confidence(
+                    eastward, northward, latitudes, options, noise,
+                ),
+            (
+                AnalysisMethod::Robust(robust_options),
+                ConfidenceInterval::MonteCarlo {
+                    options: monte_carlo_options,
+                    noise,
+                },
+            ) => batch
+                .solve_vector_time_major_with_missing_robust_and_monte_carlo_confidence_with_stream_offset(
+                    eastward,
+                    northward,
+                    latitudes,
+                    robust_options,
+                    monte_carlo_options,
+                    noise,
+                    stream_offset,
+                ),
+        },
+        VectorAnalysisBatch::Inferred(batch) => match (analysis_method, confidence_interval) {
+            (AnalysisMethod::Ols, ConfidenceInterval::None) => {
+                batch.solve_vector_time_major_with_missing(eastward, northward, latitudes)
+            }
+            (AnalysisMethod::Ols, ConfidenceInterval::Linear(noise)) => batch
+                .solve_vector_time_major_with_missing_and_linear_confidence(
+                    eastward, northward, latitudes, noise,
+                ),
+            (AnalysisMethod::Ols, ConfidenceInterval::MonteCarlo { options, noise }) => batch
+                .solve_vector_time_major_with_missing_and_monte_carlo_confidence_with_stream_offset(
+                    eastward,
+                    northward,
+                    latitudes,
+                    options,
+                    noise,
+                    stream_offset,
+                ),
+            (AnalysisMethod::Robust(options), ConfidenceInterval::None) => batch
+                .solve_vector_time_major_with_missing_robust(
+                    eastward, northward, latitudes, options,
+                ),
+            (AnalysisMethod::Robust(options), ConfidenceInterval::Linear(noise)) => batch
+                .solve_vector_time_major_with_missing_robust_and_linear_confidence(
+                    eastward, northward, latitudes, options, noise,
+                ),
+            (
+                AnalysisMethod::Robust(robust_options),
+                ConfidenceInterval::MonteCarlo {
+                    options: monte_carlo_options,
+                    noise,
+                },
+            ) => batch
+                .solve_vector_time_major_with_missing_robust_and_monte_carlo_confidence_with_stream_offset(
+                    eastward,
+                    northward,
+                    latitudes,
+                    robust_options,
+                    monte_carlo_options,
+                    noise,
+                    stream_offset,
+                ),
+        },
+    })
+}
+
 fn validate_vector_config(config: &VectorAnalyzeConfig) -> Result<(), AppError> {
     validate_config(&AnalyzeConfig {
         input: config.input.clone(),
@@ -664,6 +762,7 @@ fn validate_vector_config(config: &VectorAnalyzeConfig) -> Result<(), AppError> 
         analysis_method: config.analysis_method,
         reconstruction: config.reconstruction.clone(),
         workers: config.workers,
+        chunk_series: config.chunk_series,
         overwrite: config.overwrite,
     })?;
     if config
@@ -703,78 +802,53 @@ fn vector_profile(
     )
 }
 
+#[cfg(test)]
 fn read_fvcom_vector(path: &Path, selection: &NodeSelection) -> Result<VectorInputData, AppError> {
-    let input_file_bytes = fs::metadata(path)?.len();
     let dataset = netcdf::open(path)?;
-    let time_count = required_dimension_length(&dataset, "time")?;
-    let element_count = required_dimension_length(&dataset, "nele")?;
+    let metadata = read_fvcom_vector_metadata(path, &dataset, selection)?;
+    let chunk = read_fvcom_vector_chunk(&dataset, &metadata, 0..metadata.element_indices.len())?;
+    Ok(VectorInputData {
+        modified_julian_days: metadata.modified_julian_days,
+        source_time_count: metadata.source_time_count,
+        discarded_timestamp_count: metadata.discarded_timestamp_count,
+        element_indices: metadata.element_indices,
+        latitudes: metadata.latitudes,
+        #[cfg(test)]
+        eastward: chunk.eastward,
+        #[cfg(test)]
+        northward: chunk.northward,
+        observation_counts: chunk.observation_counts,
+        input_file_bytes: metadata.input_file_bytes,
+        logical_input_bytes: metadata.logical_input_bytes,
+    })
+}
+
+fn read_fvcom_vector_metadata(
+    path: &Path,
+    dataset: &netcdf::File,
+    selection: &NodeSelection,
+) -> Result<VectorInputMetadata, AppError> {
+    let input_file_bytes = fs::metadata(path)?.len();
+    let time_count = required_dimension_length(dataset, "time")?;
+    let element_count = required_dimension_length(dataset, "nele")?;
     let element_indices = resolve_element_selection(selection, element_count)?;
     let series_count = element_indices.len();
 
-    let (time_axis, time_element_bytes) = read_fvcom_time_axis(&dataset, time_count)?;
+    let (time_axis, time_element_bytes) = read_fvcom_time_axis(dataset, time_count)?;
 
-    let latitude_variable = required_variable(&dataset, "latc")?;
+    let latitude_variable = required_variable(dataset, "latc")?;
     validate_dimensions(&latitude_variable, &[("nele", element_count)])?;
     let latitude_fill = latitude_variable.fill_value::<f32>()?;
-    let eastward_variable = required_vector_variable(&dataset, "ua", time_count, element_count)?;
-    let northward_variable = required_vector_variable(&dataset, "va", time_count, element_count)?;
+    let eastward_variable = required_vector_variable(dataset, "ua", time_count, element_count)?;
+    let northward_variable = required_vector_variable(dataset, "va", time_count, element_count)?;
     let eastward_fill = eastward_variable.fill_value::<f32>()?;
     let northward_fill = northward_variable.fill_value::<f32>()?;
 
-    let is_prefix = element_indices.iter().copied().eq(0..series_count);
-    let (latitude_values, eastward, northward) = if is_prefix {
-        (
-            latitude_variable.get_values::<f64, _>(0..series_count)?,
-            eastward_variable.get_values::<f64, _>((.., 0..series_count))?,
-            northward_variable.get_values::<f64, _>((.., 0..series_count))?,
-        )
-    } else {
-        let mut latitude_values = Vec::with_capacity(series_count);
-        let mut eastward = vec![0.0; time_count * series_count];
-        let mut northward = vec![0.0; time_count * series_count];
-        for (series, element) in element_indices.iter().copied().enumerate() {
-            latitude_values.push(latitude_variable.get_value::<f64, _>(element)?);
-            let eastward_column = eastward_variable.get_values::<f64, _>((.., element))?;
-            let northward_column = northward_variable.get_values::<f64, _>((.., element))?;
-            for time in 0..time_count {
-                eastward[time * series_count + series] = eastward_column[time];
-                northward[time * series_count + series] = northward_column[time];
-            }
-        }
-        (latitude_values, eastward, northward)
-    };
-    let mut eastward = retain_time_major_rows(
-        eastward,
-        time_count,
-        series_count,
-        time_axis.retained_indices(),
-    )?;
-    let mut northward = retain_time_major_rows(
-        northward,
-        time_count,
-        series_count,
-        time_axis.retained_indices(),
-    )?;
+    let latitude_values = read_selected_1d(&latitude_variable, &element_indices)?;
 
     for (series, value) in latitude_values.iter().copied().enumerate() {
         validate_source_value("latc", value, latitude_fill, series, 0)?;
     }
-    let mut observation_counts = vec![0; series_count];
-    for index in 0..eastward.len() {
-        let series = index % series_count;
-        let time = index / series_count;
-        eastward[index] =
-            normalize_source_observation("ua", eastward[index], eastward_fill, series, time)?;
-        northward[index] =
-            normalize_source_observation("va", northward[index], northward_fill, series, time)?;
-        if eastward[index].is_finite() && northward[index].is_finite() {
-            observation_counts[series] += 1;
-        } else {
-            eastward[index] = f64::NAN;
-            northward[index] = f64::NAN;
-        }
-    }
-
     let value_count = time_count
         .checked_mul(series_count)
         .ok_or_else(|| AppError::Invalid("logical input size exceeds usize".to_owned()))?;
@@ -785,20 +859,89 @@ fn read_fvcom_vector(path: &Path, selection: &NodeSelection) -> Result<VectorInp
         (value_count, eastward_variable.vartype().size()),
         (value_count, northward_variable.vartype().size()),
     ])?;
-    let discarded_timestamp_count = time_axis.discarded_count();
     let source_time_count = time_axis.source_count();
-    let (modified_julian_days, _) = time_axis.into_parts();
-    Ok(VectorInputData {
+    let discarded_timestamp_count = time_axis.discarded_count();
+    let (modified_julian_days, retained_time_indices) = time_axis.into_parts();
+    Ok(VectorInputMetadata {
         modified_julian_days,
+        retained_time_indices,
         source_time_count,
         discarded_timestamp_count,
         element_indices,
         latitudes: latitude_values,
+        eastward_fill,
+        northward_fill,
+        input_file_bytes,
+        logical_input_bytes,
+    })
+}
+
+fn read_fvcom_vector_chunk(
+    dataset: &netcdf::File,
+    metadata: &VectorInputMetadata,
+    series_range: std::ops::Range<usize>,
+) -> Result<VectorInputChunk, AppError> {
+    let element_indices = metadata
+        .element_indices
+        .get(series_range.clone())
+        .ok_or_else(|| {
+            AppError::Invalid("vector chunk range exceeds selected element count".to_owned())
+        })?;
+    let series_count = element_indices.len();
+    if series_count == 0 {
+        return Err(AppError::Invalid("vector input chunk is empty".to_owned()));
+    }
+    let mut eastward = read_selected_time_major(
+        &required_variable(dataset, "ua")?,
+        metadata.source_time_count,
+        element_indices,
+    )?;
+    let mut northward = read_selected_time_major(
+        &required_variable(dataset, "va")?,
+        metadata.source_time_count,
+        element_indices,
+    )?;
+    eastward = retain_time_major_rows(
+        eastward,
+        metadata.source_time_count,
+        series_count,
+        &metadata.retained_time_indices,
+    )?;
+    northward = retain_time_major_rows(
+        northward,
+        metadata.source_time_count,
+        series_count,
+        &metadata.retained_time_indices,
+    )?;
+    let mut observation_counts = vec![0; series_count];
+    for index in 0..eastward.len() {
+        let series = index % series_count;
+        let time = index / series_count;
+        eastward[index] = normalize_source_observation(
+            "ua",
+            eastward[index],
+            metadata.eastward_fill,
+            series_range.start + series,
+            time,
+        )?;
+        northward[index] = normalize_source_observation(
+            "va",
+            northward[index],
+            metadata.northward_fill,
+            series_range.start + series,
+            time,
+        )?;
+        if eastward[index].is_finite() && northward[index].is_finite() {
+            observation_counts[series] += 1;
+        } else {
+            eastward[index] = f64::NAN;
+            northward[index] = f64::NAN;
+        }
+    }
+    Ok(VectorInputChunk {
         eastward,
         northward,
         observation_counts,
-        input_file_bytes,
-        logical_input_bytes,
     })
 }
 
@@ -1130,6 +1273,7 @@ struct VectorOutputData<'data> {
     nodal_corrections: NodalCorrections,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
+    chunk_plan: super::SpatialChunkPlan,
     reference_time_modified_julian_day: f64,
     reconstruction: Option<(&'data ReconstructionFilter, &'data [VectorReconstruction])>,
 }
@@ -1186,6 +1330,20 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
             .map_err(|_| AppError::Invalid("discarded timestamp count exceeds i64".to_owned()))?,
     )?;
     output.add_attribute("time_epoch", "modified-julian-day")?;
+    output.add_attribute(
+        "chunk_series",
+        u64::try_from(data.chunk_plan.series_per_chunk)
+            .map_err(|_| AppError::Invalid("chunk series count exceeds u64".to_owned()))?,
+    )?;
+    output.add_attribute(
+        "chunk_count",
+        u64::try_from(data.chunk_plan.chunk_count)
+            .map_err(|_| AppError::Invalid("chunk count exceeds u64".to_owned()))?,
+    )?;
+    output.add_attribute(
+        "maximum_observation_buffer_bytes",
+        data.chunk_plan.maximum_observation_buffer_bytes,
+    )?;
     let profile = vector_profile(
         data.selection,
         data.analysis_method,
@@ -1618,6 +1776,10 @@ mod tests {
         let input_path = temporary_sibling(&input_destination).expect("valid input path");
         let output_destination = std::env::temp_dir().join("rutide-vector-output-test.nc");
         let output_path = temporary_sibling(&output_destination).expect("valid output path");
+        let chunked_output_destination =
+            std::env::temp_dir().join("rutide-vector-chunked-output-test.nc");
+        let chunked_output_path =
+            temporary_sibling(&chunked_output_destination).expect("valid chunked output path");
         let inference_output_destination =
             std::env::temp_dir().join("rutide-vector-inference-output-test.nc");
         let inference_output_path =
@@ -1695,7 +1857,7 @@ mod tests {
         assert!(input.eastward[3 * 2 + 1].is_nan());
         assert!(input.northward[3 * 2 + 1].is_nan());
 
-        let report = analyze_vector(&VectorAnalyzeConfig {
+        let config = VectorAnalyzeConfig {
             input: input_path.clone(),
             output: output_path.clone(),
             report: None,
@@ -1722,9 +1884,41 @@ mod tests {
             }),
             reconstruction: Some(ReconstructionFilter::All),
             workers: 2,
+            chunk_series: None,
             overwrite: false,
-        })
-        .expect("analyze vector fixture");
+        };
+        let report = analyze_vector(&config).expect("analyze vector fixture");
+        let mut chunked_config = config.clone();
+        chunked_config.output = chunked_output_path.clone();
+        chunked_config.chunk_series = Some(1);
+        let chunked_report =
+            analyze_vector(&chunked_config).expect("analyze vector fixture in one-series chunks");
+        assert_eq!(chunked_report.chunk_series, 1);
+        assert_eq!(chunked_report.chunk_count, 2);
+        assert_eq!(chunked_report.result_sha256, report.result_sha256);
+        for name in [
+            "semi_major",
+            "semi_minor",
+            "inclination",
+            "phase",
+            "robust_weight",
+            "eastward_reconstruction",
+            "northward_reconstruction",
+        ] {
+            let whole = netcdf::open(&output_path)
+                .expect("open whole-field vector output")
+                .variable(name)
+                .expect("whole-field variable")
+                .get_values::<f64, _>(..)
+                .expect("read whole-field variable");
+            let chunked = netcdf::open(&chunked_output_path)
+                .expect("open chunked vector output")
+                .variable(name)
+                .expect("chunked variable")
+                .get_values::<f64, _>(..)
+                .expect("read chunked variable");
+            assert_eq!(chunked, whole, "chunked {name} differs");
+        }
         assert_eq!(report.series_count, 2);
         assert_eq!(report.source_time_count, 49);
         assert_eq!(report.discarded_timestamp_count, 1);
@@ -1883,6 +2077,7 @@ mod tests {
             }),
             reconstruction: Some(ReconstructionFilter::All),
             workers: 2,
+            chunk_series: Some(1),
             overwrite: false,
         })
         .expect("analyze inferred vector fixture");
@@ -1903,6 +2098,7 @@ mod tests {
         assert_eq!(inference_report.confidence_interval, "monte-carlo");
         assert_eq!(inference_report.monte_carlo_realizations, Some(64));
         assert_eq!(inference_report.monte_carlo_seed, Some(99));
+        assert_eq!(inference_report.chunk_count, 2);
         assert_eq!(
             inference_report.profile,
             "fixed-constituents-raw-nodal-linear-time-vector-inference-robust-order-snr-no-trend"
@@ -2027,6 +2223,7 @@ mod tests {
         drop(inference_output);
         fs::remove_file(input_path).expect("remove vector fixture");
         fs::remove_file(output_path).expect("remove vector output");
+        fs::remove_file(chunked_output_path).expect("remove chunked vector output");
         fs::remove_file(inference_output_path).expect("remove inferred vector output");
     }
 }

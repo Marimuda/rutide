@@ -25,6 +25,9 @@ defined behavior, and representative oracle tests are versioned.
   are missing from an otherwise equidistant source grid.
 - FVCOM `zeta` and depth-averaged `ua` / `va` NetCDF applications.
 - Whole-field scalar and vector correctness and performance benchmarks.
+- Bounded scalar/vector FVCOM spatial chunks with contiguous hyperslab reads,
+  deterministic output order, mask grouping, and globally stable Monte Carlo
+  streams across chunk sizes.
 
 ## 1. Irregular colored-noise confidence — complete
 
@@ -261,19 +264,19 @@ combinations must be rejected during validation rather than partially applied.
 
 ## 6. Product and resource work — planned
 
-- Read and solve NetCDF spatial chunks so complete `f64` scalar/vector fields are
-  not simultaneously resident. Preserve deterministic output order and mask
-  grouping across chunks.
 - Add depth-resolved FVCOM current variables after defining their output schema.
 - Stabilize the Rust library and NetCDF schemas, then add Python bindings only if
   a drop-in or mixed Python/Rust workflow is an actual user requirement.
 - Publish reproducible release artifacts, compatibility documentation, and a
   machine-readable feature matrix.
 
-For the current vector benchmark, chunked input is the main remaining resource
-opportunity: the complete promoted `ua` and `va` arrays dominate the approximately
-2.10 GiB Rust high-water mark. It is independent of the scientific feature order
-above and can be scheduled between oracle-heavy increments.
+Bounded spatial input is complete. The default 512 MiB promoted-observation
+budget reduced the 64-worker vector peak RSS from 2.23 GiB to 0.94 GiB with a
+9.5% median wall-time cost and identical whole-field digests; see
+`benchmarks/results/spatial-chunking-2026-09-02.md`. Compact coefficient and
+diagnostic results remain resident for a single high-throughput NetCDF output
+transaction. An incremental result sink is therefore optional future work for
+fields whose result arrays, rather than source observations, become material.
 
 ## Definition of broad compatibility
 

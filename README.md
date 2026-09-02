@@ -27,6 +27,12 @@ reports a 5.39-second Rust median versus 126.97 seconds for the 32-process Pytho
 UTide baseline across all 144,860 current elements, a 23.6x process-boundary
 speedup with Python-compatible ellipse and colored-CI correctness.
 
+The subsequent [spatial-chunk snapshot](benchmarks/results/spatial-chunking-2026-09-02.md)
+reduces the 64-worker vector peak RSS from 2.23 GiB to 0.94 GiB while retaining
+the same canonical digest. Its 5.40-second median is 9.5% slower than the
+one-chunk comparison and remains 23.5x faster than the previously measured
+126.97-second Python baseline.
+
 The focused [irregular-confidence snapshot](benchmarks/results/irregular-confidence-2026-09-01.md)
 records Lomb–Scargle scalar and vector parity and a 20.05–70.06x advantage over
 pinned Python UTide on its 100-series observational workload, depending on field
@@ -79,6 +85,18 @@ eastward/northward reconstruction. The command-line application accepts either
 FVCOM `zeta(time, node)` or `ua(time, nele)` plus `va(time, nele)` and serializes
 the corresponding analysis, diagnostics, observation counts, per-series
 reference epochs, and optional reconstruction to NetCDF.
+
+FVCOM observations are read and solved in bounded spatial chunks. By default,
+the application targets at most 512 MiB of promoted `f64` observation storage
+per chunk, rounds multi-chunk work to the requested worker count, and uses one
+chunk when the selected field already fits. `--chunk-series N` provides an
+explicit reproducibility or memory-control override. Contiguous selections use
+one NetCDF hyperslab per component; arbitrary selections coalesce adjacent
+source indices while preserving requested output order. Chunk-local masks are
+grouped exactly as before, and global Monte Carlo stream offsets make results
+independent of chunk size and worker scheduling. JSON reports and scalar/vector
+NetCDF schemas v15/v11 record the actual chunk count, series count, and maximum
+logical observation-buffer bytes.
 
 Cauchy robust fitting is available for scalar and vector analyses, including
 missing and irregular records, colored confidence intervals, and reconstruction.
@@ -165,6 +183,10 @@ cargo run --release --bin rutide -- analyze-scalar \
   --report run.json \
   --workers 64
 ```
+
+The automatic memory/performance balance is recommended. For a controlled
+whole-field comparison, pass a `--chunk-series` value at least as large as the
+selected node or element count; use a smaller value to enforce a tighter bound.
 
 Supply any unique catalog names in output order with, for example,
 `--constituents Q1,O1,K1,M2,S2,K2,M4`. The default remains the frozen five-name
