@@ -3,8 +3,8 @@
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
     AnalysisError, FitOptions, GreenwichNodalBatch, GreenwichNodalOls, GreenwichNodalReconstructor,
-    LinearConfidence, MonteCarloOptions, PhaseReference, ReconstructionFilter, RobustOptions,
-    SolverOptions, TidalConstituent,
+    LinearConfidence, MonteCarloOptions, NodalCorrections, PhaseReference, ReconstructionFilter,
+    RobustOptions, SolverOptions, TidalConstituent,
 };
 
 const CONSTITUENTS: [TidalConstituent; 5] = [
@@ -625,6 +625,208 @@ fn matches_python_utide_linear_time_and_raw_phase_references() {
                 2e-9,
             );
         }
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "freezes scalar, rotary, batch, and reconstruction nodal-mode behavior"
+)]
+fn matches_python_utide_linearized_and_disabled_nodal_corrections() {
+    let time = oracle_times();
+    let observations = oracle_observations();
+    let (eastward, northward) = synthetic_vector_observations(&time);
+    let cases = [
+        (
+            NodalCorrections::LinearTime,
+            [
+                0.653_860_959_779_784_3,
+                0.226_264_638_346_505_34,
+                0.158_047_496_220_637_6,
+                0.112_481_323_029_007_67,
+                0.068_856_049_717_752_24,
+            ],
+            [
+                189.408_378_219_114_1,
+                228.992_560_112_334_64,
+                163.388_847_122_994_12,
+                154.298_864_149_819_85,
+                20.070_146_783_815_737,
+            ],
+            [
+                0.002_485_769_396_334_92,
+                0.002_666_246_927_678_49,
+                0.001_975_002_629_185_95,
+                0.003_247_905_383_644_46,
+                0.043_153_206_226_346_16,
+            ],
+            [
+                0.000_092_458_858_290_605_6,
+                -0.000_776_729_242_515_180_8,
+                0.001_285_000_051_158_08,
+                -0.001_541_310_561_553_152_2,
+                -0.007_647_798_097_564_069,
+            ],
+            [
+                253.898_925_554_814_1,
+                101.185_626_780_857_79,
+                332.983_709_634_021_7,
+                5.868_665_113_215_684,
+                173.448_058_486_651_38,
+            ],
+        ),
+        (
+            NodalCorrections::Disabled,
+            [
+                0.672_212_080_982_874_3,
+                0.225_933_490_105_273_53,
+                0.162_148_198_298_791_3,
+                0.103_698_132_731_553_82,
+                0.060_258_545_157_316_89,
+            ],
+            [
+                190.885_864_445_715_92,
+                228.905_303_519_941_67,
+                165.072_516_426_180_4,
+                161.169_387_027_392_5,
+                11.128_279_280_728_849,
+            ],
+            [
+                0.002_555_534_466_099_17,
+                0.002_662_344_758_133_9,
+                0.002_026_246_069_161_37,
+                0.002_994_290_203_057_78,
+                0.037_765_010_289_327_08,
+            ],
+            [
+                0.000_095_053_788_749_829_05,
+                -0.000_775_592_465_160_763_3,
+                0.001_318_340_676_642_313_7,
+                -0.001_420_956_145_327_254_5,
+                -0.006_692_878_678_129_113,
+            ],
+            [
+                255.376_411_781_416_44,
+                101.098_370_188_463_8,
+                334.667_378_937_207_96,
+                12.739_187_990_786_235,
+                164.506_190_983_566_06,
+            ],
+        ),
+    ];
+
+    for (mode, expected_amplitude, expected_phase, expected_major, expected_minor, expected_g) in
+        cases
+    {
+        let solver_options = SolverOptions::default().with_nodal_corrections(mode);
+        let model = GreenwichNodalOls::prepare_modified_julian_days_with_solver_options(
+            &time,
+            LATITUDE_DEGREES_NORTH,
+            &CONSTITUENTS,
+            solver_options,
+        )
+        .expect("valid alternative-nodal model");
+        assert_eq!(model.nodal_corrections(), mode);
+        assert_eq!(
+            mode.name(),
+            if mode == NodalCorrections::LinearTime {
+                "linear-time"
+            } else {
+                "disabled"
+            }
+        );
+        let scalar = model.solve(&observations).expect("valid scalar solution");
+        for (field, actual, expected, tolerance) in [
+            ("amplitude", &scalar.amplitude, &expected_amplitude, 5e-11),
+            ("phase", &scalar.phase_degrees, &expected_phase, 5e-8),
+        ] {
+            for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert_close(
+                    &format!("{} {field}[{index}]", mode.name()),
+                    *actual,
+                    *expected,
+                    tolerance,
+                );
+            }
+        }
+
+        let vector = model
+            .solve_vector(&eastward, &northward)
+            .expect("valid vector solution");
+        for (field, actual, expected, tolerance) in [
+            ("semi-major", &vector.semi_major, &expected_major, 5e-11),
+            ("semi-minor", &vector.semi_minor, &expected_minor, 5e-11),
+            ("vector phase", &vector.phase_degrees, &expected_g, 5e-7),
+        ] {
+            for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert_close(
+                    &format!("{} {field}[{index}]", mode.name()),
+                    *actual,
+                    *expected,
+                    tolerance,
+                );
+            }
+        }
+
+        let batch = GreenwichNodalBatch::prepare_modified_julian_days_with_solver_options(
+            &time,
+            &CONSTITUENTS,
+            solver_options,
+        )
+        .expect("valid alternative-nodal batch");
+        assert_eq!(batch.nodal_corrections(), mode);
+        let batch_solution = batch
+            .solve_time_major(&observations, &[LATITUDE_DEGREES_NORTH])
+            .expect("valid batch solution");
+        assert_eq!(batch_solution.as_slice(), std::slice::from_ref(&scalar));
+
+        let reconstruction = model
+            .reconstruct_modified_julian_days(
+                &RECONSTRUCTION_TIMES,
+                &scalar,
+                &ReconstructionFilter::All,
+            )
+            .expect("valid alternative-nodal reconstruction");
+        let expected = [
+            0.389_402_046_390_603_05,
+            0.342_625_364_541_310_65,
+            1.119_671_431_073_497_6,
+            0.473_218_694_255_534_6,
+            0.471_119_316_713_373_4,
+            -0.293_915_905_386_267_3,
+        ];
+        for (index, (actual, expected)) in reconstruction.iter().zip(expected).enumerate() {
+            assert_close(
+                &format!("{} reconstruction[{index}]", mode.name()),
+                *actual,
+                expected,
+                2e-9,
+            );
+        }
+        let reconstructor = batch
+            .reconstructor_modified_julian_days(&RECONSTRUCTION_TIMES)
+            .expect("valid matching reconstruction basis");
+        assert_eq!(reconstructor.nodal_corrections(), mode);
+        let standalone =
+            GreenwichNodalReconstructor::prepare_modified_julian_days_with_solver_options(
+                &RECONSTRUCTION_TIMES,
+                model.reference_time_modified_julian_day(),
+                &CONSTITUENTS,
+                solver_options,
+            )
+            .expect("valid standalone alternative-nodal basis");
+        assert_eq!(standalone.nodal_corrections(), mode);
+        assert_eq!(
+            standalone
+                .reconstruct_at_latitude(
+                    &scalar,
+                    LATITUDE_DEGREES_NORTH,
+                    &ReconstructionFilter::All,
+                )
+                .expect("valid standalone alternative-nodal reconstruction"),
+            reconstruction
+        );
     }
 }
 

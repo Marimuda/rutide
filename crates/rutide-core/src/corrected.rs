@@ -58,14 +58,41 @@ impl PhaseReference {
     }
 }
 
+/// Nodal/satellite amplitude and phase corrections applied to each constituent.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NodalCorrections {
+    /// Evaluate time-varying nodal/satellite corrections at every timestamp.
+    #[default]
+    Exact,
+    /// Evaluate corrections once at the fitted record midpoint and hold them
+    /// constant across that record.
+    LinearTime,
+    /// Omit nodal/satellite corrections, equivalent to unit amplitude and zero
+    /// nodal phase.
+    Disabled,
+}
+
+impl NodalCorrections {
+    /// Stable machine-readable name used by reports and serialized outputs.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::LinearTime => "linear-time",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
 /// Solver configuration shared by the corrected scalar and vector APIs.
 ///
-/// The fields are private so future nodal-correction choices can be added
-/// without requiring callers to update struct literals.
+/// The fields are private so future solver choices can be added without
+/// requiring callers to update struct literals.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SolverOptions {
     fit_options: FitOptions,
     phase_reference: PhaseReference,
+    nodal_corrections: NodalCorrections,
 }
 
 impl SolverOptions {
@@ -75,6 +102,7 @@ impl SolverOptions {
         Self {
             fit_options,
             phase_reference,
+            nodal_corrections: NodalCorrections::Exact,
         }
     }
 
@@ -88,6 +116,19 @@ impl SolverOptions {
     #[must_use]
     pub const fn phase_reference(self) -> PhaseReference {
         self.phase_reference
+    }
+
+    /// Set the nodal/satellite correction convention.
+    #[must_use]
+    pub const fn with_nodal_corrections(mut self, nodal_corrections: NodalCorrections) -> Self {
+        self.nodal_corrections = nodal_corrections;
+        self
+    }
+
+    /// Return the nodal/satellite correction convention.
+    #[must_use]
+    pub const fn nodal_corrections(self) -> NodalCorrections {
+        self.nodal_corrections
     }
 }
 
@@ -267,6 +308,7 @@ pub struct GreenwichNodalOls {
     base_constituents: Vec<TidalConstituent>,
     recipes: Vec<CorrectionRecipe>,
     phase_reference: PhaseReference,
+    nodal_corrections: NodalCorrections,
     model: FixedRawOls,
 }
 
@@ -329,6 +371,7 @@ pub struct ScalarInferenceOls {
     base_constituents: Vec<TidalConstituent>,
     recipes: Vec<CorrectionRecipe>,
     phase_reference: PhaseReference,
+    nodal_corrections: NodalCorrections,
     model: FixedRawOls,
 }
 
@@ -394,6 +437,7 @@ pub struct VectorInferenceOls {
     time_count: usize,
     fit_options: FitOptions,
     phase_reference: PhaseReference,
+    nodal_corrections: NodalCorrections,
     base_constituents: Vec<TidalConstituent>,
     recipes: Vec<CorrectionRecipe>,
     confidence_sampling: ConfidenceSampling,
@@ -506,6 +550,7 @@ impl GreenwichNodalOls {
             base_constituents: basis.base_constituents,
             recipes: basis.recipes,
             phase_reference: basis.phase_reference,
+            nodal_corrections: basis.nodal_corrections,
             model,
         })
     }
@@ -550,6 +595,12 @@ impl GreenwichNodalOls {
     #[must_use]
     pub const fn phase_reference(&self) -> PhaseReference {
         self.phase_reference
+    }
+
+    /// Return the configured nodal/satellite correction convention.
+    #[must_use]
+    pub const fn nodal_corrections(&self) -> NodalCorrections {
+        self.nodal_corrections
     }
 
     /// Fit one complete, finite scalar observation series.
@@ -872,7 +923,7 @@ impl GreenwichNodalOls {
 
     /// Reconstruct one solution at arbitrary Modified Julian Days.
     ///
-    /// The configured phase convention and exact nodal corrections are evaluated
+    /// The configured phase convention and nodal-correction mode are evaluated
     /// at each target timestamp. The fitted mean, and the trend when enabled,
     /// are retained.
     ///
@@ -893,6 +944,7 @@ impl GreenwichNodalOls {
             &self.base_constituents,
             self.recipes.clone(),
             self.phase_reference,
+            self.nodal_corrections,
         )?
         .reconstruct_at_latitude(solution, self.latitude_degrees_north, filter)
     }
@@ -916,6 +968,7 @@ impl GreenwichNodalOls {
             &self.base_constituents,
             self.recipes.clone(),
             self.phase_reference,
+            self.nodal_corrections,
         )?
         .reconstruct_vector_at_latitude(solution, self.latitude_degrees_north, filter)
     }
@@ -1033,6 +1086,7 @@ impl ScalarInferenceOls {
             base_constituents: basis.base_constituents.clone(),
             recipes: basis.recipes.clone(),
             phase_reference: basis.phase_reference,
+            nodal_corrections: basis.nodal_corrections,
             model,
         })
     }
@@ -1089,6 +1143,12 @@ impl ScalarInferenceOls {
     #[must_use]
     pub const fn phase_reference(&self) -> PhaseReference {
         self.phase_reference
+    }
+
+    /// Return the configured nodal/satellite correction convention.
+    #[must_use]
+    pub const fn nodal_corrections(&self) -> NodalCorrections {
+        self.nodal_corrections
     }
 
     /// Fit one finite scalar series and expand inferred coefficients.
@@ -1244,6 +1304,7 @@ impl ScalarInferenceOls {
             &self.base_constituents,
             self.recipes.clone(),
             self.phase_reference,
+            self.nodal_corrections,
         )?
         .reconstruct_at_latitude(solution, self.latitude_degrees_north, filter)
     }
@@ -1606,6 +1667,7 @@ impl VectorInferenceOls {
             time_count: record.positions.len(),
             fit_options: basis.fit_options,
             phase_reference: basis.phase_reference,
+            nodal_corrections: basis.nodal_corrections,
             base_constituents: basis.base_constituents.clone(),
             recipes: basis.recipes.clone(),
             confidence_sampling: record.confidence_sampling.clone(),
@@ -1666,6 +1728,12 @@ impl VectorInferenceOls {
     #[must_use]
     pub const fn phase_reference(&self) -> PhaseReference {
         self.phase_reference
+    }
+
+    /// Return the configured nodal/satellite correction convention.
+    #[must_use]
+    pub const fn nodal_corrections(&self) -> NodalCorrections {
+        self.nodal_corrections
     }
 
     /// Fit one eastward/northward current series.
@@ -1835,6 +1903,7 @@ impl VectorInferenceOls {
             &self.base_constituents,
             self.recipes.clone(),
             self.phase_reference,
+            self.nodal_corrections,
         )?
         .reconstruct_vector_at_latitude(solution, self.latitude_degrees_north, filter)
     }
@@ -2579,7 +2648,7 @@ pub enum ReconstructionFilter {
     },
 }
 
-/// A reusable configurable-phase, exact-nodal basis for reconstruction times.
+/// A reusable configurable-phase and configurable-nodal reconstruction basis.
 ///
 /// Astronomy is prepared once and can then reconstruct many scalar solutions at
 /// different latitudes. Multi-series output is series-major: one complete target
@@ -2590,13 +2659,15 @@ pub struct GreenwichNodalReconstructor {
     constituent_frequency_cph: Vec<f64>,
     recipes: Vec<CorrectionRecipe>,
     phase_reference: PhaseReference,
+    nodal_corrections: NodalCorrections,
     reference_greenwich_phase: Vec<f64>,
+    reference_base_nodal_terms: Vec<NodalTerms>,
     reference_time_modified_julian_day: f64,
     time_terms: Vec<ReconstructionTimeTerms>,
 }
 
 impl GreenwichNodalReconstructor {
-    /// Prepare an exact reconstruction basis from a fit epoch and target MJDs.
+    /// Prepare an exact-nodal Greenwich-phase basis from a fit epoch and target MJDs.
     ///
     /// Target times may be unordered or repeated, but must be finite and nonempty.
     ///
@@ -2609,11 +2680,11 @@ impl GreenwichNodalReconstructor {
         reference_time_modified_julian_day: f64,
         constituents: &[TidalConstituent],
     ) -> Result<Self, AnalysisError> {
-        Self::prepare_modified_julian_days_with_phase_reference(
+        Self::prepare_modified_julian_days_with_solver_options(
             modified_julian_days,
             reference_time_modified_julian_day,
             constituents,
-            PhaseReference::Greenwich,
+            SolverOptions::default(),
         )
     }
 
@@ -2631,6 +2702,29 @@ impl GreenwichNodalReconstructor {
         constituents: &[TidalConstituent],
         phase_reference: PhaseReference,
     ) -> Result<Self, AnalysisError> {
+        Self::prepare_modified_julian_days_with_solver_options(
+            modified_julian_days,
+            reference_time_modified_julian_day,
+            constituents,
+            SolverOptions::new(FitOptions::default(), phase_reference),
+        )
+    }
+
+    /// Prepare a reconstruction basis with explicit phase and nodal options.
+    ///
+    /// Target times may be unordered or repeated, but must be finite and nonempty.
+    /// Fit-specific fields in `solver_options` do not affect reconstruction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for an invalid reference time, target time, or
+    /// constituent list.
+    pub fn prepare_modified_julian_days_with_solver_options(
+        modified_julian_days: &[f64],
+        reference_time_modified_julian_day: f64,
+        constituents: &[TidalConstituent],
+        solver_options: SolverOptions,
+    ) -> Result<Self, AnalysisError> {
         validate_tidal_constituents(constituents)?;
         let (base_constituents, recipes) = dependency_recipes(constituents);
         Self::from_parts(
@@ -2639,7 +2733,8 @@ impl GreenwichNodalReconstructor {
             constituents.to_vec(),
             &base_constituents,
             recipes,
-            phase_reference,
+            solver_options.phase_reference(),
+            solver_options.nodal_corrections(),
         )
     }
 
@@ -2650,6 +2745,7 @@ impl GreenwichNodalReconstructor {
         base_constituents: &[TidalConstituent],
         recipes: Vec<CorrectionRecipe>,
         phase_reference: PhaseReference,
+        nodal_corrections: NodalCorrections,
     ) -> Result<Self, AnalysisError> {
         validate_reconstruction_times(modified_julian_days, reference_time_modified_julian_day)?;
         let scalar_constituents = scalar_constituents_at_reference(
@@ -2668,6 +2764,8 @@ impl GreenwichNodalReconstructor {
             &recipes,
             reference_time_modified_julian_day,
         );
+        let reference_base_nodal_terms =
+            base_nodal_terms_at_time(base_constituents, reference_time_modified_julian_day);
         let time_terms = modified_julian_days
             .iter()
             .copied()
@@ -2683,13 +2781,17 @@ impl GreenwichNodalReconstructor {
                         .iter()
                         .map(|recipe| recipe.combine_phase(&base_greenwich_phase))
                         .collect(),
-                    base_nodal_terms: base_constituents
-                        .iter()
-                        .copied()
-                        .map(|constituent| {
-                            precompute_nodal_terms(constituent.metadata(), astronomy.cycles)
-                        })
-                        .collect(),
+                    base_nodal_terms: if nodal_corrections == NodalCorrections::Exact {
+                        base_constituents
+                            .iter()
+                            .copied()
+                            .map(|constituent| {
+                                precompute_nodal_terms(constituent.metadata(), astronomy.cycles)
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
                     modified_julian_day: time,
                 }
             })
@@ -2699,7 +2801,9 @@ impl GreenwichNodalReconstructor {
             constituent_frequency_cph,
             recipes,
             phase_reference,
+            nodal_corrections,
             reference_greenwich_phase,
+            reference_base_nodal_terms,
             reference_time_modified_julian_day,
             time_terms,
         })
@@ -2729,6 +2833,12 @@ impl GreenwichNodalReconstructor {
         self.phase_reference
     }
 
+    /// Return the configured nodal-correction mode.
+    #[must_use]
+    pub const fn nodal_corrections(&self) -> NodalCorrections {
+        self.nodal_corrections
+    }
+
     /// Reconstruct one scalar solution at a specified latitude.
     ///
     /// # Errors
@@ -2744,18 +2854,21 @@ impl GreenwichNodalReconstructor {
         validate_latitude(latitude_degrees_north)?;
         let selected = reconstruction_indices(&self.tidal_constituents, solution, filter)?;
         let latitude_factors = latitude_factors(latitude_degrees_north);
-        let base_count = self
-            .time_terms
-            .first()
-            .map_or(0, |terms| terms.base_nodal_terms.len());
-        let mut base_corrections = vec![(0.0, 0.0); base_count];
+        let mut base_corrections = base_nodal_corrections(
+            self.nodal_corrections,
+            &self.time_terms[0].base_nodal_terms,
+            &self.reference_base_nodal_terms,
+            latitude_factors,
+        );
         let mut reconstruction = Vec::with_capacity(self.time_terms.len());
         for terms in &self.time_terms {
-            for (correction, nodal_terms) in base_corrections
-                .iter_mut()
-                .zip(terms.base_nodal_terms.iter().copied())
-            {
-                *correction = nodal_correction(nodal_terms, latitude_factors);
+            if self.nodal_corrections == NodalCorrections::Exact {
+                for (correction, nodal_terms) in base_corrections
+                    .iter_mut()
+                    .zip(terms.base_nodal_terms.iter().copied())
+                {
+                    *correction = nodal_correction(nodal_terms, latitude_factors);
+                }
             }
             let harmonics = selected
                 .iter()
@@ -2956,6 +3069,12 @@ impl ScalarInferenceBatch {
         self.basis.phase_reference
     }
 
+    /// Return the configured nodal/satellite correction convention.
+    #[must_use]
+    pub const fn nodal_corrections(&self) -> NodalCorrections {
+        self.basis.nodal_corrections
+    }
+
     /// Return every reported constituent in coefficient order.
     #[must_use]
     pub fn tidal_constituents(&self) -> &[TidalConstituent] {
@@ -3014,6 +3133,7 @@ impl ScalarInferenceBatch {
             &self.basis.base_constituents,
             self.basis.recipes.clone(),
             self.basis.phase_reference,
+            self.basis.nodal_corrections,
         )
     }
 
@@ -3442,6 +3562,12 @@ impl VectorInferenceBatch {
         self.basis.phase_reference
     }
 
+    /// Return the configured nodal/satellite correction convention.
+    #[must_use]
+    pub const fn nodal_corrections(&self) -> NodalCorrections {
+        self.basis.nodal_corrections
+    }
+
     /// Return every reported constituent in coefficient order.
     #[must_use]
     pub fn tidal_constituents(&self) -> &[TidalConstituent] {
@@ -3500,6 +3626,7 @@ impl VectorInferenceBatch {
             &self.basis.base_constituents,
             self.basis.recipes.clone(),
             self.basis.phase_reference,
+            self.basis.nodal_corrections,
         )
     }
 
@@ -3945,6 +4072,12 @@ impl GreenwichNodalBatch {
         self.basis.phase_reference
     }
 
+    /// Return the configured nodal/satellite correction convention.
+    #[must_use]
+    pub const fn nodal_corrections(&self) -> NodalCorrections {
+        self.basis.nodal_corrections
+    }
+
     /// Return the prepared catalog constituents in coefficient order.
     #[must_use]
     pub fn tidal_constituents(&self) -> &[TidalConstituent] {
@@ -4002,6 +4135,7 @@ impl GreenwichNodalBatch {
             &self.basis.base_constituents,
             self.basis.recipes.clone(),
             self.basis.phase_reference,
+            self.basis.nodal_corrections,
         )
     }
 
@@ -4610,6 +4744,7 @@ struct CorrectionBasis {
     time_span_days: f64,
     fit_options: FitOptions,
     phase_reference: PhaseReference,
+    nodal_corrections: NodalCorrections,
     sample_interval_hours: Option<f64>,
 }
 
@@ -4877,6 +5012,7 @@ impl CorrectionBasis {
         solver_options: SolverOptions,
     ) -> Result<Self, AnalysisError> {
         let fit_options = solver_options.fit_options();
+        let nodal_corrections = solver_options.nodal_corrections();
         validate_tidal_constituents(constituents)?;
         let (reference_time, time_span_days) =
             validate_time_with_options(modified_julian_days, model_constituent_count, fit_options)?;
@@ -4903,13 +5039,17 @@ impl CorrectionBasis {
                         .iter()
                         .map(|recipe| recipe.combine_phase(&base_greenwich_phase))
                         .collect(),
-                    base_nodal_terms: base_constituents
-                        .iter()
-                        .copied()
-                        .map(|constituent| {
-                            precompute_nodal_terms(constituent.metadata(), astronomy.cycles)
-                        })
-                        .collect(),
+                    base_nodal_terms: if nodal_corrections == NodalCorrections::Exact {
+                        base_constituents
+                            .iter()
+                            .copied()
+                            .map(|constituent| {
+                                precompute_nodal_terms(constituent.metadata(), astronomy.cycles)
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
                     modified_julian_day: time,
                 }
             })
@@ -4925,6 +5065,7 @@ impl CorrectionBasis {
             time_span_days,
             fit_options,
             phase_reference: solver_options.phase_reference(),
+            nodal_corrections,
             sample_interval_hours: equidistant_sample_interval_hours(modified_julian_days),
         })
     }
@@ -4947,18 +5088,29 @@ impl CorrectionBasis {
         let column_count = harmonic_columns + 1 + usize::from(self.fit_options.trend);
         let mut design = Mat::zeros(record.positions.len(), column_count);
         let latitude_factors = latitude_factors(latitude);
+        let constant_base_corrections = constant_base_nodal_corrections(
+            self.nodal_corrections,
+            &record.reference_base_nodal_terms,
+            latitude_factors,
+        );
         for (time_index, position) in record.positions.iter().copied().enumerate() {
             let terms = &self.time_terms[position];
-            let base_corrections = terms
-                .base_nodal_terms
-                .iter()
-                .copied()
-                .map(|terms| nodal_correction(terms, latitude_factors))
-                .collect::<Vec<_>>();
+            let exact_base_corrections;
+            let base_corrections = if let Some(corrections) = &constant_base_corrections {
+                corrections
+            } else {
+                exact_base_corrections = base_nodal_corrections(
+                    self.nodal_corrections,
+                    &terms.base_nodal_terms,
+                    &record.reference_base_nodal_terms,
+                    latitude_factors,
+                );
+                &exact_base_corrections
+            };
             let basis_values = (0..self.tidal_constituents.len())
                 .map(|constituent_index| {
                     let (nodal_amplitude, nodal_phase) =
-                        self.recipes[constituent_index].combine_nodal(&base_corrections);
+                        self.recipes[constituent_index].combine_nodal(base_corrections);
                     let astronomical_phase = phase_cycles(
                         self.phase_reference,
                         terms.greenwich_phase[constituent_index],
@@ -5019,18 +5171,29 @@ impl CorrectionBasis {
         let column_count = harmonic_columns + 1 + usize::from(self.fit_options.trend);
         let mut design = Mat::zeros(record.positions.len(), column_count);
         let latitude_factors = latitude_factors(latitude);
+        let constant_base_corrections = constant_base_nodal_corrections(
+            self.nodal_corrections,
+            &record.reference_base_nodal_terms,
+            latitude_factors,
+        );
         for (time_index, position) in record.positions.iter().copied().enumerate() {
             let terms = &self.time_terms[position];
-            let base_corrections = terms
-                .base_nodal_terms
-                .iter()
-                .copied()
-                .map(|terms| nodal_correction(terms, latitude_factors))
-                .collect::<Vec<_>>();
+            let exact_base_corrections;
+            let base_corrections = if let Some(corrections) = &constant_base_corrections {
+                corrections
+            } else {
+                exact_base_corrections = base_nodal_corrections(
+                    self.nodal_corrections,
+                    &terms.base_nodal_terms,
+                    &record.reference_base_nodal_terms,
+                    latitude_factors,
+                );
+                &exact_base_corrections
+            };
             let basis_values = (0..self.tidal_constituents.len())
                 .map(|constituent_index| {
                     let (nodal_amplitude, nodal_phase) =
-                        self.recipes[constituent_index].combine_nodal(&base_corrections);
+                        self.recipes[constituent_index].combine_nodal(base_corrections);
                     let astronomical_phase = phase_cycles(
                         self.phase_reference,
                         terms.greenwich_phase[constituent_index],
@@ -5126,10 +5289,13 @@ impl CorrectionBasis {
         validate_derived_frequencies(&scalar_constituents)?;
         let reference_greenwich_phase =
             greenwich_phases_at_time(&self.base_constituents, &self.recipes, reference_time);
+        let reference_base_nodal_terms =
+            base_nodal_terms_at_time(&self.base_constituents, reference_time);
         Ok(RecordSubset {
             positions,
             scalar_constituents,
             reference_greenwich_phase,
+            reference_base_nodal_terms,
             reference_time,
             time_span_days,
             confidence_sampling,
@@ -5146,17 +5312,28 @@ impl CorrectionBasis {
         let column_count = harmonic_columns + 1 + usize::from(self.fit_options.trend);
         let mut design = Mat::zeros(record.positions.len(), column_count);
         let latitude_factors = latitude_factors(latitude);
+        let constant_base_corrections = constant_base_nodal_corrections(
+            self.nodal_corrections,
+            &record.reference_base_nodal_terms,
+            latitude_factors,
+        );
         for (time_index, position) in record.positions.iter().copied().enumerate() {
             let terms = &self.time_terms[position];
-            let base_corrections = terms
-                .base_nodal_terms
-                .iter()
-                .copied()
-                .map(|terms| nodal_correction(terms, latitude_factors))
-                .collect::<Vec<_>>();
+            let exact_base_corrections;
+            let base_corrections = if let Some(corrections) = &constant_base_corrections {
+                corrections
+            } else {
+                exact_base_corrections = base_nodal_corrections(
+                    self.nodal_corrections,
+                    &terms.base_nodal_terms,
+                    &record.reference_base_nodal_terms,
+                    latitude_factors,
+                );
+                &exact_base_corrections
+            };
             for constituent_index in 0..self.tidal_constituents.len() {
                 let (nodal_amplitude, nodal_phase) =
-                    self.recipes[constituent_index].combine_nodal(&base_corrections);
+                    self.recipes[constituent_index].combine_nodal(base_corrections);
                 let astronomical_phase = phase_cycles(
                     self.phase_reference,
                     terms.greenwich_phase[constituent_index],
@@ -5199,6 +5376,7 @@ struct RecordSubset {
     positions: Vec<usize>,
     scalar_constituents: Vec<Constituent>,
     reference_greenwich_phase: Vec<f64>,
+    reference_base_nodal_terms: Vec<NodalTerms>,
     reference_time: f64,
     time_span_days: f64,
     confidence_sampling: ConfidenceSampling,
@@ -5475,6 +5653,18 @@ fn greenwich_phases_at_time(
         .collect()
 }
 
+fn base_nodal_terms_at_time(
+    base_constituents: &[TidalConstituent],
+    modified_julian_day: f64,
+) -> Vec<NodalTerms> {
+    let astronomy = at_modified_julian_day(modified_julian_day);
+    base_constituents
+        .iter()
+        .copied()
+        .map(|constituent| precompute_nodal_terms(constituent.metadata(), astronomy.cycles))
+        .collect()
+}
+
 fn phase_cycles(
     phase_reference: PhaseReference,
     exact_greenwich_phase: f64,
@@ -5585,6 +5775,45 @@ fn nodal_correction(terms: NodalTerms, latitude_factors: [f64; 3]) -> (f64, f64)
     (real.hypot(imaginary), imaginary.atan2(real) / TAU)
 }
 
+fn base_nodal_corrections(
+    mode: NodalCorrections,
+    exact_terms: &[NodalTerms],
+    reference_terms: &[NodalTerms],
+    latitude_factors: [f64; 3],
+) -> Vec<(f64, f64)> {
+    match mode {
+        NodalCorrections::Exact => exact_terms
+            .iter()
+            .copied()
+            .map(|terms| nodal_correction(terms, latitude_factors))
+            .collect(),
+        NodalCorrections::LinearTime => reference_terms
+            .iter()
+            .copied()
+            .map(|terms| nodal_correction(terms, latitude_factors))
+            .collect(),
+        NodalCorrections::Disabled => vec![(1.0, 0.0); reference_terms.len()],
+    }
+}
+
+fn constant_base_nodal_corrections(
+    mode: NodalCorrections,
+    reference_terms: &[NodalTerms],
+    latitude_factors: [f64; 3],
+) -> Option<Vec<(f64, f64)>> {
+    match mode {
+        NodalCorrections::Exact => None,
+        NodalCorrections::LinearTime => Some(
+            reference_terms
+                .iter()
+                .copied()
+                .map(|terms| nodal_correction(terms, latitude_factors))
+                .collect(),
+        ),
+        NodalCorrections::Disabled => Some(vec![(1.0, 0.0); reference_terms.len()]),
+    }
+}
+
 fn dot6(left: [i8; 6], right: [f64; 6]) -> f64 {
     f64::from(left[0]) * right[0]
         + f64::from(left[1]) * right[1]
@@ -5605,7 +5834,7 @@ fn usize_to_f64(value: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        GreenwichNodalBatch, GreenwichNodalOls, PhaseReference, SolverOptions,
+        GreenwichNodalBatch, GreenwichNodalOls, NodalCorrections, PhaseReference, SolverOptions,
         shared_lomb_plan_groups, usize_to_f64,
     };
     use crate::{AnalysisError, FitOptions, LinearConfidence, TidalConstituent};
@@ -5755,7 +5984,7 @@ mod tests {
     }
 
     #[test]
-    fn irregular_phase_references_use_each_retained_record_epoch() {
+    fn irregular_astronomy_options_use_each_retained_record_epoch() {
         let mut time = times();
         time[20] += 0.001;
         let constituents = [TidalConstituent::M2, TidalConstituent::K1];
@@ -5767,33 +5996,42 @@ mod tests {
         let retained_observations = observations[1..].to_vec();
 
         for phase_reference in [PhaseReference::LinearTime, PhaseReference::Raw] {
-            let solver_options = SolverOptions::new(FitOptions::default(), phase_reference);
-            let batch = GreenwichNodalBatch::prepare_modified_julian_days_with_solver_options(
-                &time,
-                &constituents,
-                solver_options,
-            )
-            .expect("valid irregular batch");
-            let actual = batch
-                .solve_time_major_with_missing(&observations, &[60.0])
-                .expect("valid irregular gappy series");
-            let individual = GreenwichNodalOls::prepare_modified_julian_days_with_solver_options(
-                &retained_time,
-                60.0,
-                &constituents,
-                solver_options,
-            )
-            .expect("valid retained-record model")
-            .solve(&retained_observations)
-            .expect("valid retained observations");
-            assert_eq!(actual, [individual]);
-            assert_eq!(batch.phase_reference(), phase_reference);
-            assert!(
-                (actual[0].reference_time_days
-                    - retained_time[0].midpoint(retained_time[retained_time.len() - 1]))
-                .abs()
-                    < 1e-12
-            );
+            for nodal_corrections in [
+                NodalCorrections::Exact,
+                NodalCorrections::LinearTime,
+                NodalCorrections::Disabled,
+            ] {
+                let solver_options = SolverOptions::new(FitOptions::default(), phase_reference)
+                    .with_nodal_corrections(nodal_corrections);
+                let batch = GreenwichNodalBatch::prepare_modified_julian_days_with_solver_options(
+                    &time,
+                    &constituents,
+                    solver_options,
+                )
+                .expect("valid irregular batch");
+                let actual = batch
+                    .solve_time_major_with_missing(&observations, &[60.0])
+                    .expect("valid irregular gappy series");
+                let individual =
+                    GreenwichNodalOls::prepare_modified_julian_days_with_solver_options(
+                        &retained_time,
+                        60.0,
+                        &constituents,
+                        solver_options,
+                    )
+                    .expect("valid retained-record model")
+                    .solve(&retained_observations)
+                    .expect("valid retained observations");
+                assert_eq!(actual, [individual]);
+                assert_eq!(batch.phase_reference(), phase_reference);
+                assert_eq!(batch.nodal_corrections(), nodal_corrections);
+                assert!(
+                    (actual[0].reference_time_days
+                        - retained_time[0].midpoint(retained_time[retained_time.len() - 1]))
+                    .abs()
+                        < 1e-12
+                );
+            }
         }
     }
 

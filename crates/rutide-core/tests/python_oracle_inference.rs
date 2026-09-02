@@ -3,9 +3,9 @@
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
     AnalysisError, FitOptions, GreenwichNodalOls, InferenceMode, LinearConfidence,
-    MonteCarloOptions, PhaseReference, ReconstructionFilter, RobustOptions, ScalarInferenceBatch,
-    ScalarInferenceOls, ScalarInferenceRelation, SolverOptions, TidalConstituent,
-    VectorInferenceBatch, VectorInferenceOls, VectorInferenceRelation,
+    MonteCarloOptions, NodalCorrections, PhaseReference, ReconstructionFilter, RobustOptions,
+    ScalarInferenceBatch, ScalarInferenceOls, ScalarInferenceRelation, SolverOptions,
+    TidalConstituent, VectorInferenceBatch, VectorInferenceOls, VectorInferenceRelation,
 };
 
 const LATITUDE: f64 = 60.957_717_895_507_81;
@@ -562,6 +562,157 @@ fn matches_python_utide_raw_phase_inference() {
                     tolerance,
                 );
             }
+        }
+    }
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "freezes scalar and rotary inference across both alternative nodal modes"
+)]
+fn alternative_nodal_modes_match_python_utide_inference() {
+    let time = oracle_times(745);
+    let observations = oracle_observations(745);
+    let (eastward, northward) = synthetic_vector_observations(&time);
+
+    let linear_options =
+        SolverOptions::default().with_nodal_corrections(NodalCorrections::LinearTime);
+    let scalar_model = ScalarInferenceOls::prepare_modified_julian_days_with_solver_options(
+        &time,
+        LATITUDE,
+        &requested(),
+        &RELATIONSHIPS,
+        InferenceMode::Exact,
+        linear_options,
+    )
+    .expect("valid midpoint-nodal scalar inference model");
+    assert_eq!(
+        scalar_model.nodal_corrections(),
+        NodalCorrections::LinearTime
+    );
+    let scalar = scalar_model
+        .solve(&observations)
+        .expect("valid midpoint-nodal scalar inference solution");
+    for (field, actual, expected, tolerance) in [
+        (
+            "amplitude",
+            &scalar.amplitude,
+            &[
+                0.005_525_084_799_315_93,
+                0.615_422_169_499_873_4,
+                0.100_246_939_462_444_58,
+                0.215_397_759_324_955_58,
+                0.050_123_469_731_222_28,
+            ],
+            5e-10,
+        ),
+        (
+            "phase",
+            &scalar.phase_degrees,
+            &[
+                63.992_268_196_591_48,
+                192.776_378_556_749_36,
+                141.236_175_489_729_76,
+                172.776_378_556_749_36,
+                96.236_175_489_729_77,
+            ],
+            5e-7,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(
+                &format!("linear nodal inferred scalar {field}[{index}]"),
+                *actual,
+                *expected,
+                tolerance,
+            );
+        }
+    }
+    let scalar_reconstruction = scalar_model
+        .reconstruct_modified_julian_days(
+            &RECONSTRUCTION_TIMES,
+            &scalar,
+            &ReconstructionFilter::All,
+        )
+        .expect("valid midpoint-nodal inferred reconstruction");
+    for (index, (actual, expected)) in scalar_reconstruction
+        .iter()
+        .zip([
+            0.373_027_598_279_288_66,
+            1.002_104_748_337_354,
+            0.135_731_879_810_277_62,
+        ])
+        .enumerate()
+    {
+        assert_close(
+            &format!("linear nodal scalar reconstruction[{index}]"),
+            *actual,
+            expected,
+            2e-9,
+        );
+    }
+
+    let disabled_options =
+        SolverOptions::default().with_nodal_corrections(NodalCorrections::Disabled);
+    let vector_model = VectorInferenceOls::prepare_modified_julian_days_with_solver_options(
+        &time,
+        LATITUDE,
+        &requested(),
+        &VECTOR_RELATIONSHIPS,
+        InferenceMode::Approximate,
+        disabled_options,
+    )
+    .expect("valid disabled-nodal vector inference model");
+    assert_eq!(vector_model.nodal_corrections(), NodalCorrections::Disabled);
+    let vector = vector_model
+        .solve_vector(&eastward, &northward)
+        .expect("valid disabled-nodal vector inference solution");
+    for (field, actual, expected, tolerance) in [
+        (
+            "semi-major",
+            &vector.semi_major,
+            &[
+                0.001_500_512_164_471_63,
+                0.002_974_227_166_087_83,
+                0.005_825_808_775_455_12,
+                0.000_898_125_884_127_56,
+                0.002_485_866_125_374_48,
+            ],
+            5e-10,
+        ),
+        (
+            "semi-minor",
+            &vector.semi_minor,
+            &[
+                0.000_181_162_837_348_11,
+                0.000_117_154_686_024_23,
+                -0.002_714_956_471_606_51,
+                0.000_183_857_764_111_66,
+                -0.000_930_439_973_450_17,
+            ],
+            5e-10,
+        ),
+        (
+            "phase",
+            &vector.phase_degrees,
+            &[
+                46.889_729_136_548_82,
+                254.521_147_412_288_14,
+                43.461_496_435_649_835,
+                249.521_147_412_288_14,
+                5.961_496_435_649_835,
+            ],
+            5e-7,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_close(
+                &format!("disabled nodal inferred vector {field}[{index}]"),
+                *actual,
+                *expected,
+                tolerance,
+            );
         }
     }
 }
