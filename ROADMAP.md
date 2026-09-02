@@ -15,7 +15,7 @@ defined behavior, and representative oracle tests are versioned.
   shallow-water relationships.
 - Explicit and Rayleigh-selected dynamic constituent lists.
 - Ordinary least-squares scalar and vector fits with a mean and optional trend.
-- Raw-phase and exact Greenwich/nodal numerical kernels.
+- Raw, linear-time Greenwich, and exact Greenwich phase with exact nodal terms.
 - Percent energy, linearized 95% confidence intervals, SNR, and ranking views.
 - Reconstruction at arbitrary target times with constituent, PE, and SNR filters.
 - Per-series missing observations, grouped valid-time masks, and joint eastward /
@@ -211,7 +211,13 @@ reported because the Python implementation rejects the combination.
   scalar and vector coefficients and colored intervals. JSON reports and the
   versioned NetCDF schemas expose `trend_enabled`; stable slope fields are exact
   zeros when the trend is omitted.
-- Expose exact Greenwich, linear-time, and raw phase modes through one API.
+- **Complete:** expose exact Greenwich, linear-time Greenwich, and raw phase
+  through one `SolverOptions` / `PhaseReference` API. The choice propagates
+  through ordinary and inferred scalar/vector fits, OLS and robust confidence
+  paths, mask-specific irregular epochs, reconstruction, CLI profiles, canonical
+  digests, reports, and versioned NetCDF metadata. Pinned Python fixtures cover
+  scalar coefficients and colored intervals, vector ellipses, exact and
+  approximate inference, and held-out reconstruction.
 - Expose exact, linear-time, and disabled nodal/satellite corrections.
 - Support result presentation by PE, SNR, frequency, or explicit order without
   losing stable constituent identity in bulk results.

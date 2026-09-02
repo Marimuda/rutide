@@ -75,7 +75,7 @@ pub struct VectorSampleResult {
     pub semi_minor: Vec<f64>,
     /// Major-axis inclinations in degrees.
     pub inclination_degrees: Vec<f64>,
-    /// Greenwich phases in degrees.
+    /// Phases in degrees using the report's configured reference convention.
     pub phase_degrees: Vec<f64>,
     /// Percent ellipse energy in constituent order.
     pub percent_energy: Vec<f64>,

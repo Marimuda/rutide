@@ -204,7 +204,7 @@ pub struct SampleResult {
     pub latitude_degrees_north: f64,
     /// Amplitudes in the report's constituent order.
     pub amplitude: Vec<f64>,
-    /// Greenwich phases in degrees in the report's constituent order.
+    /// Phases in degrees using the report's configured reference convention.
     pub phase_degrees: Vec<f64>,
     /// Percent energy in the report's constituent order.
     pub percent_energy: Vec<f64>,

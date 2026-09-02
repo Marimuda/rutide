@@ -1,4 +1,4 @@
-//! Exact Greenwich phase and nodal corrections for catalog constituents.
+//! Configurable astronomical phase and exact nodal corrections for catalog constituents.
 
 use std::{
     cmp::Reverse,
@@ -252,7 +252,7 @@ fn shared_lomb_plan_groups(record_use_count: &[usize]) -> Vec<bool> {
     shared
 }
 
-/// A reusable fixed-constituent OLS model with exact Greenwich and nodal terms.
+/// A reusable fixed-constituent OLS model with configurable phase and exact nodal terms.
 ///
 /// The astronomical basis matches the default phase and nodal behavior of the
 /// pinned Python `UTide` oracle. Preparation is specific to a latitude because
@@ -311,7 +311,7 @@ impl ScalarInferenceRelation {
     }
 }
 
-/// A reusable scalar exact-Greenwich model with constrained inferred constituents.
+/// A reusable corrected scalar model with constrained inferred constituents.
 ///
 /// Reported constituents follow Python `UTide` order: ordinary requested
 /// constituents, unique references in first-use order, then inferred
@@ -872,8 +872,9 @@ impl GreenwichNodalOls {
 
     /// Reconstruct one solution at arbitrary Modified Julian Days.
     ///
-    /// Exact Greenwich phase and nodal corrections are evaluated at each target
-    /// timestamp. The fitted mean, and the trend when enabled, are retained.
+    /// The configured phase convention and exact nodal corrections are evaluated
+    /// at each target timestamp. The fitted mean, and the trend when enabled,
+    /// are retained.
     ///
     /// # Errors
     ///
@@ -1225,7 +1226,7 @@ impl ScalarInferenceOls {
             })
     }
 
-    /// Reconstruct an inferred solution with exact astronomical terms.
+    /// Reconstruct an inferred solution with the fitted astronomical options.
     ///
     /// # Errors
     ///
@@ -1816,7 +1817,7 @@ impl VectorInferenceOls {
         )
     }
 
-    /// Reconstruct one inferred vector solution with exact astronomical terms.
+    /// Reconstruct one inferred vector solution with the fitted astronomical options.
     ///
     /// # Errors
     ///
@@ -2578,7 +2579,7 @@ pub enum ReconstructionFilter {
     },
 }
 
-/// A reusable exact Greenwich/nodal basis for arbitrary reconstruction times.
+/// A reusable configurable-phase, exact-nodal basis for reconstruction times.
 ///
 /// Astronomy is prepared once and can then reconstruct many scalar solutions at
 /// different latitudes. Multi-series output is series-major: one complete target
@@ -2997,7 +2998,7 @@ impl ScalarInferenceBatch {
         constituents_at_reference_for_basis(&self.basis, reference_time)
     }
 
-    /// Prepare exact reconstruction astronomy at arbitrary target MJDs.
+    /// Prepare matching reconstruction astronomy at arbitrary target MJDs.
     ///
     /// # Errors
     ///
@@ -3483,7 +3484,7 @@ impl VectorInferenceBatch {
         constituents_at_reference_for_basis(&self.basis, reference_time)
     }
 
-    /// Prepare exact reconstruction astronomy at arbitrary target MJDs.
+    /// Prepare matching reconstruction astronomy at arbitrary target MJDs.
     ///
     /// # Errors
     ///
@@ -3865,7 +3866,7 @@ impl VectorInferenceBatch {
     }
 }
 
-/// Shared exact astronomy for fitting many series at different latitudes.
+/// Shared astronomy for fitting many series at different latitudes.
 ///
 /// Preparation evaluates the latitude-independent astronomical arguments once.
 /// [`Self::solve_time_major`] then builds and solves each latitude-specific
@@ -3985,7 +3986,7 @@ impl GreenwichNodalBatch {
         self.basis.reference_time_modified_julian_day
     }
 
-    /// Prepare a reusable exact basis at arbitrary reconstruction MJDs.
+    /// Prepare a reusable matching basis at arbitrary reconstruction MJDs.
     ///
     /// # Errors
     ///
@@ -5603,8 +5604,11 @@ fn usize_to_f64(value: usize) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{GreenwichNodalBatch, GreenwichNodalOls, shared_lomb_plan_groups, usize_to_f64};
-    use crate::{AnalysisError, LinearConfidence, TidalConstituent};
+    use super::{
+        GreenwichNodalBatch, GreenwichNodalOls, PhaseReference, SolverOptions,
+        shared_lomb_plan_groups, usize_to_f64,
+    };
+    use crate::{AnalysisError, FitOptions, LinearConfidence, TidalConstituent};
 
     fn times() -> Vec<f64> {
         (0_u32..745)
@@ -5748,6 +5752,49 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn irregular_phase_references_use_each_retained_record_epoch() {
+        let mut time = times();
+        time[20] += 0.001;
+        let constituents = [TidalConstituent::M2, TidalConstituent::K1];
+        let mut observations = (0_u32..745)
+            .map(|index| (f64::from(index) / 13.0).sin())
+            .collect::<Vec<_>>();
+        observations[0] = f64::NAN;
+        let retained_time = time[1..].to_vec();
+        let retained_observations = observations[1..].to_vec();
+
+        for phase_reference in [PhaseReference::LinearTime, PhaseReference::Raw] {
+            let solver_options = SolverOptions::new(FitOptions::default(), phase_reference);
+            let batch = GreenwichNodalBatch::prepare_modified_julian_days_with_solver_options(
+                &time,
+                &constituents,
+                solver_options,
+            )
+            .expect("valid irregular batch");
+            let actual = batch
+                .solve_time_major_with_missing(&observations, &[60.0])
+                .expect("valid irregular gappy series");
+            let individual = GreenwichNodalOls::prepare_modified_julian_days_with_solver_options(
+                &retained_time,
+                60.0,
+                &constituents,
+                solver_options,
+            )
+            .expect("valid retained-record model")
+            .solve(&retained_observations)
+            .expect("valid retained observations");
+            assert_eq!(actual, [individual]);
+            assert_eq!(batch.phase_reference(), phase_reference);
+            assert!(
+                (actual[0].reference_time_days
+                    - retained_time[0].midpoint(retained_time[retained_time.len() - 1]))
+                .abs()
+                    < 1e-12
+            );
+        }
     }
 
     #[test]

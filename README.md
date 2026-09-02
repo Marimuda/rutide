@@ -56,7 +56,7 @@ confidence and 27.73–33.74% over vector linear confidence while retaining
 bitwise-identical checksums across 1 and 16 workers.
 
 The implemented scalar kernels now cover fixed-constituent OLS with a mean and
-optional trend in both raw-phase mode and exact Greenwich/nodal mode. The
+optional trend using raw, linear-time Greenwich, or exact Greenwich phase. The
 exact-correction catalog contains all 146 constituents, 162 satellite
 corrections, and 251 shallow-water relationships from the pinned Python oracle.
 The corrected bulk API shares latitude-independent astronomy, pre-aggregates
@@ -202,6 +202,16 @@ for scalar and vector analyses, ordinary and inferred constituents, OLS and
 robust fitting, all confidence methods, and complete, gappy, or irregular
 records. JSON reports and NetCDF metadata record `trend_enabled`; NetCDF keeps
 its stable slope variables and writes exact zeros when the trend is disabled.
+
+Use `--phase greenwich`, `--phase linear-time`, or `--phase raw` to select
+Python UTide's phase-reference convention. `greenwich` is the default and
+evaluates the astronomical argument at every timestamp. `linear-time` evaluates
+it once at the fitted record midpoint and advances it using the constituent's
+reference-time frequency. `raw` references phase directly to that midpoint.
+Exact nodal/satellite corrections remain enabled in all three cases; their
+independent approximation/disable controls are the next solver-parity item.
+The selected convention is retained in JSON reports, NetCDF metadata, result
+digests, profile names, and reconstruction.
 
 Add one repeatable `--infer INFERRED:REFERENCE:AMPLITUDE_RATIO:PHASE_OFFSET`
 for each constrained scalar constituent. Exact astronomical inference is the
