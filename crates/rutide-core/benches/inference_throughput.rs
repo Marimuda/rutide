@@ -3,10 +3,10 @@
 use std::{env, error::Error, hint::black_box, time::Instant};
 
 use faer::{Par, set_global_parallelism};
-use rayon::ThreadPoolBuilder;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use rutide_core::{
-    InferenceMode, LinearConfidence, ScalarInferenceBatch, ScalarInferenceRelation,
-    TidalConstituent, VectorInferenceBatch, VectorInferenceRelation,
+    InferenceMode, LinearConfidence, MonteCarloOptions, ScalarInferenceBatch,
+    ScalarInferenceRelation, TidalConstituent, VectorInferenceBatch, VectorInferenceRelation,
 };
 
 const CONSTITUENTS: [TidalConstituent; 5] = [
@@ -49,6 +49,13 @@ fn setting(name: &str, default: usize) -> usize {
 }
 
 fn nonnegative_setting(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn u64_setting(name: &str, default: u64) -> u64 {
     env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())
@@ -159,6 +166,86 @@ fn measure(
     Ok((median(&mut seconds), retained_checksum))
 }
 
+struct RunSettings {
+    monte_carlo: bool,
+    monte_carlo_options: MonteCarloOptions,
+    warmups: usize,
+    repetitions: usize,
+}
+
+fn measure_scalar(
+    pool: &ThreadPool,
+    batch: &ScalarInferenceBatch,
+    observations: &[f64],
+    latitudes: &[f64],
+    settings: &RunSettings,
+) -> Result<(f64, f64), Box<dyn Error>> {
+    measure(
+        || {
+            let solutions = pool.install(|| {
+                if settings.monte_carlo {
+                    batch.solve_time_major_with_missing_and_monte_carlo_confidence(
+                        observations,
+                        latitudes,
+                        settings.monte_carlo_options,
+                        LinearConfidence::Colored,
+                    )
+                } else {
+                    batch.solve_time_major_with_missing_and_linear_confidence(
+                        observations,
+                        latitudes,
+                        LinearConfidence::Colored,
+                    )
+                }
+            })?;
+            Ok(solutions
+                .iter()
+                .flat_map(|solution| solution.amplitude_ci.as_ref().expect("requested CI"))
+                .sum())
+        },
+        settings.warmups,
+        settings.repetitions,
+    )
+}
+
+fn measure_vector(
+    pool: &ThreadPool,
+    batch: &VectorInferenceBatch,
+    eastward: &[f64],
+    northward: &[f64],
+    latitudes: &[f64],
+    settings: &RunSettings,
+) -> Result<(f64, f64), Box<dyn Error>> {
+    measure(
+        || {
+            let solutions = pool.install(|| {
+                if settings.monte_carlo {
+                    batch.solve_vector_time_major_with_missing_and_monte_carlo_confidence(
+                        eastward,
+                        northward,
+                        latitudes,
+                        settings.monte_carlo_options,
+                        LinearConfidence::Colored,
+                    )
+                } else {
+                    batch.solve_vector_time_major_with_missing_and_linear_confidence(
+                        eastward,
+                        northward,
+                        latitudes,
+                        LinearConfidence::Colored,
+                    )
+                }
+            })?;
+            Ok(solutions
+                .iter()
+                .flat_map(|solution| solution.semi_major_ci.as_ref().expect("requested CI"))
+                .sum())
+        },
+        settings.warmups,
+        settings.repetitions,
+    )
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let field = benchmark_setting("RUTIDE_BENCH_FIELD", "scalar", &["scalar", "vector"])?;
     let sampling = benchmark_setting(
@@ -176,10 +263,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         InferenceMode::Approximate
     };
+    let confidence = benchmark_setting(
+        "RUTIDE_BENCH_CONFIDENCE",
+        "linear",
+        &["linear", "monte-carlo"],
+    )?;
+    let monte_carlo_options = MonteCarloOptions {
+        realizations: setting("RUTIDE_BENCH_MC_REALIZATIONS", 200),
+        seed: u64_setting("RUTIDE_BENCH_MC_SEED", 0),
+    };
     let series_count = setting("RUTIDE_BENCH_SERIES", 100);
     let repetitions = setting("RUTIDE_BENCH_REPETITIONS", 5);
     let warmups = nonnegative_setting("RUTIDE_BENCH_WARMUPS", 1);
     let workers = setting("RUTIDE_BENCH_WORKERS", 1);
+    let run_settings = RunSettings {
+        monte_carlo: confidence == "monte-carlo",
+        monte_carlo_options,
+        warmups,
+        repetitions,
+    };
     set_global_parallelism(Par::Seq);
 
     let times = times(&sampling);
@@ -204,23 +306,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             mode,
         )?;
         let prepare_seconds = prepare_start.elapsed().as_secs_f64();
-        let measured = measure(
-            || {
-                let solutions = pool.install(|| {
-                    batch.solve_time_major_with_missing_and_linear_confidence(
-                        &scalar,
-                        &latitudes,
-                        LinearConfidence::Colored,
-                    )
-                })?;
-                Ok(solutions
-                    .iter()
-                    .flat_map(|solution| solution.amplitude_ci.as_ref().expect("requested CI"))
-                    .sum())
-            },
-            warmups,
-            repetitions,
-        )?;
+        let measured = measure_scalar(&pool, &batch, &scalar, &latitudes, &run_settings)?;
         println!("prepare_seconds={prepare_seconds:.9}");
         measured
     } else {
@@ -231,32 +317,25 @@ fn main() -> Result<(), Box<dyn Error>> {
             mode,
         )?;
         let prepare_seconds = prepare_start.elapsed().as_secs_f64();
-        let measured = measure(
-            || {
-                let solutions = pool.install(|| {
-                    batch.solve_vector_time_major_with_missing_and_linear_confidence(
-                        &eastward,
-                        &northward,
-                        &latitudes,
-                        LinearConfidence::Colored,
-                    )
-                })?;
-                Ok(solutions
-                    .iter()
-                    .flat_map(|solution| solution.semi_major_ci.as_ref().expect("requested CI"))
-                    .sum())
-            },
-            warmups,
-            repetitions,
+        let measured = measure_vector(
+            &pool,
+            &batch,
+            &eastward,
+            &northward,
+            &latitudes,
+            &run_settings,
         )?;
         println!("prepare_seconds={prepare_seconds:.9}");
         measured
     };
     println!(
-        "summary field={field} sampling={sampling} inference_mode={mode_name} \
+        "summary field={field} sampling={sampling} inference_mode={mode_name} confidence={confidence} \
          series={series_count} workers={workers} warmups={warmups} repetitions={repetitions} \
+         mc_realizations={} mc_seed={} \
          median_seconds={median_seconds:.9} median_series_per_second={:.3} \
          checksum={checksum:.12e}",
+        monte_carlo_options.realizations,
+        monte_carlo_options.seed,
         f64::from(u32::try_from(series_count)?) / median_seconds,
     );
     Ok(())

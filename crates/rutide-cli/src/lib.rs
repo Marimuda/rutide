@@ -941,12 +941,12 @@ fn validate_config(config: &AnalyzeConfig) -> Result<(), AppError> {
             "input and output paths must differ".to_owned(),
         ));
     }
-    if let ConfidenceInterval::MonteCarlo { options, .. } = config.confidence_interval {
-        if options.realizations < 2 {
-            return Err(AppError::Invalid(
-                "Monte Carlo confidence requires at least two realizations".to_owned(),
-            ));
-        }
+    if let ConfidenceInterval::MonteCarlo { options, .. } = config.confidence_interval
+        && options.realizations < 2
+    {
+        return Err(AppError::Invalid(
+            "Monte Carlo confidence requires at least two realizations".to_owned(),
+        ));
     }
     if let AnalysisMethod::Robust(options) = config.analysis_method {
         if !options.tuning_constant.is_finite() || options.tuning_constant <= 0.0 {
