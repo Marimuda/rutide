@@ -26,6 +26,11 @@ pub enum AnalysisError {
         /// Position of the latter timestamp in the invalid pair.
         index: usize,
     },
+    /// A proleptic-Gregorian civil timestamp has an out-of-range component.
+    InvalidGregorianDateTime {
+        /// Name of the invalid component.
+        component: &'static str,
+    },
     /// Latitude is non-finite or outside the physical range.
     InvalidLatitude,
     /// Python `UTide`'s exact nodal formula is singular at precisely zero latitude.
@@ -167,6 +172,9 @@ impl fmt::Display for AnalysisError {
                 formatter,
                 "timestamps must be strictly increasing; violation at index {index}"
             ),
+            Self::InvalidGregorianDateTime { component } => {
+                write!(formatter, "Gregorian datetime has an invalid {component}")
+            }
             Self::InvalidLatitude => formatter
                 .write_str("latitude must be finite and between -90 and 90 degrees inclusive"),
             Self::EquatorialLatitude => formatter.write_str(

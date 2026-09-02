@@ -12,6 +12,7 @@ mod monte_carlo;
 mod robust;
 mod scalar;
 mod selection;
+mod time;
 mod vector;
 
 pub use catalog::{
@@ -29,6 +30,10 @@ pub use monte_carlo::MonteCarloOptions;
 pub use robust::{RobustDiagnostics, RobustOptions, RobustTermination};
 pub use scalar::{Constituent, FitOptions, FixedRawOls, LinearConfidence, ScalarSolution};
 pub use selection::{RayleighSelection, select_constituents_by_rayleigh};
+pub use time::{
+    GregorianDateTime, NormalizedTimeAxis, TimeEpoch, normalize_numeric_time,
+    system_time_to_modified_julian_day,
+};
 pub use vector::{VectorReconstruction, VectorSolution};
 
 /// The `RUTide` core crate version used to produce a result.

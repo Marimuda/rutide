@@ -20,18 +20,18 @@ use sha2::{Digest, Sha256};
 use super::{
     AnalysisMethod, AnalyzeConfig, AppError, ConfidenceInterval, ConstituentOrder,
     ConstituentOrderMap, ConstituentSelection, ConstituentSelectionReport, InferenceReport,
-    MILLISECONDS_PER_DAY, NodeSelection, ReconstructionReport, ResolvedConstituentSelection,
-    RobustOptionsReport, StageTimings, VectorInferenceConfig, constituent_order_indices,
-    encode_hex, nodal_profile_component, normalize_source_observation, order_profile_suffix,
-    reconstruction_report, required_dimension_length, required_variable,
-    resolve_constituent_selection, robust_termination_code, temporary_sibling,
-    update_constituent_order_digest, update_inference_digest, update_reconstruction_filter_digest,
-    validate_config, validate_dimensions, validate_reconstruction_filter, validate_source_value,
-    write_constituent_order_indices, write_inference_metadata, write_json_report,
-    write_robust_schema_metadata, write_variable,
+    NodeSelection, ReconstructionReport, ResolvedConstituentSelection, RobustOptionsReport,
+    StageTimings, VectorInferenceConfig, constituent_order_indices, encode_hex,
+    nodal_profile_component, normalize_source_observation, order_profile_suffix,
+    read_fvcom_time_axis, reconstruction_report, required_dimension_length, required_variable,
+    resolve_constituent_selection, retain_time_major_rows, robust_termination_code,
+    temporary_sibling, update_constituent_order_digest, update_inference_digest,
+    update_reconstruction_filter_digest, validate_config, validate_dimensions,
+    validate_reconstruction_filter, validate_source_value, write_constituent_order_indices,
+    write_inference_metadata, write_json_report, write_robust_schema_metadata, write_variable,
 };
 
-const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 8;
+const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 9;
 
 /// Configuration for one depth-averaged FVCOM current analysis.
 #[derive(Clone, Debug, PartialEq)]
@@ -137,8 +137,12 @@ pub struct VectorRunReport {
     pub output_path: String,
     /// Completed output file size.
     pub output_file_bytes: u64,
-    /// Number of timestamps.
+    /// Number of finite timestamps retained for analysis.
     pub time_count: usize,
+    /// Number of timestamps in the source time dimension.
+    pub source_time_count: usize,
+    /// Number of missing source timestamps and corresponding rows discarded.
+    pub discarded_timestamp_count: usize,
     /// Number of analyzed elements.
     pub series_count: usize,
     /// Number of elements with at least one missing component sample.
@@ -194,6 +198,8 @@ pub struct VectorRunReport {
 
 struct VectorInputData {
     modified_julian_days: Vec<f64>,
+    source_time_count: usize,
+    discarded_timestamp_count: usize,
     element_indices: Vec<usize>,
     latitudes: Vec<f64>,
     eastward: Vec<f64>,
@@ -542,6 +548,8 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         output_path: config.output.to_string_lossy().into_owned(),
         output_file_bytes,
         time_count: input.modified_julian_days.len(),
+        source_time_count: input.source_time_count,
+        discarded_timestamp_count: input.discarded_timestamp_count,
         series_count: input.element_indices.len(),
         series_with_missing_observations: input
             .observation_counts
@@ -670,17 +678,7 @@ fn read_fvcom_vector(path: &Path, selection: &NodeSelection) -> Result<VectorInp
     let element_indices = resolve_element_selection(selection, element_count)?;
     let series_count = element_indices.len();
 
-    let integer_day_variable = required_variable(&dataset, "Itime")?;
-    validate_dimensions(&integer_day_variable, &[("time", time_count)])?;
-    let integer_days = integer_day_variable.get_values::<i32, _>(..)?;
-    let millisecond_variable = required_variable(&dataset, "Itime2")?;
-    validate_dimensions(&millisecond_variable, &[("time", time_count)])?;
-    let integer_milliseconds = millisecond_variable.get_values::<i32, _>(..)?;
-    let modified_julian_days = integer_days
-        .into_iter()
-        .zip(integer_milliseconds)
-        .map(|(day, milliseconds)| f64::from(day) + f64::from(milliseconds) / MILLISECONDS_PER_DAY)
-        .collect::<Vec<_>>();
+    let (time_axis, time_element_bytes) = read_fvcom_time_axis(&dataset, time_count)?;
 
     let latitude_variable = required_variable(&dataset, "latc")?;
     validate_dimensions(&latitude_variable, &[("nele", element_count)])?;
@@ -691,7 +689,7 @@ fn read_fvcom_vector(path: &Path, selection: &NodeSelection) -> Result<VectorInp
     let northward_fill = northward_variable.fill_value::<f32>()?;
 
     let is_prefix = element_indices.iter().copied().eq(0..series_count);
-    let (latitude_values, mut eastward, mut northward) = if is_prefix {
+    let (latitude_values, eastward, northward) = if is_prefix {
         (
             latitude_variable.get_values::<f64, _>(0..series_count)?,
             eastward_variable.get_values::<f64, _>((.., 0..series_count))?,
@@ -712,6 +710,18 @@ fn read_fvcom_vector(path: &Path, selection: &NodeSelection) -> Result<VectorInp
         }
         (latitude_values, eastward, northward)
     };
+    let mut eastward = retain_time_major_rows(
+        eastward,
+        time_count,
+        series_count,
+        time_axis.retained_indices(),
+    )?;
+    let mut northward = retain_time_major_rows(
+        northward,
+        time_count,
+        series_count,
+        time_axis.retained_indices(),
+    )?;
 
     for (series, value) in latitude_values.iter().copied().enumerate() {
         validate_source_value("latc", value, latitude_fill, series, 0)?;
@@ -736,14 +746,19 @@ fn read_fvcom_vector(path: &Path, selection: &NodeSelection) -> Result<VectorInp
         .checked_mul(series_count)
         .ok_or_else(|| AppError::Invalid("logical input size exceeds usize".to_owned()))?;
     let logical_input_bytes = logical_input_bytes(&[
-        (time_count, integer_day_variable.vartype().size()),
-        (time_count, millisecond_variable.vartype().size()),
+        (time_count, time_element_bytes[0]),
+        (time_count, time_element_bytes[1]),
         (series_count, latitude_variable.vartype().size()),
         (value_count, eastward_variable.vartype().size()),
         (value_count, northward_variable.vartype().size()),
     ])?;
+    let discarded_timestamp_count = time_axis.discarded_count();
+    let source_time_count = time_axis.source_count();
+    let (modified_julian_days, _) = time_axis.into_parts();
     Ok(VectorInputData {
         modified_julian_days,
+        source_time_count,
+        discarded_timestamp_count,
         element_indices,
         latitudes: latitude_values,
         eastward,
@@ -1118,6 +1133,17 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
         i64::from(VECTOR_OUTPUT_SCHEMA_VERSION),
     )?;
     output.add_attribute("rutide_version", rutide_core::VERSION)?;
+    output.add_attribute(
+        "source_time_count",
+        i64::try_from(input.source_time_count)
+            .map_err(|_| AppError::Invalid("source time count exceeds i64".to_owned()))?,
+    )?;
+    output.add_attribute(
+        "discarded_timestamp_count",
+        i64::try_from(input.discarded_timestamp_count)
+            .map_err(|_| AppError::Invalid("discarded timestamp count exceeds i64".to_owned()))?,
+    )?;
+    output.add_attribute("time_epoch", "modified-julian-day")?;
     let profile = vector_profile(
         data.selection,
         data.analysis_method,
@@ -1555,14 +1581,19 @@ mod tests {
             temporary_sibling(&inference_output_destination).expect("valid inference output path");
         let time_count = 49_usize;
         let fill = -999.0_f32;
+        let time_fill = -999_i32;
         let mut dataset = netcdf::create(&input_path).expect("create vector fixture");
         dataset.add_dimension("time", time_count).expect("add time");
         dataset.add_dimension("nele", 2).expect("add elements");
-        dataset
-            .add_variable::<i32>("Itime", &["time"])
-            .expect("add Itime")
-            .put_values(&vec![58_113; time_count], ..)
-            .expect("write Itime");
+        {
+            let mut variable = dataset
+                .add_variable::<i32>("Itime", &["time"])
+                .expect("add Itime");
+            variable.set_fill_value(time_fill).expect("set time fill");
+            let mut integer_days = vec![58_113; time_count];
+            integer_days[10] = time_fill;
+            variable.put_values(&integer_days, ..).expect("write Itime");
+        }
         dataset
             .add_variable::<i32>("Itime2", &["time"])
             .expect("add Itime2")
@@ -1612,7 +1643,10 @@ mod tests {
         let input = read_fvcom_vector(&input_path, &NodeSelection::Indices(vec![1, 0]))
             .expect("read vector fixture");
         assert_eq!(input.element_indices, [1, 0]);
-        assert_eq!(input.observation_counts, [48, 48]);
+        assert_eq!(input.source_time_count, 49);
+        assert_eq!(input.discarded_timestamp_count, 1);
+        assert_eq!(input.modified_julian_days.len(), 48);
+        assert_eq!(input.observation_counts, [47, 47]);
         assert!(input.eastward[4 * 2].is_nan());
         assert!(input.northward[4 * 2].is_nan());
         assert!(input.eastward[3 * 2 + 1].is_nan());
@@ -1649,6 +1683,9 @@ mod tests {
         })
         .expect("analyze vector fixture");
         assert_eq!(report.series_count, 2);
+        assert_eq!(report.source_time_count, 49);
+        assert_eq!(report.discarded_timestamp_count, 1);
+        assert_eq!(report.time_count, 48);
         assert_eq!(report.series_with_missing_observations, 2);
         assert_eq!(report.analysis_method, "robust");
         assert_eq!(report.constituent_order, "frequency");
@@ -1684,11 +1721,19 @@ mod tests {
         );
         assert_eq!(
             output
+                .attribute("discarded_timestamp_count")
+                .expect("discarded timestamp metadata")
+                .value()
+                .expect("read discarded timestamp metadata"),
+            netcdf::AttributeValue::Longlong(1)
+        );
+        assert_eq!(
+            output
                 .variable("observation_count")
                 .expect("observation count")
                 .get_values::<i64, _>(..)
                 .expect("read observation count"),
-            [48, 48]
+            [47, 47]
         );
         assert_eq!(output.variable("semi_major").expect("semi-major").len(), 4);
         assert_eq!(
@@ -1697,14 +1742,14 @@ mod tests {
                 .expect("robust row sizes")
                 .get_values::<i64, _>(..)
                 .expect("read robust row sizes"),
-            [48, 48]
+            [47, 47]
         );
         assert_eq!(
             output
                 .variable("robust_weight")
                 .expect("robust weights")
                 .len(),
-            96
+            94
         );
         assert_eq!(
             output
@@ -1721,7 +1766,7 @@ mod tests {
                 .variable("eastward_reconstruction")
                 .expect("eastward reconstruction")
                 .len(),
-            time_count * 2
+            (time_count - 1) * 2
         );
         drop(output);
 
@@ -1904,14 +1949,14 @@ mod tests {
                 .expect("inferred robust row sizes")
                 .get_values::<i64, _>(..)
                 .expect("read inferred robust row sizes"),
-            [48, 48]
+            [47, 47]
         );
         assert_eq!(
             inference_output
                 .variable("robust_weight")
                 .expect("inferred robust weights")
                 .len(),
-            96
+            94
         );
         drop(inference_output);
         fs::remove_file(input_path).expect("remove vector fixture");

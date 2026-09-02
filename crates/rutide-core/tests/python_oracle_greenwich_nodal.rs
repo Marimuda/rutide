@@ -4,7 +4,7 @@ use rayon::ThreadPoolBuilder;
 use rutide_core::{
     AnalysisError, FitOptions, GreenwichNodalBatch, GreenwichNodalOls, GreenwichNodalReconstructor,
     LinearConfidence, MonteCarloOptions, NodalCorrections, PhaseReference, ReconstructionFilter,
-    RobustOptions, SolverOptions, TidalConstituent,
+    RobustOptions, SolverOptions, TidalConstituent, TimeEpoch, normalize_numeric_time,
 };
 
 const CONSTITUENTS: [TidalConstituent; 5] = [
@@ -269,6 +269,64 @@ fn matches_python_utide_for_real_fvcom_elevation() {
         EXPECTED_SLOPE_PER_DAY,
         3e-12,
     );
+}
+
+#[test]
+fn python_epoch_and_missing_timestamp_normalization_preserve_the_oracle_fit() {
+    // Python UTide 8fabe121752bc317931472a10a42e306715106de removes this
+    // non-finite time and its corresponding observation before solving.
+    let mut python_gregorian_days = oracle_times()
+        .into_iter()
+        .map(|modified_julian_day| modified_julian_day + 678_576.0)
+        .collect::<Vec<_>>();
+    let mut observations = oracle_observations();
+    python_gregorian_days.insert(97, f64::NAN);
+    observations.insert(97, 1.0e30);
+    let normalized = normalize_numeric_time(&python_gregorian_days, TimeEpoch::PythonGregorian)
+        .expect("valid Python-epoch time axis");
+    assert_eq!(normalized.source_count(), 746);
+    assert_eq!(normalized.discarded_count(), 1);
+    let retained_observations = normalized
+        .retained_indices()
+        .iter()
+        .map(|index| observations[*index])
+        .collect::<Vec<_>>();
+
+    let model = GreenwichNodalOls::prepare_modified_julian_days(
+        normalized.modified_julian_days(),
+        LATITUDE_DEGREES_NORTH,
+        &CONSTITUENTS,
+    )
+    .expect("valid normalized oracle model");
+    let solution = model
+        .solve(&retained_observations)
+        .expect("valid normalized oracle observations");
+    for (index, (actual, expected)) in solution
+        .amplitude
+        .iter()
+        .zip(EXPECTED_AMPLITUDE)
+        .enumerate()
+    {
+        assert_close(
+            &format!("normalized amplitude[{index}]"),
+            *actual,
+            expected,
+            3e-12,
+        );
+    }
+    for (index, (actual, expected)) in solution
+        .phase_degrees
+        .iter()
+        .zip(EXPECTED_PHASE_DEGREES)
+        .enumerate()
+    {
+        assert_close(
+            &format!("normalized phase[{index}]"),
+            *actual,
+            expected,
+            3e-9,
+        );
+    }
 }
 
 #[test]

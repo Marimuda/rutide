@@ -235,8 +235,14 @@ reported because the Python implementation rejects the combination.
   deterministic, and focused fixtures freeze the pinned Python UTide PE/SNR/
   frequency views. Shared maps avoid per-series allocation, while diagnostic
   maps use one contiguous buffer.
-- Define missing/non-finite timestamp handling and datetime/epoch conversion at
-  application or binding boundaries.
+- **Complete:** normalize numeric MJD, Unix, Python Gregorian, MATLAB, and custom
+  Gregorian epochs plus civil/Rust datetimes at application or binding
+  boundaries while retaining an MJD-only numerical core. Non-finite times and
+  corresponding scalar/vector rows are removed as in Python UTide; source and
+  discarded counts are serialized. Duplicate or decreasing retained times are
+  explicitly rejected rather than silently sorted or passed into an ambiguous
+  Python fit. Pinned epoch constants, leap dates, invalid civil components,
+  missing-time oracle parity, and FVCOM scalar/vector fill rows are covered.
 
 Each remaining option combination needs focused oracle coverage. Unsupported
 combinations must be rejected during validation rather than partially applied.

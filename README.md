@@ -300,6 +300,22 @@ Each series must retain enough finite observations to overdetermine its selected
 model. Infinite observations remain invalid; missing samples are reported rather
 than silently replaced in the fit.
 
+The solver core uses strictly increasing Modified Julian Days. Boundary code can
+normalize numeric days declared as MJD, Unix, Python Gregorian, MATLAB, or a
+custom proleptic-Gregorian epoch with `normalize_numeric_time`; validated
+millisecond-resolution `GregorianDateTime` and Rust `SystemTime` conversion are
+also available. These conversions reproduce the pinned Python UTide epoch
+offsets before the MJD-based astronomical kernel is entered.
+
+Matching Python UTide's safe timestamp behavior, non-finite numeric timestamps
+are removed together with their corresponding observations. FVCOM `_FillValue`
+entries in either `Itime` or `Itime2` therefore discard that complete time row
+for every scalar node or both vector components. Reports and NetCDF metadata
+retain the source, analyzed, and discarded timestamp counts; reconstruction is
+written only at retained finite timestamps. RUTide deliberately rejects duplicate
+or decreasing retained timestamps instead of accepting the ambiguous ordering as
+Python currently does, and it never sorts observations implicitly.
+
 ## FVCOM vector-current analysis
 
 Use `analyze-vector` for FVCOM depth-averaged eastward/northward currents. The

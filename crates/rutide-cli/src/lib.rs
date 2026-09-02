@@ -14,10 +14,11 @@ use netcdf::{FileMut, Variable, VariableMut};
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
     AnalysisError, Constituent, FitOptions, GreenwichNodalBatch, GreenwichNodalReconstructor,
-    InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections, PhaseReference,
-    RayleighSelection, ReconstructionFilter, RobustOptions, RobustTermination,
+    InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections, NormalizedTimeAxis,
+    PhaseReference, RayleighSelection, ReconstructionFilter, RobustOptions, RobustTermination,
     ScalarInferenceBatch, ScalarInferenceRelation, ScalarSolution, SolverOptions, TidalConstituent,
-    VectorInferenceRelation, VectorSolution, select_constituents_by_rayleigh,
+    TimeEpoch, VectorInferenceRelation, VectorSolution, normalize_numeric_time,
+    select_constituents_by_rayleigh,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -27,7 +28,7 @@ mod vector;
 pub use vector::{VectorAnalyzeConfig, VectorRunReport, VectorSampleResult, analyze_vector};
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
-const OUTPUT_SCHEMA_VERSION: u32 = 12;
+const OUTPUT_SCHEMA_VERSION: u32 = 13;
 /// Backward-compatible benchmark constituent set used when none is specified.
 pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -648,8 +649,12 @@ pub struct RunReport {
     pub output_path: String,
     /// Completed output file size.
     pub output_file_bytes: u64,
-    /// Number of timestamps.
+    /// Number of finite timestamps retained for analysis.
     pub time_count: usize,
+    /// Number of timestamps in the source time dimension.
+    pub source_time_count: usize,
+    /// Number of missing source timestamps and corresponding rows discarded.
+    pub discarded_timestamp_count: usize,
     /// Number of analyzed nodes.
     pub series_count: usize,
     /// Number of series containing at least one missing observation.
@@ -806,6 +811,8 @@ impl From<rayon::ThreadPoolBuildError> for AppError {
 
 struct InputData {
     modified_julian_days: Vec<f64>,
+    source_time_count: usize,
+    discarded_timestamp_count: usize,
     node_indices: Vec<usize>,
     latitudes: Vec<f64>,
     observations: Vec<f64>,
@@ -1051,6 +1058,8 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         config.overwrite,
         &OutputData {
             node_indices: &input.node_indices,
+            source_time_count: input.source_time_count,
+            discarded_timestamp_count: input.discarded_timestamp_count,
             latitudes: &input.latitudes,
             observation_counts: &input.observation_counts,
             constituents: batch.constituents(),
@@ -1100,6 +1109,8 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         output_path: config.output.to_string_lossy().into_owned(),
         output_file_bytes,
         time_count: input.modified_julian_days.len(),
+        source_time_count: input.source_time_count,
+        discarded_timestamp_count: input.discarded_timestamp_count,
         series_count: input.node_indices.len(),
         series_with_missing_observations: input
             .observation_counts
@@ -1614,18 +1625,7 @@ fn read_fvcom_scalar(path: &Path, selection: &NodeSelection) -> Result<InputData
     let node_indices = resolve_node_selection(selection, node_count)?;
     let series_count = node_indices.len();
 
-    let integer_day_variable = required_variable(&dataset, "Itime")?;
-    validate_dimensions(&integer_day_variable, &[("time", time_count)])?;
-    let integer_days = integer_day_variable.get_values::<i32, _>(..)?;
-
-    let millisecond_variable = required_variable(&dataset, "Itime2")?;
-    validate_dimensions(&millisecond_variable, &[("time", time_count)])?;
-    let integer_milliseconds = millisecond_variable.get_values::<i32, _>(..)?;
-    let modified_julian_days = integer_days
-        .into_iter()
-        .zip(integer_milliseconds)
-        .map(|(day, milliseconds)| f64::from(day) + f64::from(milliseconds) / MILLISECONDS_PER_DAY)
-        .collect::<Vec<_>>();
+    let (time_axis, time_element_bytes) = read_fvcom_time_axis(&dataset, time_count)?;
 
     let latitude_variable = required_variable(&dataset, "lat")?;
     validate_dimensions(&latitude_variable, &[("node", node_count)])?;
@@ -1639,7 +1639,7 @@ fn read_fvcom_scalar(path: &Path, selection: &NodeSelection) -> Result<InputData
     let zeta_fill = zeta_variable.fill_value::<f32>()?;
 
     let is_prefix = node_indices.iter().copied().eq(0..node_indices.len());
-    let (latitude_values, mut observation_values) = if is_prefix {
+    let (latitude_values, observation_values) = if is_prefix {
         (
             latitude_variable.get_values::<f64, _>(0..series_count)?,
             zeta_variable.get_values::<f64, _>((.., 0..series_count))?,
@@ -1656,6 +1656,12 @@ fn read_fvcom_scalar(path: &Path, selection: &NodeSelection) -> Result<InputData
         }
         (latitude_values, observation_values)
     };
+    let mut observation_values = retain_time_major_rows(
+        observation_values,
+        time_count,
+        series_count,
+        time_axis.retained_indices(),
+    )?;
 
     for (series, value) in latitude_values.iter().copied().enumerate() {
         validate_source_value("lat", value, latitude_fill, series, 0)?;
@@ -1684,8 +1690,8 @@ fn read_fvcom_scalar(path: &Path, selection: &NodeSelection) -> Result<InputData
         .checked_mul(series_count)
         .ok_or_else(|| AppError::Invalid("logical input size exceeds usize".to_owned()))?;
     let logical_input_bytes = [
-        (time_count, integer_day_variable.vartype().size()),
-        (time_count, millisecond_variable.vartype().size()),
+        (time_count, time_element_bytes[0]),
+        (time_count, time_element_bytes[1]),
         (series_count, latitude_variable.vartype().size()),
         (observation_count, zeta_variable.vartype().size()),
     ]
@@ -1702,8 +1708,13 @@ fn read_fvcom_scalar(path: &Path, selection: &NodeSelection) -> Result<InputData
             .ok_or_else(|| AppError::Invalid("logical input byte count overflows u64".to_owned()))
     })?;
 
+    let discarded_timestamp_count = time_axis.discarded_count();
+    let source_time_count = time_axis.source_count();
+    let (modified_julian_days, _) = time_axis.into_parts();
     Ok(InputData {
         modified_julian_days,
+        source_time_count,
+        discarded_timestamp_count,
         node_indices,
         latitudes: latitude_values,
         observations: observation_values,
@@ -1711,6 +1722,83 @@ fn read_fvcom_scalar(path: &Path, selection: &NodeSelection) -> Result<InputData
         input_file_bytes,
         logical_input_bytes,
     })
+}
+
+fn read_fvcom_time_axis(
+    dataset: &netcdf::File,
+    time_count: usize,
+) -> Result<(NormalizedTimeAxis, [usize; 2]), AppError> {
+    let integer_day_variable = required_variable(dataset, "Itime")?;
+    validate_dimensions(&integer_day_variable, &[("time", time_count)])?;
+    let integer_day_fill = integer_day_variable.fill_value::<i32>()?;
+    let integer_days = integer_day_variable.get_values::<i32, _>(..)?;
+
+    let millisecond_variable = required_variable(dataset, "Itime2")?;
+    validate_dimensions(&millisecond_variable, &[("time", time_count)])?;
+    let millisecond_fill = millisecond_variable.fill_value::<i32>()?;
+    let integer_milliseconds = millisecond_variable.get_values::<i32, _>(..)?;
+    let numeric_mjd = integer_days
+        .into_iter()
+        .zip(integer_milliseconds)
+        .map(|(day, milliseconds)| {
+            if integer_day_fill == Some(day) || millisecond_fill == Some(milliseconds) {
+                f64::NAN
+            } else {
+                f64::from(day) + f64::from(milliseconds) / MILLISECONDS_PER_DAY
+            }
+        })
+        .collect::<Vec<_>>();
+    let normalized = normalize_numeric_time(&numeric_mjd, TimeEpoch::ModifiedJulian)?;
+    Ok((
+        normalized,
+        [
+            integer_day_variable.vartype().size(),
+            millisecond_variable.vartype().size(),
+        ],
+    ))
+}
+
+fn retain_time_major_rows(
+    values: Vec<f64>,
+    source_time_count: usize,
+    series_count: usize,
+    retained_time_indices: &[usize],
+) -> Result<Vec<f64>, AppError> {
+    let expected = source_time_count
+        .checked_mul(series_count)
+        .ok_or_else(|| AppError::Invalid("source observation shape exceeds usize".to_owned()))?;
+    if values.len() != expected {
+        return Err(AppError::Invalid(format!(
+            "source observation array contains {} values; expected {expected}",
+            values.len()
+        )));
+    }
+    if retained_time_indices.len() == source_time_count
+        && retained_time_indices
+            .iter()
+            .copied()
+            .eq(0..source_time_count)
+    {
+        return Ok(values);
+    }
+    let retained_len = retained_time_indices
+        .len()
+        .checked_mul(series_count)
+        .ok_or_else(|| AppError::Invalid("retained observation shape exceeds usize".to_owned()))?;
+    let mut retained = Vec::with_capacity(retained_len);
+    for &time in retained_time_indices {
+        let start = time
+            .checked_mul(series_count)
+            .ok_or_else(|| AppError::Invalid("source row offset exceeds usize".to_owned()))?;
+        let end = start + series_count;
+        let row = values.get(start..end).ok_or_else(|| {
+            AppError::Invalid(format!(
+                "retained timestamp index {time} exceeds source shape"
+            ))
+        })?;
+        retained.extend_from_slice(row);
+    }
+    Ok(retained)
 }
 
 fn required_dimension_length(dataset: &netcdf::File, name: &str) -> Result<usize, AppError> {
@@ -2122,6 +2210,8 @@ fn retained_samples(
 
 struct OutputData<'data> {
     node_indices: &'data [usize],
+    source_time_count: usize,
+    discarded_timestamp_count: usize,
     latitudes: &'data [f64],
     observation_counts: &'data [usize],
     constituents: &'data [Constituent],
@@ -2164,6 +2254,8 @@ fn write_output(path: &Path, overwrite: bool, data: &OutputData<'_>) -> Result<(
 fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError> {
     let OutputData {
         node_indices,
+        source_time_count,
+        discarded_timestamp_count,
         latitudes,
         observation_counts,
         constituents,
@@ -2193,6 +2285,17 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
     output.add_attribute("title", "RUTide scalar harmonic coefficients")?;
     output.add_attribute("rutide_schema_version", i64::from(OUTPUT_SCHEMA_VERSION))?;
     output.add_attribute("rutide_version", rutide_core::VERSION)?;
+    output.add_attribute(
+        "source_time_count",
+        i64::try_from(source_time_count)
+            .map_err(|_| AppError::Invalid("source time count exceeds i64".to_owned()))?,
+    )?;
+    output.add_attribute(
+        "discarded_timestamp_count",
+        i64::try_from(discarded_timestamp_count)
+            .map_err(|_| AppError::Invalid("discarded timestamp count exceeds i64".to_owned()))?,
+    )?;
+    output.add_attribute("time_epoch", "modified-julian-day")?;
     let profile = selection.profile(
         analysis_method,
         inference.is_some(),
@@ -2869,17 +2972,22 @@ mod tests {
         let destination = std::env::temp_dir().join("rutide-read-input-test.nc");
         let path = temporary_sibling(&destination).expect("valid temporary path");
         let mut dataset = netcdf::create(&path).expect("create test NetCDF");
-        dataset.add_dimension("time", 2).expect("add time");
+        dataset.add_dimension("time", 3).expect("add time");
         dataset.add_dimension("node", 2).expect("add node");
-        dataset
-            .add_variable::<i32>("Itime", &["time"])
-            .expect("add Itime")
-            .put_values(&[58_113, 58_113], ..)
-            .expect("write Itime");
+        let time_fill = -999_i32;
+        {
+            let mut variable = dataset
+                .add_variable::<i32>("Itime", &["time"])
+                .expect("add Itime");
+            variable.set_fill_value(time_fill).expect("set time fill");
+            variable
+                .put_values(&[58_113, time_fill, 58_113], ..)
+                .expect("write Itime");
+        }
         dataset
             .add_variable::<i32>("Itime2", &["time"])
             .expect("add Itime2")
-            .put_values(&[0, 3_600_000], ..)
+            .put_values(&[0, 0, 3_600_000], ..)
             .expect("write Itime2");
         let latitudes = [60.1_f32, 61.2_f32];
         dataset
@@ -2887,7 +2995,14 @@ mod tests {
             .expect("add lat")
             .put_values(&latitudes, ..)
             .expect("write lat");
-        let observations = [0.1_f32, -2.5_f32, 3.25_f32, 4.5_f32];
+        let observations = [
+            0.1_f32,
+            -2.5_f32,
+            f32::INFINITY,
+            f32::INFINITY,
+            3.25_f32,
+            4.5_f32,
+        ];
         dataset
             .add_variable::<f32>("zeta", &["time", "node"])
             .expect("add zeta")
@@ -2902,6 +3017,8 @@ mod tests {
             [58_113.0, 58_113.0 + 1.0 / 24.0]
         );
         assert_eq!(input.node_indices, [1, 0]);
+        assert_eq!(input.source_time_count, 3);
+        assert_eq!(input.discarded_timestamp_count, 1);
         assert_eq!(
             input.latitudes,
             [f64::from(latitudes[1]), f64::from(latitudes[0])]
@@ -2911,11 +3028,11 @@ mod tests {
             [
                 f64::from(observations[1]),
                 f64::from(observations[0]),
-                f64::from(observations[3]),
-                f64::from(observations[2]),
+                f64::from(observations[5]),
+                f64::from(observations[4]),
             ]
         );
-        assert_eq!(input.logical_input_bytes, 40);
+        assert_eq!(input.logical_input_bytes, 56);
         assert_eq!(input.observation_counts, [2, 2]);
         fs::remove_file(path).expect("remove test NetCDF");
     }
