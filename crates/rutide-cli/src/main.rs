@@ -37,6 +37,8 @@ Options:
   --nodes I,J,...     Analyze explicit zero-based node indices
   --element-count N   Analyze the first N elements (vector mode)
   --elements I,J,...  Analyze explicit zero-based element indices (vector mode)
+  --layer-count N     Analyze the first N native sigma layers (vector mode)
+  --layers I,J,...    Analyze explicit zero-based native sigma-layer indices
   --constituents LIST Comma-separated names or 'auto' (default: M2,S2,N2,K1,O1)
   --rayleigh-min X    Automatic selection criterion (default with auto: 1.0)
   --order ORDER       Presentation: selection, pe, snr, frequency, or a full name list
@@ -150,6 +152,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let mut workers = std::thread::available_parallelism().map_or(1, usize::from);
     let mut chunk_series = None;
     let mut selection = None;
+    let mut layer_selection = None;
     let mut constituents = None;
     let mut rayleigh_minimum = None;
     let mut constituent_order = None;
@@ -220,7 +223,34 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                     return Err("--elements is only valid for analyze-vector".to_owned());
                 }
                 ensure_selection_is_unset(selection.as_ref())?;
-                selection = Some(parse_nodes(&required_value(&mut arguments, option)?)?);
+                selection = Some(parse_index_selection(
+                    &required_value(&mut arguments, option)?,
+                    option,
+                    "element",
+                )?);
+            }
+            "--layer-count" => {
+                if !vector {
+                    return Err("--layer-count is only valid for analyze-vector".to_owned());
+                }
+                if layer_selection.is_some() {
+                    return Err("--layers and --layer-count are mutually exclusive".to_owned());
+                }
+                let count = parse_positive_usize(&required_value(&mut arguments, option)?, option)?;
+                layer_selection = Some(NodeSelection::Prefix(count));
+            }
+            "--layers" => {
+                if !vector {
+                    return Err("--layers is only valid for analyze-vector".to_owned());
+                }
+                if layer_selection.is_some() {
+                    return Err("--layers and --layer-count are mutually exclusive".to_owned());
+                }
+                layer_selection = Some(parse_index_selection(
+                    &required_value(&mut arguments, option)?,
+                    option,
+                    "layer",
+                )?);
             }
             "--constituents" => {
                 if constituents.is_some() {
@@ -450,6 +480,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             output,
             report,
             elements: selection,
+            layers: layer_selection,
             constituent_selection,
             constituent_order,
             inference,
@@ -797,9 +828,17 @@ fn ensure_selection_is_unset(selection: Option<&NodeSelection>) -> Result<(), St
 }
 
 fn parse_nodes(value: &OsStr) -> Result<NodeSelection, String> {
+    parse_index_selection(value, "--nodes", "node")
+}
+
+fn parse_index_selection(
+    value: &OsStr,
+    option: &str,
+    index_name: &str,
+) -> Result<NodeSelection, String> {
     let text = value
         .to_str()
-        .ok_or_else(|| "--nodes value must be valid UTF-8".to_owned())?;
+        .ok_or_else(|| format!("{option} value must be valid UTF-8"))?;
     if text == "all" {
         return Ok(NodeSelection::All);
     }
@@ -807,11 +846,13 @@ fn parse_nodes(value: &OsStr) -> Result<NodeSelection, String> {
         .split(',')
         .map(|item| {
             item.parse::<usize>()
-                .map_err(|_| format!("invalid zero-based node index: {item:?}"))
+                .map_err(|_| format!("invalid zero-based {index_name} index: {item:?}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
     if indices.is_empty() {
-        return Err("--nodes requires 'all' or a comma-separated index list".to_owned());
+        return Err(format!(
+            "{option} requires 'all' or a comma-separated index list"
+        ));
     }
     Ok(NodeSelection::Indices(indices))
 }
@@ -981,6 +1022,8 @@ mod tests {
             "output.nc",
             "--elements",
             "4,1,3",
+            "--layers",
+            "2,0",
             "--confidence",
             "linear",
             "--phase",
@@ -996,6 +1039,7 @@ mod tests {
             panic!("expected vector analyze command");
         };
         assert_eq!(config.elements, NodeSelection::Indices(vec![4, 1, 3]));
+        assert_eq!(config.layers, Some(NodeSelection::Indices(vec![2, 0])));
         assert_eq!(
             config.confidence_interval,
             ConfidenceInterval::Linear(LinearConfidence::Colored)
@@ -1013,6 +1057,32 @@ mod tests {
                 "output.nc",
                 "--nodes",
                 "1",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_arguments(args(&[
+                "analyze-vector",
+                "--input",
+                "input.nc",
+                "--output",
+                "output.nc",
+                "--layers",
+                "0",
+                "--layer-count",
+                "2",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_arguments(args(&[
+                "analyze-scalar",
+                "--input",
+                "input.nc",
+                "--output",
+                "output.nc",
+                "--layers",
+                "0",
             ]))
             .is_err()
         );

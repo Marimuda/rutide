@@ -66,6 +66,31 @@ def ellipse_component_coefficients(
 def _read_output(path: Path) -> dict[str, Any]:
     with netCDF4.Dataset(path.resolve(strict=True), mode="r") as dataset:
         confidence = str(dataset.getncattr("confidence_interval"))
+        vertical_mode = (
+            str(dataset.getncattr("vertical_mode"))
+            if "vertical_mode" in dataset.ncattrs()
+            else "depth-averaged"
+        )
+        element_indices = np.asarray(dataset.variables["element_index"][:], dtype=np.int64)
+        latitudes = _finite(dataset.variables["latitude"][:], "output latitude")
+        if vertical_mode == "sigma-layer":
+            selected_layers = np.asarray(dataset.variables["siglay_index"][:], dtype=np.int64)
+            indices = np.tile(element_indices, len(selected_layers))
+            series_layers: np.ndarray | None = np.repeat(selected_layers, len(element_indices))
+            latitudes = np.tile(latitudes, len(selected_layers))
+        elif vertical_mode == "depth-averaged":
+            selected_layers = None
+            indices = element_indices
+            series_layers = None
+        else:
+            raise ValueError(f"unsupported vertical mode: {vertical_mode}")
+
+        def series_values(name: str, description: str) -> np.ndarray:
+            values = _finite(dataset.variables[name][:], description)
+            if vertical_mode == "sigma-layer":
+                return values.reshape((-1, *values.shape[2:]))
+            return values
+
         result: dict[str, Any] = {
             "profile": str(dataset.getncattr("profile")),
             "selection": str(dataset.getncattr("constituent_selection")),
@@ -74,36 +99,24 @@ def _read_output(path: Path) -> dict[str, Any]:
                 str(dataset.getncattr("confidence_noise")) if confidence == "linear" else None
             ),
             "names": str(dataset.getncattr("constituent_names")).split(","),
-            "indices": np.asarray(dataset.variables["element_index"][:], dtype=np.int64),
-            "latitudes": _finite(dataset.variables["latitude"][:], "output latitude"),
-            "observation_counts": np.asarray(
-                dataset.variables["observation_count"][:], dtype=np.int64
-            ),
-            "reference_times": _finite(
-                dataset.variables["reference_time"][:], "output reference time"
-            ),
-            "frequencies": _finite(dataset.variables["frequency"][:], "output frequency"),
-            "semi_major": _finite(dataset.variables["semi_major"][:], "output semi-major"),
-            "semi_minor": _finite(dataset.variables["semi_minor"][:], "output semi-minor"),
-            "inclination": _finite(
-                dataset.variables["inclination"][:], "output inclination"
-            ),
-            "phase": _finite(dataset.variables["phase"][:], "output phase"),
-            "percent_energy": _finite(
-                dataset.variables["percent_energy"][:], "output percent energy"
-            ),
-            "eastward_mean": _finite(
-                dataset.variables["eastward_mean"][:], "output eastward mean"
-            ),
-            "northward_mean": _finite(
-                dataset.variables["northward_mean"][:], "output northward mean"
-            ),
-            "eastward_slope": _finite(
-                dataset.variables["eastward_slope"][:], "output eastward slope"
-            ),
-            "northward_slope": _finite(
-                dataset.variables["northward_slope"][:], "output northward slope"
-            ),
+            "vertical_mode": vertical_mode,
+            "indices": indices,
+            "layer_indices": series_layers,
+            "latitudes": latitudes,
+            "observation_counts": series_values(
+                "observation_count", "output observation count"
+            ).astype(np.int64),
+            "reference_times": series_values("reference_time", "output reference time"),
+            "frequencies": series_values("frequency", "output frequency"),
+            "semi_major": series_values("semi_major", "output semi-major"),
+            "semi_minor": series_values("semi_minor", "output semi-minor"),
+            "inclination": series_values("inclination", "output inclination"),
+            "phase": series_values("phase", "output phase"),
+            "percent_energy": series_values("percent_energy", "output percent energy"),
+            "eastward_mean": series_values("eastward_mean", "output eastward mean"),
+            "northward_mean": series_values("northward_mean", "output northward mean"),
+            "eastward_slope": series_values("eastward_slope", "output eastward slope"),
+            "northward_slope": series_values("northward_slope", "output northward slope"),
             "result_sha256": str(dataset.getncattr("result_sha256")),
         }
         if confidence == "linear":
@@ -114,7 +127,7 @@ def _read_output(path: Path) -> dict[str, Any]:
                 "phase_ci",
                 "signal_to_noise",
             ):
-                result[name] = _finite(dataset.variables[name][:], f"output {name}")
+                result[name] = series_values(name, f"output {name}")
         selection = result["selection"]
         result["rayleigh_min"] = (
             float(dataset.getncattr("rayleigh_min")) if selection == "rayleigh" else None
@@ -125,8 +138,19 @@ def _read_output(path: Path) -> dict[str, Any]:
 def _validate_output_shapes(output: dict[str, Any]) -> None:
     series_count = len(output["indices"])
     constituent_count = len(output["names"])
-    if series_count == 0 or len(set(int(value) for value in output["indices"])) != series_count:
-        raise ValueError("element indices must be non-empty and unique")
+    if series_count == 0:
+        raise ValueError("vector series must be non-empty")
+    coordinates = list(
+        zip(
+            output["layer_indices"]
+            if output["layer_indices"] is not None
+            else np.full(series_count, -1, dtype=np.int64),
+            output["indices"],
+            strict=True,
+        )
+    )
+    if len(set((int(layer), int(element)) for layer, element in coordinates)) != series_count:
+        raise ValueError("layer-element coordinates must be unique")
     if constituent_count == 0 or len(set(output["names"])) != constituent_count:
         raise ValueError("constituent names must be non-empty and unique")
     matrix_shape = (series_count, constituent_count)
@@ -177,6 +201,8 @@ def compare_vector_with_oracle(
     if output["profile"] not in {
         "fixed-constituents-greenwich-nodal-vector-ols",
         "rayleigh-auto-greenwich-nodal-vector-ols",
+        "fixed-constituents-greenwich-nodal-sigma-layer-vector-ols",
+        "rayleigh-auto-greenwich-nodal-sigma-layer-vector-ols",
     }:
         raise ValueError("RUTide output uses an unsupported vector profile")
     options = _profile_options("fixed-constituents")
@@ -198,9 +224,7 @@ def compare_vector_with_oracle(
     metric_names = list(TOLERANCES)
     if output["confidence"] != "linear":
         metric_names = [name for name in metric_names if "_ci" not in name]
-    errors: dict[str, list[tuple[float, int, str | None]]] = {
-        name: [] for name in metric_names
-    }
+    errors: dict[str, list[tuple[float, int, str | None]]] = {name: [] for name in metric_names}
     snr_errors: list[tuple[float, float, int, str]] = []
     raw_angle_errors = {"inclination_degrees": 0.0, "phase_degrees": 0.0}
     fixture_path = fixture.resolve(strict=True)
@@ -209,18 +233,34 @@ def compare_vector_with_oracle(
         element_count = len(source.dimensions["nele"])
         for position, raw_element_index in enumerate(output["indices"]):
             element_index = int(raw_element_index)
+            layer_index = (
+                int(output["layer_indices"][position])
+                if output["layer_indices"] is not None
+                else None
+            )
             if not 0 <= element_index < element_count:
                 raise ValueError(f"element index is out of range: {element_index}")
             latitude = float(source.variables["latc"][element_index])
             if output["latitudes"][position] != latitude:
                 raise ValueError(f"latitude differs at element {element_index}")
+            if layer_index is None:
+                eastward_source = source.variables["ua"][:, element_index]
+                northward_source = source.variables["va"][:, element_index]
+                source_label = f"element {element_index}"
+            else:
+                layer_count = len(source.dimensions["siglay"])
+                if not 0 <= layer_index < layer_count:
+                    raise ValueError(f"sigma-layer index is out of range: {layer_index}")
+                eastward_source = source.variables["u"][:, layer_index, element_index]
+                northward_source = source.variables["v"][:, layer_index, element_index]
+                source_label = f"layer {layer_index}, element {element_index}"
             eastward = _observations_with_nan(
-                source.variables["ua"][:, element_index],
-                f"source ua at element {element_index}",
+                eastward_source,
+                f"source eastward current at {source_label}",
             )
             northward = _observations_with_nan(
-                source.variables["va"][:, element_index],
-                f"source va at element {element_index}",
+                northward_source,
+                f"source northward current at {source_label}",
             )
             valid = np.isfinite(eastward) & np.isfinite(northward)
             if output["observation_counts"][position] != int(valid.sum()):
@@ -270,9 +310,7 @@ def compare_vector_with_oracle(
                 expected["inclination"],
                 expected["phase"],
             )
-            coefficient_errors = np.max(
-                np.abs(actual_coefficients - expected_coefficients), axis=1
-            )
+            coefficient_errors = np.max(np.abs(actual_coefficients - expected_coefficients), axis=1)
             errors["component_coefficient"].extend(
                 (float(value), element_index, name)
                 for value, name in zip(coefficient_errors, names, strict=True)
@@ -294,8 +332,7 @@ def compare_vector_with_oracle(
                 float(
                     np.max(
                         np.abs(
-                            (output["phase"][position] - expected["phase"] + 180.0) % 360.0
-                            - 180.0
+                            (output["phase"][position] - expected["phase"] + 180.0) % 360.0 - 180.0
                         )
                     )
                 ),
@@ -347,9 +384,7 @@ def compare_vector_with_oracle(
                     )
                 )
 
-    metrics = {
-        name: _maximum_error(values, TOLERANCES[name]) for name, values in errors.items()
-    }
+    metrics = {name: _maximum_error(values, TOLERANCES[name]) for name, values in errors.items()}
     if snr_errors:
         metrics["signal_to_noise"] = _maximum_snr_error(snr_errors)
     passed = all(metric["within_tolerance"] for metric in metrics.values())
@@ -359,6 +394,7 @@ def compare_vector_with_oracle(
         "rust_output": str(rust_output.resolve(strict=True)),
         "fixture": str(fixture_path),
         "series": len(output["indices"]),
+        "vertical_mode": output["vertical_mode"],
         "constituents": output["names"],
         "confidence_interval": output["confidence"],
         "confidence_noise": output["confidence_noise"],

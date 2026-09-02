@@ -77,12 +77,13 @@ ranking, and matching scalar reconstruction are available. Reconstruction
 supports arbitrary target times in the core API and an opt-in complete
 original-time series in the FVCOM command.
 Scalar `_FillValue` and `NaN` observations are omitted per series, with shared
-valid-time masks grouped before fitting. Depth-averaged vector currents now use
-the same machinery with a joint `ua`/`va` validity mask and return current
-ellipses, all four linearized or Monte Carlo ellipse confidence intervals, SNR,
-PE, and optional
-eastward/northward reconstruction. The command-line application accepts either
-FVCOM `zeta(time, node)` or `ua(time, nele)` plus `va(time, nele)` and serializes
+valid-time masks grouped before fitting. Depth-averaged and native sigma-layer
+vector currents use the same machinery with a joint `ua`/`va` or `u`/`v`
+validity mask and return current ellipses, all four linearized or Monte Carlo
+ellipse confidence intervals, SNR, PE, and optional eastward/northward
+reconstruction. The command-line application accepts either
+FVCOM `zeta(time, node)`, `ua(time, nele)` plus `va(time, nele)`, or
+`u(time, siglay, nele)` plus `v(time, siglay, nele)` and serializes
 the corresponding analysis, diagnostics, observation counts, per-series
 reference epochs, and optional reconstruction to NetCDF.
 
@@ -91,11 +92,12 @@ the application targets at most 512 MiB of promoted `f64` observation storage
 per chunk, rounds multi-chunk work to the requested worker count, and uses one
 chunk when the selected field already fits. `--chunk-series N` provides an
 explicit reproducibility or memory-control override. Contiguous selections use
-one NetCDF hyperslab per component; arbitrary selections coalesce adjacent
-source indices while preserving requested output order. Chunk-local masks are
+one NetCDF hyperslab per component. Sparse sigma-layer selections coalesce
+nearby elements and traverse classic NetCDF record variables in file order;
+requested layer and element order is still preserved. Chunk-local masks are
 grouped exactly as before, and global Monte Carlo stream offsets make results
 independent of chunk size and worker scheduling. JSON reports and scalar/vector
-NetCDF schemas v15/v11 record the actual chunk count, series count, and maximum
+NetCDF schemas v15/v12 record the actual chunk count, series count, and maximum
 logical observation-buffer bytes.
 
 Cauchy robust fitting is available for scalar and vector analyses, including
@@ -359,8 +361,10 @@ silently reject a fit.
 
 ## FVCOM vector-current analysis
 
-Use `analyze-vector` for FVCOM depth-averaged eastward/northward currents. The
-source schema is `ua(time, nele)`, `va(time, nele)`, and `latc(nele)`. A sample is
+Use `analyze-vector` for FVCOM eastward/northward currents. With no layer option,
+the source schema is depth-averaged `ua(time, nele)`, `va(time, nele)`, and
+`latc(nele)`. Add `--layers all`, `--layers 0,4,9`, or `--layer-count N` to read
+native `u(time, siglay, nele)` and `v(time, siglay, nele)` instead. A sample is
 removed from both components when either is `_FillValue` or `NaN`; this preserves
 a single current ellipse fit on a joint time base.
 
@@ -375,12 +379,30 @@ cargo run --release --bin rutide -- analyze-vector \
   --workers 64
 ```
 
+A depth-resolved example is:
+
+```console
+cargo run --release --bin rutide -- analyze-vector \
+  --input /path/to/fvcom.nc \
+  --output sigma-layer-ellipses.nc \
+  --layers 0,4,9 \
+  --constituents M2,S2,N2,K1,O1 \
+  --workers 64
+```
+
 The output includes semi-major and signed semi-minor axes, inclination, the
 configured phase convention, PE, and—when enabled—the four ellipse CIs and SNR.
 Reconstruction is written as `eastward_reconstruction(time, series)` and
 `northward_reconstruction(time, series)`. Use `--element-count N` or
 `--elements 0,10,20` for subsets. Dynamic constituent selection and reconstruction
 filters behave as in scalar mode.
+
+Sigma-layer output preserves the selected geometry: coefficient and diagnostic
+variables use `(siglay, element[, constituent])`, while reconstruction uses
+`(time, siglay, element)`. `siglay_index` and `element_index` retain the exact
+zero-based requested source order. These are native terrain-following model
+layers, not fixed physical depths; physical depth varies with bathymetry and the
+free surface, so fixed-depth interpolation remains a separate future workflow.
 
 For compatibility, colored two-dimensional linear intervals reproduce the
 pinned Python UTide implementation exactly, including its asymmetric variance

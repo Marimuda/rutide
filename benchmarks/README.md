@@ -64,6 +64,11 @@ uv run --project benchmarks/python --locked \
   --rust-output benchmark-results/rust-vector-correctness-32.nc
 ```
 
+The comparator detects schema-v12 `vertical_mode`. For `sigma-layer` output it
+expands each selected `(siglay, element)` coordinate in layer-major order and
+compares it with the matching `u[:, layer, element]` / `v[:, layer, element]`
+Python UTide fit; depth-averaged output continues to use `ua` / `va`.
+
 Benchmark scalar or vector colored confidence on the shared deterministic
 irregular/gappy fixture with the dedicated Rust and pinned-Python probes:
 

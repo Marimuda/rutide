@@ -2898,8 +2898,14 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         solutions.len(),
         constituents.len(),
         constituent_index_by_rank,
+        &["series"],
     )?;
-    write_sampling_diagnostics(&mut output, solutions.len(), sampling_diagnostics)?;
+    write_sampling_diagnostics(
+        &mut output,
+        solutions.len(),
+        sampling_diagnostics,
+        &["series"],
+    )?;
 
     write_solution_variables(
         &mut output,
@@ -2926,6 +2932,7 @@ fn write_constituent_order_indices(
     series_count: usize,
     constituent_count: usize,
     constituent_index_by_rank: &ConstituentOrderMap,
+    series_dimensions: &[&str],
 ) -> Result<(), AppError> {
     const TARGET_CHUNK_INDICES: usize = 1 << 20;
 
@@ -2934,16 +2941,22 @@ fn write_constituent_order_indices(
             "constituent presentation order is not a complete per-series permutation".to_owned(),
         ));
     }
-    let mut variable = output.add_variable::<i64>(
-        "constituent_index_by_rank",
-        &["series", "presentation_rank"],
-    )?;
+    let depth_element_count = (series_dimensions == ["siglay", "element"])
+        .then(|| output.dimension("element").map(|dimension| dimension.len()))
+        .flatten();
+    let mut dimensions = series_dimensions.to_vec();
+    dimensions.push("presentation_rank");
+    let mut variable = output.add_variable::<i64>("constituent_index_by_rank", &dimensions)?;
     variable.put_attribute(
         "long_name",
         "stable constituent index at each requested presentation rank",
     )?;
     variable.put_attribute("start_index", 0_i64)?;
-    let rows_per_chunk = (TARGET_CHUNK_INDICES / constituent_count.max(1)).max(1);
+    let rows_per_chunk = if let Some(element_count) = depth_element_count {
+        element_count
+    } else {
+        (TARGET_CHUNK_INDICES / constituent_count.max(1)).max(1)
+    };
     let mut indices = Vec::with_capacity(rows_per_chunk.saturating_mul(constituent_count));
     for first_series in (0..series_count).step_by(rows_per_chunk) {
         let end_series = (first_series + rows_per_chunk).min(series_count);
@@ -2953,15 +2966,29 @@ fn write_constituent_order_indices(
                 indices.push(i64::from(index));
             }
         }
-        variable.put_values(&indices, (first_series..end_series, ..))?;
+        if let Some(element_count) = depth_element_count {
+            if end_series - first_series != element_count {
+                return Err(AppError::Invalid(
+                    "sigma-layer constituent-order output is not layer-aligned".to_owned(),
+                ));
+            }
+            variable.put_values(&indices, (first_series / element_count, .., ..))?;
+        } else {
+            variable.put_values(&indices, (first_series..end_series, ..))?;
+        }
     }
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the sampling NetCDF schema is kept together as one auditable transaction"
+)]
 fn write_sampling_diagnostics(
     output: &mut FileMut,
     series_count: usize,
     diagnostics: &[CoreSamplingDiagnostics],
+    series_dimensions: &[&str],
 ) -> Result<(), AppError> {
     if diagnostics.len() != series_count {
         return Err(AppError::Invalid(format!(
@@ -2986,7 +3013,7 @@ fn write_sampling_diagnostics(
         .map(|series| series.record_span_days)
         .collect::<Vec<_>>();
     write_variable(
-        &mut output.add_variable::<f64>("sampling_record_span", &["series"])?,
+        &mut output.add_variable::<f64>("sampling_record_span", series_dimensions)?,
         &record_span_days,
         "days",
     )?;
@@ -2995,7 +3022,7 @@ fn write_sampling_diagnostics(
         .map(|series| series.mean_sample_interval_hours)
         .collect::<Vec<_>>();
     write_variable(
-        &mut output.add_variable::<f64>("sampling_mean_interval", &["series"])?,
+        &mut output.add_variable::<f64>("sampling_mean_interval", series_dimensions)?,
         &mean_interval_hours,
         "hours",
     )?;
@@ -3004,7 +3031,7 @@ fn write_sampling_diagnostics(
         .map(|series| series.largest_gap_hours)
         .collect::<Vec<_>>();
     write_variable(
-        &mut output.add_variable::<f64>("sampling_largest_gap", &["series"])?,
+        &mut output.add_variable::<f64>("sampling_largest_gap", series_dimensions)?,
         &largest_gap_hours,
         "hours",
     )?;
@@ -3016,7 +3043,7 @@ fn write_sampling_diagnostics(
         })
         .collect::<Vec<_>>();
     let mut method_variable =
-        output.add_variable::<i64>("residual_spectrum_method", &["series"])?;
+        output.add_variable::<i64>("residual_spectrum_method", series_dimensions)?;
     method_variable.put_attribute("flag_values", vec![0_i64, 1])?;
     method_variable.put_attribute("flag_meanings", "fft lomb_scargle")?;
     method_variable.put_values(&methods, ..)?;
@@ -3029,7 +3056,7 @@ fn write_sampling_diagnostics(
         })
         .collect::<Result<Vec<_>, _>>()?;
     write_variable(
-        &mut output.add_variable::<i64>("residual_spectrum_time_count", &["series"])?,
+        &mut output.add_variable::<i64>("residual_spectrum_time_count", series_dimensions)?,
         &spectrum_time_count,
         "1",
     )?;
@@ -3056,8 +3083,10 @@ fn write_sampling_diagnostics(
                     .map_err(|_| AppError::Invalid("spectral bin count exceeds i64".to_owned()))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let mut dimensions = series_dimensions.to_vec();
+        dimensions.push("spectral_band");
         write_variable(
-            &mut output.add_variable::<i64>(name, &["series", "spectral_band"])?,
+            &mut output.add_variable::<i64>(name, &dimensions)?,
             &values,
             "1",
         )?;
@@ -3248,7 +3277,7 @@ fn write_robust_variables(
             "1",
         )?;
     }
-    write_robust_schema_metadata(output, &termination)?;
+    write_robust_schema_metadata(output, &termination, &["series"])?;
     for (name, values, units) in [
         (
             "robust_residual_scale",
@@ -3293,12 +3322,16 @@ const fn robust_termination_code(termination: RobustTermination) -> i64 {
     }
 }
 
-fn write_robust_schema_metadata(output: &mut FileMut, termination: &[i64]) -> Result<(), AppError> {
+fn write_robust_schema_metadata(
+    output: &mut FileMut,
+    termination: &[i64],
+    series_dimensions: &[&str],
+) -> Result<(), AppError> {
     output
         .variable_mut("robust_weight_row_size")
         .ok_or_else(|| AppError::Invalid("robust row-size variable was not created".to_owned()))?
         .put_attribute("sample_dimension", "robust_observation")?;
-    let mut variable = output.add_variable::<i64>("robust_termination", &["series"])?;
+    let mut variable = output.add_variable::<i64>("robust_termination", series_dimensions)?;
     write_variable(&mut variable, termination, "1")?;
     variable.put_attribute("flag_values", vec![0_i64, 1, 2])?;
     variable.put_attribute("flag_meanings", "tolerance objective_increase exact_fit")?;
@@ -3679,7 +3712,7 @@ mod tests {
         dataset
             .add_dimension("spectral_band", 9)
             .expect("add spectral bands");
-        write_sampling_diagnostics(&mut dataset, 2, &diagnostics)
+        write_sampling_diagnostics(&mut dataset, 2, &diagnostics, &["series"])
             .expect("write sampling diagnostics");
         dataset.close().expect("close sampling output");
         let dataset = netcdf::open(&path).expect("open sampling output");

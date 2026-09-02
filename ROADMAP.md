@@ -264,7 +264,14 @@ combinations must be rejected during validation rather than partially applied.
 
 ## 6. Product and resource work — planned
 
-- Add depth-resolved FVCOM current variables after defining their output schema.
+- Native depth-resolved FVCOM currents are complete. Explicit `siglay` selections
+  read `u(time, siglay, nele)` / `v(time, siglay, nele)` in bounded chunks,
+  preserve requested layer-element order, apply joint missing masks, and write
+  `(siglay, element[, constituent])` coefficient and diagnostic arrays plus
+  `(time, siglay, element)` reconstruction. Sparse classic-NetCDF reads traverse
+  records in storage order, and a 96-series, three-layer real-FVCOM comparison
+  passes the pinned Python UTide oracle. Fixed-physical-depth interpolation is
+  intentionally separate from native terrain-following layers.
 - Stabilize the Rust library and NetCDF schemas, then add Python bindings only if
   a drop-in or mixed Python/Rust workflow is an actual user requirement.
 - Publish reproducible release artifacts, compatibility documentation, and a
@@ -275,8 +282,12 @@ budget reduced the 64-worker vector peak RSS from 2.23 GiB to 0.94 GiB with a
 9.5% median wall-time cost and identical whole-field digests; see
 `benchmarks/results/spatial-chunking-2026-09-02.md`. Compact coefficient and
 diagnostic results remain resident for a single high-throughput NetCDF output
-transaction. An incremental result sink is therefore optional future work for
-fields whose result arrays, rather than source observations, become material.
+transaction. The complete ten-layer, 1,448,600-series OLS fixture remained at
+2.35 GiB peak RSS with a fixed 512 MiB observation bound; see
+`benchmarks/results/depth-resolved-fvcom-2026-09-02.md`. An incremental result
+sink therefore remains a targeted optimization for result-rich all-layer
+confidence, robust-diagnostic, or reconstruction workflows rather than a base
+OLS prerequisite.
 
 ## Definition of broad compatibility
 

@@ -34,9 +34,9 @@ use super::{
     write_robust_schema_metadata, write_sampling_diagnostics, write_variable,
 };
 
-const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 11;
+const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 12;
 
-/// Configuration for one depth-averaged FVCOM current analysis.
+/// Configuration for one depth-averaged or native sigma-layer FVCOM current analysis.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VectorAnalyzeConfig {
     /// Read-only source FVCOM `NetCDF` path.
@@ -47,6 +47,8 @@ pub struct VectorAnalyzeConfig {
     pub report: Option<PathBuf>,
     /// Element subset to analyze.
     pub elements: NodeSelection,
+    /// Native FVCOM sigma layers to analyze, or `None` for depth-averaged `ua`/`va`.
+    pub layers: Option<NodeSelection>,
     /// Explicit or record-length-based constituent selection.
     pub constituent_selection: ConstituentSelection,
     /// Per-series constituent presentation ranking.
@@ -78,6 +80,9 @@ pub struct VectorAnalyzeConfig {
 pub struct VectorSampleResult {
     /// Original zero-based FVCOM element index.
     pub element_index: usize,
+    /// Original zero-based FVCOM sigma-layer index for depth-resolved currents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer_index: Option<usize>,
     /// Element-center latitude in degrees north.
     pub latitude_degrees_north: f64,
     /// Semi-major axes in constituent order.
@@ -150,11 +155,18 @@ pub struct VectorRunReport {
     pub source_time_count: usize,
     /// Number of missing source timestamps and corresponding rows discarded.
     pub discarded_timestamp_count: usize,
-    /// Number of analyzed elements.
+    /// Number of analyzed current series (`elements × selected layers`).
     pub series_count: usize,
-    /// Number of elements with at least one missing component sample.
+    /// Number of distinct selected FVCOM elements.
+    pub element_count: usize,
+    /// Vertical source mode: `depth-averaged` or `sigma-layer`.
+    pub vertical_mode: &'static str,
+    /// Selected zero-based native sigma-layer indices for depth-resolved currents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer_indices: Option<Vec<usize>>,
+    /// Number of current series with at least one missing component sample.
     pub series_with_missing_observations: usize,
-    /// Aggregate temporal and spectral coverage across fitted elements.
+    /// Aggregate temporal and spectral coverage across fitted current series.
     pub sampling: SamplingSummary,
     /// Number of outer spatial workers.
     pub workers: usize,
@@ -216,6 +228,7 @@ struct VectorInputData {
     source_time_count: usize,
     discarded_timestamp_count: usize,
     element_indices: Vec<usize>,
+    layer_indices: Option<Vec<usize>>,
     latitudes: Vec<f64>,
     #[cfg(test)]
     eastward: Vec<f64>,
@@ -232,6 +245,7 @@ struct VectorInputMetadata {
     source_time_count: usize,
     discarded_timestamp_count: usize,
     element_indices: Vec<usize>,
+    layer_indices: Option<Vec<usize>>,
     latitudes: Vec<f64>,
     eastward_fill: Option<f32>,
     northward_fill: Option<f32>,
@@ -243,6 +257,56 @@ struct VectorInputChunk {
     eastward: Vec<f64>,
     northward: Vec<f64>,
     observation_counts: Vec<usize>,
+}
+
+impl VectorInputData {
+    fn series_count(&self) -> usize {
+        self.element_indices.len() * self.layer_indices.as_ref().map_or(1, Vec::len)
+    }
+
+    fn series_coordinates(&self, series: usize) -> (Option<usize>, usize, f64) {
+        let element_position = series % self.element_indices.len();
+        let layer_index = self
+            .layer_indices
+            .as_ref()
+            .map(|layers| layers[series / self.element_indices.len()]);
+        (
+            layer_index,
+            self.element_indices[element_position],
+            self.latitudes[element_position],
+        )
+    }
+
+    fn is_depth_resolved(&self) -> bool {
+        self.layer_indices.is_some()
+    }
+
+    fn series_dimensions(&self) -> &'static [&'static str] {
+        if self.is_depth_resolved() {
+            &["siglay", "element"]
+        } else {
+            &["series"]
+        }
+    }
+
+    fn solution_dimensions(&self) -> Vec<&'static str> {
+        let mut dimensions = self.series_dimensions().to_vec();
+        dimensions.push("constituent");
+        dimensions
+    }
+}
+
+impl VectorInputMetadata {
+    fn series_count(&self) -> usize {
+        self.element_indices.len() * self.layer_indices.as_ref().map_or(1, Vec::len)
+    }
+
+    fn chunk_latitudes(&self, series_range: std::ops::Range<usize>) -> Vec<f64> {
+        let element_count = self.element_indices.len();
+        series_range
+            .map(|series| self.latitudes[series % element_count])
+            .collect()
+    }
 }
 
 enum VectorAnalysisBatch {
@@ -327,7 +391,7 @@ impl VectorAnalysisBatch {
     }
 }
 
-/// Analyze FVCOM `ua(time, nele)` and `va(time, nele)` currents.
+/// Analyze depth-averaged or native sigma-layer FVCOM currents.
 ///
 /// A time sample is omitted from both components when either source component
 /// is missing. Infinities remain hard input errors.
@@ -347,7 +411,12 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
 
     let input_start = Instant::now();
     let dataset = netcdf::open(&config.input)?;
-    let metadata = read_fvcom_vector_metadata(&config.input, &dataset, &config.elements)?;
+    let metadata = read_fvcom_vector_metadata(
+        &config.input,
+        &dataset,
+        &config.elements,
+        config.layers.as_ref(),
+    )?;
     let mut input_seconds = input_start.elapsed().as_secs_f64();
 
     let preparation_start = Instant::now();
@@ -369,7 +438,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
     }
     let chunk_plan = spatial_chunk_plan(
         config.chunk_series,
-        metadata.element_indices.len(),
+        metadata.series_count(),
         metadata.source_time_count,
         2,
         config.workers,
@@ -386,7 +455,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
     let worker_pool = ThreadPoolBuilder::new()
         .num_threads(config.workers)
         .build()?;
-    let series_count = metadata.element_indices.len();
+    let series_count = metadata.series_count();
     let mut solutions = Vec::with_capacity(series_count);
     let mut series_frequency_cph = Vec::with_capacity(series_count);
     let mut sampling_diagnostics = Vec::with_capacity(series_count);
@@ -403,7 +472,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         let read_start = Instant::now();
         let chunk = read_fvcom_vector_chunk(&dataset, &metadata, first_series..end_series)?;
         input_seconds += read_start.elapsed().as_secs_f64();
-        let latitudes = &metadata.latitudes[first_series..end_series];
+        let latitudes = metadata.chunk_latitudes(first_series..end_series);
 
         let solve_start = Instant::now();
         let chunk_solutions = solve_vector_input(
@@ -411,7 +480,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             &batch,
             &chunk.eastward,
             &chunk.northward,
-            latitudes,
+            &latitudes,
             first_series,
             config.analysis_method,
             config.confidence_interval,
@@ -427,7 +496,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             values.extend(worker_pool.install(|| {
                 reconstructor.reconstruct_many_vectors_series_major(
                     &chunk_solutions,
-                    latitudes,
+                    &latitudes,
                     filter,
                 )
             })?);
@@ -468,6 +537,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         source_time_count: metadata.source_time_count,
         discarded_timestamp_count: metadata.discarded_timestamp_count,
         element_indices: metadata.element_indices,
+        layer_indices: metadata.layer_indices,
         latitudes: metadata.latitudes,
         #[cfg(test)]
         eastward: Vec::new(),
@@ -487,8 +557,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         &solutions,
     )?;
     let result_sha256 = vector_result_digest(
-        &input.element_indices,
-        &input.latitudes,
+        &input,
         batch.constituents(),
         &series_frequency_cph,
         &solutions,
@@ -559,6 +628,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         rutide_version: rutide_core::VERSION,
         profile: vector_profile(
             &selection,
+            input.is_depth_resolved(),
             config.analysis_method,
             config.inference.is_some(),
             config.fit_options,
@@ -574,7 +644,14 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         time_count: input.modified_julian_days.len(),
         source_time_count: input.source_time_count,
         discarded_timestamp_count: input.discarded_timestamp_count,
-        series_count: input.element_indices.len(),
+        series_count: input.series_count(),
+        element_count: input.element_indices.len(),
+        vertical_mode: if input.is_depth_resolved() {
+            "sigma-layer"
+        } else {
+            "depth-averaged"
+        },
+        layer_indices: input.layer_indices.clone(),
         series_with_missing_observations: input
             .observation_counts
             .iter()
@@ -777,8 +854,13 @@ fn validate_vector_config(config: &VectorAnalyzeConfig) -> Result<(), AppError> 
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the profile name encodes each independent public analysis option"
+)]
 fn vector_profile(
     selection: &ResolvedConstituentSelection,
+    depth_resolved: bool,
     analysis_method: AnalysisMethod,
     inferred: bool,
     fit_options: FitOptions,
@@ -794,8 +876,13 @@ fn vector_profile(
     let inference = if inferred { "inference-" } else { "" };
     let ordering = order_profile_suffix(constituent_order);
     let trend = if fit_options.trend { "" } else { "-no-trend" };
+    let vertical = if depth_resolved {
+        "sigma-layer-vector"
+    } else {
+        "vector"
+    };
     format!(
-        "{selection}-{}-{}-vector-{inference}{}{ordering}{trend}",
+        "{selection}-{}-{}-{vertical}-{inference}{}{ordering}{trend}",
         phase_reference.name(),
         nodal_profile_component(nodal_corrections),
         analysis_method.name(),
@@ -805,13 +892,14 @@ fn vector_profile(
 #[cfg(test)]
 fn read_fvcom_vector(path: &Path, selection: &NodeSelection) -> Result<VectorInputData, AppError> {
     let dataset = netcdf::open(path)?;
-    let metadata = read_fvcom_vector_metadata(path, &dataset, selection)?;
-    let chunk = read_fvcom_vector_chunk(&dataset, &metadata, 0..metadata.element_indices.len())?;
+    let metadata = read_fvcom_vector_metadata(path, &dataset, selection, None)?;
+    let chunk = read_fvcom_vector_chunk(&dataset, &metadata, 0..metadata.series_count())?;
     Ok(VectorInputData {
         modified_julian_days: metadata.modified_julian_days,
         source_time_count: metadata.source_time_count,
         discarded_timestamp_count: metadata.discarded_timestamp_count,
         element_indices: metadata.element_indices,
+        layer_indices: metadata.layer_indices,
         latitudes: metadata.latitudes,
         #[cfg(test)]
         eastward: chunk.eastward,
@@ -827,20 +915,53 @@ fn read_fvcom_vector_metadata(
     path: &Path,
     dataset: &netcdf::File,
     selection: &NodeSelection,
+    layer_selection: Option<&NodeSelection>,
 ) -> Result<VectorInputMetadata, AppError> {
     let input_file_bytes = fs::metadata(path)?.len();
     let time_count = required_dimension_length(dataset, "time")?;
     let element_count = required_dimension_length(dataset, "nele")?;
     let element_indices = resolve_element_selection(selection, element_count)?;
-    let series_count = element_indices.len();
+    let layer_indices = layer_selection
+        .map(|selection| {
+            let layer_count = required_dimension_length(dataset, "siglay")?;
+            resolve_layer_selection(selection, layer_count)
+        })
+        .transpose()?;
+    let series_count = element_indices
+        .len()
+        .checked_mul(layer_indices.as_ref().map_or(1, Vec::len))
+        .ok_or_else(|| AppError::Invalid("vector series count exceeds usize".to_owned()))?;
 
     let (time_axis, time_element_bytes) = read_fvcom_time_axis(dataset, time_count)?;
 
     let latitude_variable = required_variable(dataset, "latc")?;
     validate_dimensions(&latitude_variable, &[("nele", element_count)])?;
     let latitude_fill = latitude_variable.fill_value::<f32>()?;
-    let eastward_variable = required_vector_variable(dataset, "ua", time_count, element_count)?;
-    let northward_variable = required_vector_variable(dataset, "va", time_count, element_count)?;
+    let (eastward_name, northward_name) = if layer_indices.is_some() {
+        ("u", "v")
+    } else {
+        ("ua", "va")
+    };
+    let eastward_variable = required_vector_variable(
+        dataset,
+        eastward_name,
+        time_count,
+        layer_indices
+            .as_ref()
+            .map(|_| required_dimension_length(dataset, "siglay"))
+            .transpose()?,
+        element_count,
+    )?;
+    let northward_variable = required_vector_variable(
+        dataset,
+        northward_name,
+        time_count,
+        layer_indices
+            .as_ref()
+            .map(|_| required_dimension_length(dataset, "siglay"))
+            .transpose()?,
+        element_count,
+    )?;
     let eastward_fill = eastward_variable.fill_value::<f32>()?;
     let northward_fill = northward_variable.fill_value::<f32>()?;
 
@@ -868,6 +989,7 @@ fn read_fvcom_vector_metadata(
         source_time_count,
         discarded_timestamp_count,
         element_indices,
+        layer_indices,
         latitudes: latitude_values,
         eastward_fill,
         northward_fill,
@@ -881,26 +1003,52 @@ fn read_fvcom_vector_chunk(
     metadata: &VectorInputMetadata,
     series_range: std::ops::Range<usize>,
 ) -> Result<VectorInputChunk, AppError> {
-    let element_indices = metadata
-        .element_indices
-        .get(series_range.clone())
-        .ok_or_else(|| {
-            AppError::Invalid("vector chunk range exceeds selected element count".to_owned())
-        })?;
-    let series_count = element_indices.len();
+    if series_range.end > metadata.series_count() {
+        return Err(AppError::Invalid(
+            "vector chunk range exceeds selected series count".to_owned(),
+        ));
+    }
+    let series_count = series_range.len();
     if series_count == 0 {
         return Err(AppError::Invalid("vector input chunk is empty".to_owned()));
     }
-    let mut eastward = read_selected_time_major(
-        &required_variable(dataset, "ua")?,
-        metadata.source_time_count,
-        element_indices,
-    )?;
-    let mut northward = read_selected_time_major(
-        &required_variable(dataset, "va")?,
-        metadata.source_time_count,
-        element_indices,
-    )?;
+    let (mut eastward, mut northward, eastward_name, northward_name) =
+        if let Some(layer_indices) = &metadata.layer_indices {
+            (
+                read_selected_layer_element_time_major(
+                    &required_variable(dataset, "u")?,
+                    metadata.source_time_count,
+                    layer_indices,
+                    &metadata.element_indices,
+                    series_range.clone(),
+                )?,
+                read_selected_layer_element_time_major(
+                    &required_variable(dataset, "v")?,
+                    metadata.source_time_count,
+                    layer_indices,
+                    &metadata.element_indices,
+                    series_range.clone(),
+                )?,
+                "u",
+                "v",
+            )
+        } else {
+            let element_indices = &metadata.element_indices[series_range.clone()];
+            (
+                read_selected_time_major(
+                    &required_variable(dataset, "ua")?,
+                    metadata.source_time_count,
+                    element_indices,
+                )?,
+                read_selected_time_major(
+                    &required_variable(dataset, "va")?,
+                    metadata.source_time_count,
+                    element_indices,
+                )?,
+                "ua",
+                "va",
+            )
+        };
     eastward = retain_time_major_rows(
         eastward,
         metadata.source_time_count,
@@ -918,14 +1066,14 @@ fn read_fvcom_vector_chunk(
         let series = index % series_count;
         let time = index / series_count;
         eastward[index] = normalize_source_observation(
-            "ua",
+            eastward_name,
             eastward[index],
             metadata.eastward_fill,
             series_range.start + series,
             time,
         )?;
         northward[index] = normalize_source_observation(
-            "va",
+            northward_name,
             northward[index],
             metadata.northward_fill,
             series_range.start + series,
@@ -945,14 +1093,136 @@ fn read_fvcom_vector_chunk(
     })
 }
 
+fn read_selected_layer_element_time_major(
+    variable: &Variable<'_>,
+    time_count: usize,
+    layer_indices: &[usize],
+    element_indices: &[usize],
+    series_range: std::ops::Range<usize>,
+) -> Result<Vec<f64>, AppError> {
+    const MAX_COALESCED_ELEMENT_GAP: usize = 4096;
+
+    struct ReadRun {
+        layer: usize,
+        source_start: usize,
+        source_end: usize,
+        selections: Vec<(usize, usize)>,
+    }
+
+    let element_count = element_indices.len();
+    let series_count = series_range.len();
+    let total_series = element_count
+        .checked_mul(layer_indices.len())
+        .ok_or_else(|| AppError::Invalid("depth-resolved series count exceeds usize".to_owned()))?;
+    if series_count == 0 || series_range.end > total_series {
+        return Err(AppError::Invalid(
+            "depth-resolved vector chunk range is empty or out of bounds".to_owned(),
+        ));
+    }
+    let value_count = time_count
+        .checked_mul(series_count)
+        .ok_or_else(|| AppError::Invalid("observation chunk shape exceeds usize".to_owned()))?;
+    let mut values = vec![0.0; value_count];
+    let mut pieces = Vec::new();
+    let mut logical_series = series_range.start;
+    while logical_series < series_range.end {
+        let layer_position = logical_series / element_count;
+        let first_element_position = logical_series % element_count;
+        let layer_remainder = element_count - first_element_position;
+        let piece_length = layer_remainder.min(series_range.end - logical_series);
+        let selected =
+            &element_indices[first_element_position..first_element_position + piece_length];
+        let destination_piece = logical_series - series_range.start;
+        pieces.push((layer_indices[layer_position], selected, destination_piece));
+        logical_series += piece_length;
+    }
+    if pieces
+        .iter()
+        .all(|(_, selected, _)| selected.windows(2).all(|pair| pair[1] == pair[0] + 1))
+    {
+        for (layer, selected, destination_piece) in pieces {
+            let source = variable.get_values::<f64, _>((
+                ..,
+                layer..layer + 1,
+                selected[0]..selected[selected.len() - 1] + 1,
+            ))?;
+            for time in 0..time_count {
+                let source_start = time * selected.len();
+                let destination_start = time * series_count + destination_piece;
+                values[destination_start..destination_start + selected.len()]
+                    .copy_from_slice(&source[source_start..source_start + selected.len()]);
+            }
+        }
+        return Ok(values);
+    }
+
+    let mut runs = Vec::new();
+    for (layer, selected, destination_piece) in pieces {
+        let mut ordered = selected
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(position, source)| (source, destination_piece + position))
+            .collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|&(source, _)| source);
+        let mut first = 0;
+        while first < ordered.len() {
+            let mut end = first + 1;
+            while end < ordered.len()
+                && ordered[end].0 - ordered[end - 1].0 <= MAX_COALESCED_ELEMENT_GAP
+            {
+                end += 1;
+            }
+            let source_start = ordered[first].0;
+            let source_end = ordered[end - 1].0 + 1;
+            runs.push(ReadRun {
+                layer,
+                source_start,
+                source_end,
+                selections: ordered[first..end]
+                    .iter()
+                    .map(|&(source, destination)| (source - source_start, destination))
+                    .collect(),
+            });
+            first = end;
+        }
+    }
+    runs.sort_unstable_by_key(|run| (run.layer, run.source_start));
+    for time in 0..time_count {
+        for run in &runs {
+            let source = variable.get_values::<f64, _>((
+                time..time + 1,
+                run.layer..run.layer + 1,
+                run.source_start..run.source_end,
+            ))?;
+            for &(source_position, destination_series) in &run.selections {
+                values[time * series_count + destination_series] = source[source_position];
+            }
+        }
+    }
+    Ok(values)
+}
+
 fn required_vector_variable<'dataset>(
     dataset: &'dataset netcdf::File,
     name: &str,
     time_count: usize,
+    layer_count: Option<usize>,
     element_count: usize,
 ) -> Result<Variable<'dataset>, AppError> {
     let variable = required_variable(dataset, name)?;
-    validate_dimensions(&variable, &[("time", time_count), ("nele", element_count)])?;
+    if let Some(layer_count) = layer_count {
+        validate_dimensions(
+            &variable,
+            &[
+                ("time", time_count),
+                ("siglay", layer_count),
+                ("nele", element_count),
+            ],
+        )?;
+    } else {
+        validate_dimensions(&variable, &[("time", time_count), ("nele", element_count)])?;
+    }
     Ok(variable)
 }
 
@@ -991,6 +1261,49 @@ fn resolve_element_selection(
                 if !unique.insert(index) {
                     return Err(AppError::Invalid(format!(
                         "element index {index} appears more than once"
+                    )));
+                }
+            }
+            Ok(indices.clone())
+        }
+    }
+}
+
+fn resolve_layer_selection(
+    selection: &NodeSelection,
+    layer_count: usize,
+) -> Result<Vec<usize>, AppError> {
+    if layer_count == 0 {
+        return Err(AppError::Invalid(
+            "source siglay dimension must not be empty".to_owned(),
+        ));
+    }
+    match selection {
+        NodeSelection::All => Ok((0..layer_count).collect()),
+        NodeSelection::Prefix(count) => {
+            if *count == 0 || *count > layer_count {
+                return Err(AppError::Invalid(format!(
+                    "layer prefix must be between 1 and {layer_count}, received {count}"
+                )));
+            }
+            Ok((0..*count).collect())
+        }
+        NodeSelection::Indices(indices) => {
+            if indices.is_empty() {
+                return Err(AppError::Invalid(
+                    "explicit layer selection must not be empty".to_owned(),
+                ));
+            }
+            let mut unique = BTreeSet::new();
+            for index in indices.iter().copied() {
+                if index >= layer_count {
+                    return Err(AppError::Invalid(format!(
+                        "layer index {index} is outside source layer count {layer_count}"
+                    )));
+                }
+                if !unique.insert(index) {
+                    return Err(AppError::Invalid(format!(
+                        "layer index {index} appears more than once"
                     )));
                 }
             }
@@ -1078,8 +1391,7 @@ fn vector_confidence_values(
     reason = "the canonical digest keeps every result-shaping input explicit"
 )]
 fn vector_result_digest(
-    element_indices: &[usize],
-    latitudes: &[f64],
+    input: &VectorInputData,
     constituents: &[Constituent],
     series_frequency_cph: &[Vec<f64>],
     solutions: &[VectorSolution],
@@ -1095,7 +1407,11 @@ fn vector_result_digest(
     reconstruction: Option<(&ReconstructionFilter, &[VectorReconstruction])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-vector-sampling-v10\0");
+    if input.is_depth_resolved() {
+        digest.update(b"rutide-vector-sampling-v12\0");
+    } else {
+        digest.update(b"rutide-vector-sampling-v10\0");
+    }
     digest.update([u8::from(fit_options.trend)]);
     digest.update(phase_reference.name().as_bytes());
     digest.update([0]);
@@ -1135,13 +1451,17 @@ fn vector_result_digest(
         digest.update(constituent.name.as_bytes());
         digest.update([0]);
     }
-    for (((element_index, latitude), frequency_cph), solution) in element_indices
-        .iter()
-        .copied()
-        .zip(latitudes.iter().copied())
-        .zip(series_frequency_cph)
-        .zip(solutions)
+    for (series, (frequency_cph, solution)) in
+        series_frequency_cph.iter().zip(solutions).enumerate()
     {
+        let (layer_index, element_index, latitude) = input.series_coordinates(series);
+        if let Some(layer) = layer_index {
+            digest.update(
+                u64::try_from(layer)
+                    .map_err(|_| AppError::Invalid("layer index exceeds u64".to_owned()))?
+                    .to_le_bytes(),
+            );
+        }
         digest.update(
             u64::try_from(element_index)
                 .map_err(|_| AppError::Invalid("element index exceeds u64".to_owned()))?
@@ -1215,45 +1535,44 @@ fn retained_vector_samples(
     sampling_diagnostics: &[CoreSamplingDiagnostics],
 ) -> Vec<VectorSampleResult> {
     input
-        .element_indices
+        .observation_counts
         .iter()
         .copied()
-        .zip(input.latitudes.iter().copied())
-        .zip(input.observation_counts.iter().copied())
         .zip(solutions)
         .enumerate()
         .take(3)
-        .map(
-            |(series, (((element_index, latitude_degrees_north), observation_count), solution))| {
-                VectorSampleResult {
-                    element_index,
-                    latitude_degrees_north,
-                    semi_major: solution.semi_major.clone(),
-                    semi_minor: solution.semi_minor.clone(),
-                    inclination_degrees: solution.inclination_degrees.clone(),
-                    phase_degrees: solution.phase_degrees.clone(),
-                    percent_energy: solution.percent_energy.clone(),
-                    constituent_index_by_rank: constituent_index_by_rank
-                        .row(series)
-                        .iter()
-                        .copied()
-                        .map(usize::from)
-                        .collect(),
-                    semi_major_ci: solution.semi_major_ci.clone(),
-                    semi_minor_ci: solution.semi_minor_ci.clone(),
-                    inclination_ci_degrees: solution.inclination_ci_degrees.clone(),
-                    phase_ci_degrees: solution.phase_ci_degrees.clone(),
-                    signal_to_noise: solution.signal_to_noise.clone(),
-                    eastward_mean: solution.eastward_mean,
-                    northward_mean: solution.northward_mean,
-                    eastward_slope_per_day: solution.eastward_slope_per_day,
-                    northward_slope_per_day: solution.northward_slope_per_day,
-                    observation_count,
-                    sampling: SeriesSamplingDiagnostics::from(&sampling_diagnostics[series]),
-                    reference_time_modified_julian_day: solution.reference_time_days,
-                }
-            },
-        )
+        .map(|(series, (observation_count, solution))| {
+            let (layer_index, element_index, latitude_degrees_north) =
+                input.series_coordinates(series);
+            VectorSampleResult {
+                element_index,
+                layer_index,
+                latitude_degrees_north,
+                semi_major: solution.semi_major.clone(),
+                semi_minor: solution.semi_minor.clone(),
+                inclination_degrees: solution.inclination_degrees.clone(),
+                phase_degrees: solution.phase_degrees.clone(),
+                percent_energy: solution.percent_energy.clone(),
+                constituent_index_by_rank: constituent_index_by_rank
+                    .row(series)
+                    .iter()
+                    .copied()
+                    .map(usize::from)
+                    .collect(),
+                semi_major_ci: solution.semi_major_ci.clone(),
+                semi_minor_ci: solution.semi_minor_ci.clone(),
+                inclination_ci_degrees: solution.inclination_ci_degrees.clone(),
+                phase_ci_degrees: solution.phase_ci_degrees.clone(),
+                signal_to_noise: solution.signal_to_noise.clone(),
+                eastward_mean: solution.eastward_mean,
+                northward_mean: solution.northward_mean,
+                eastward_slope_per_day: solution.eastward_slope_per_day,
+                northward_slope_per_day: solution.northward_slope_per_day,
+                observation_count,
+                sampling: SeriesSamplingDiagnostics::from(&sampling_diagnostics[series]),
+                reference_time_modified_julian_day: solution.reference_time_days,
+            }
+        })
         .collect()
 }
 
@@ -1303,7 +1622,12 @@ fn write_vector_output(
 fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<(), AppError> {
     let input = data.input;
     let mut output = netcdf::create(path)?;
-    output.add_dimension("series", input.element_indices.len())?;
+    if let Some(layers) = &input.layer_indices {
+        output.add_dimension("siglay", layers.len())?;
+        output.add_dimension("element", input.element_indices.len())?;
+    } else {
+        output.add_dimension("series", input.element_indices.len())?;
+    }
     output.add_dimension("constituent", data.constituents.len())?;
     output.add_dimension("presentation_rank", data.constituents.len())?;
     output.add_dimension(
@@ -1313,7 +1637,14 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
     if data.reconstruction.is_some() {
         output.add_dimension("time", input.modified_julian_days.len())?;
     }
-    output.add_attribute("title", "RUTide depth-averaged current ellipses")?;
+    output.add_attribute(
+        "title",
+        if input.is_depth_resolved() {
+            "RUTide native sigma-layer current ellipses"
+        } else {
+            "RUTide depth-averaged current ellipses"
+        },
+    )?;
     output.add_attribute(
         "rutide_schema_version",
         i64::from(VECTOR_OUTPUT_SCHEMA_VERSION),
@@ -1346,6 +1677,7 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
     )?;
     let profile = vector_profile(
         data.selection,
+        input.is_depth_resolved(),
         data.analysis_method,
         data.inference.is_some(),
         data.fit_options,
@@ -1371,8 +1703,29 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
                 .map_err(|_| AppError::Invalid("robust iteration limit exceeds i64".to_owned()))?,
         )?;
     }
-    output.add_attribute("source_eastward_variable", "ua")?;
-    output.add_attribute("source_northward_variable", "va")?;
+    output.add_attribute(
+        "vertical_mode",
+        if input.is_depth_resolved() {
+            "sigma-layer"
+        } else {
+            "depth-averaged"
+        },
+    )?;
+    output.add_attribute(
+        "source_eastward_variable",
+        if input.is_depth_resolved() { "u" } else { "ua" },
+    )?;
+    output.add_attribute(
+        "source_northward_variable",
+        if input.is_depth_resolved() { "v" } else { "va" },
+    )?;
+    if input.is_depth_resolved() {
+        output.add_attribute("source_vertical_dimension", "siglay")?;
+        output.add_attribute(
+            "vertical_coordinate_note",
+            "native FVCOM layer indices; physical depth varies with bathymetry and free surface",
+        )?;
+    }
     output.add_attribute("confidence_interval", data.confidence_interval.method())?;
     if let Some(noise) = data.confidence_interval.noise() {
         output.add_attribute("confidence_noise", noise)?;
@@ -1424,16 +1777,36 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
                 .map_err(|_| AppError::Invalid("element index exceeds i64".to_owned()))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let coordinate_dimension = if input.is_depth_resolved() {
+        "element"
+    } else {
+        "series"
+    };
     write_variable(
-        &mut output.add_variable::<i64>("element_index", &["series"])?,
+        &mut output.add_variable::<i64>("element_index", &[coordinate_dimension])?,
         &element_indices,
         "1",
     )?;
     write_variable(
-        &mut output.add_variable::<f64>("latitude", &["series"])?,
+        &mut output.add_variable::<f64>("latitude", &[coordinate_dimension])?,
         &input.latitudes,
         "degrees_north",
     )?;
+    if let Some(layers) = &input.layer_indices {
+        let layers = layers
+            .iter()
+            .copied()
+            .map(|index| {
+                i64::try_from(index)
+                    .map_err(|_| AppError::Invalid("layer index exceeds i64".to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        write_variable(
+            &mut output.add_variable::<i64>("siglay_index", &["siglay"])?,
+            &layers,
+            "1",
+        )?;
+    }
     let observation_counts = input
         .observation_counts
         .iter()
@@ -1444,7 +1817,7 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
         })
         .collect::<Result<Vec<_>, _>>()?;
     write_variable(
-        &mut output.add_variable::<i64>("observation_count", &["series"])?,
+        &mut output.add_variable::<i64>("observation_count", input.series_dimensions())?,
         &observation_counts,
         "1",
     )?;
@@ -1454,7 +1827,7 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
         .map(|solution| solution.reference_time_days)
         .collect::<Vec<_>>();
     write_variable(
-        &mut output.add_variable::<f64>("reference_time", &["series"])?,
+        &mut output.add_variable::<f64>("reference_time", input.series_dimensions())?,
         &reference_times,
         "days since 1858-11-17 00:00:00 UTC",
     )?;
@@ -1469,7 +1842,7 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
         ));
     }
     write_variable(
-        &mut output.add_variable::<f64>("frequency", &["series", "constituent"])?,
+        &mut output.add_variable::<f64>("frequency", &input.solution_dimensions())?,
         &data
             .series_frequency_cph
             .iter()
@@ -1483,14 +1856,21 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
         data.solutions.len(),
         data.constituents.len(),
         data.constituent_index_by_rank,
+        input.series_dimensions(),
     )?;
-    write_sampling_diagnostics(&mut output, data.solutions.len(), data.sampling_diagnostics)?;
+    write_sampling_diagnostics(
+        &mut output,
+        data.solutions.len(),
+        data.sampling_diagnostics,
+        input.series_dimensions(),
+    )?;
     write_vector_solution_variables(
         &mut output,
         data.constituents.len(),
         data.solutions,
         data.analysis_method,
         data.confidence_interval,
+        input.series_dimensions(),
     )?;
     if let Some((filter, values)) = data.reconstruction {
         write_vector_reconstruction_variables(&mut output, input, filter, values)?;
@@ -1505,6 +1885,7 @@ fn write_vector_solution_variables(
     solutions: &[VectorSolution],
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
+    series_dimensions: &[&str],
 ) -> Result<(), AppError> {
     let capacity = solutions.len() * constituent_count;
     let mut semi_major = Vec::with_capacity(capacity);
@@ -1550,8 +1931,10 @@ fn write_vector_solution_variables(
         ("phase", &phase, "degrees"),
         ("percent_energy", &percent_energy, "percent"),
     ] {
+        let mut dimensions = series_dimensions.to_vec();
+        dimensions.push("constituent");
         write_variable(
-            &mut output.add_variable::<f64>(name, &["series", "constituent"])?,
+            &mut output.add_variable::<f64>(name, &dimensions)?,
             values,
             units,
         )?;
@@ -1564,8 +1947,10 @@ fn write_vector_solution_variables(
             ("phase_ci", &phase_ci, "degrees"),
             ("signal_to_noise", &signal_to_noise, "1"),
         ] {
+            let mut dimensions = series_dimensions.to_vec();
+            dimensions.push("constituent");
             write_variable(
-                &mut output.add_variable::<f64>(name, &["series", "constituent"])?,
+                &mut output.add_variable::<f64>(name, &dimensions)?,
                 values,
                 units,
             )?;
@@ -1586,12 +1971,12 @@ fn write_vector_solution_variables(
         ),
     ] {
         write_variable(
-            &mut output.add_variable::<f64>(name, &["series"])?,
+            &mut output.add_variable::<f64>(name, series_dimensions)?,
             values,
             units,
         )?;
     }
-    write_vector_robust_variables(output, solutions, analysis_method)?;
+    write_vector_robust_variables(output, solutions, analysis_method, series_dimensions)?;
     Ok(())
 }
 
@@ -1599,6 +1984,7 @@ fn write_vector_robust_variables(
     output: &mut FileMut,
     solutions: &[VectorSolution],
     analysis_method: AnalysisMethod,
+    series_dimensions: &[&str],
 ) -> Result<(), AppError> {
     if analysis_method == AnalysisMethod::Ols {
         if solutions.iter().any(|solution| solution.robust.is_some()) {
@@ -1657,12 +2043,12 @@ fn write_vector_robust_variables(
         ("robust_iterations", &iterations),
     ] {
         write_variable(
-            &mut output.add_variable::<i64>(name, &["series"])?,
+            &mut output.add_variable::<i64>(name, series_dimensions)?,
             values,
             "1",
         )?;
     }
-    write_robust_schema_metadata(output, &termination)?;
+    write_robust_schema_metadata(output, &termination, series_dimensions)?;
     for (name, values, units) in [
         (
             "robust_residual_scale",
@@ -1681,7 +2067,7 @@ fn write_vector_robust_variables(
         ),
     ] {
         write_variable(
-            &mut output.add_variable::<f64>(name, &["series"])?,
+            &mut output.add_variable::<f64>(name, series_dimensions)?,
             values,
             units,
         )?;
@@ -1705,7 +2091,7 @@ fn write_vector_reconstruction_variables(
     filter: &ReconstructionFilter,
     values: &[VectorReconstruction],
 ) -> Result<(), AppError> {
-    if values.len() != input.element_indices.len()
+    if values.len() != input.series_count()
         || values.iter().any(|series| {
             series.eastward.len() != input.modified_julian_days.len()
                 || series.northward.len() != input.modified_julian_days.len()
@@ -1735,7 +2121,12 @@ fn write_vector_reconstruction_variables(
         ("eastward_reconstruction", true),
         ("northward_reconstruction", false),
     ] {
-        let mut variable = output.add_variable::<f64>(name, &["time", "series"])?;
+        let dimensions = if input.is_depth_resolved() {
+            vec!["time", "siglay", "element"]
+        } else {
+            vec!["time", "series"]
+        };
+        let mut variable = output.add_variable::<f64>(name, &dimensions)?;
         variable.put_attribute("units", "source velocity units")?;
         for (series, reconstruction) in values.iter().enumerate() {
             let component = if eastward {
@@ -1743,7 +2134,15 @@ fn write_vector_reconstruction_variables(
             } else {
                 &reconstruction.northward
             };
-            variable.put_values(component, (.., series))?;
+            if input.is_depth_resolved() {
+                let element_count = input.element_indices.len();
+                variable.put_values(
+                    component,
+                    (.., series / element_count, series % element_count),
+                )?;
+            } else {
+                variable.put_values(component, (.., series))?;
+            }
         }
     }
     Ok(())
@@ -1784,12 +2183,21 @@ mod tests {
             std::env::temp_dir().join("rutide-vector-inference-output-test.nc");
         let inference_output_path =
             temporary_sibling(&inference_output_destination).expect("valid inference output path");
+        let layered_output_destination =
+            std::env::temp_dir().join("rutide-vector-layered-output-test.nc");
+        let layered_output_path =
+            temporary_sibling(&layered_output_destination).expect("valid layered output path");
+        let layered_chunked_output_destination =
+            std::env::temp_dir().join("rutide-vector-layered-chunked-output-test.nc");
+        let layered_chunked_output_path = temporary_sibling(&layered_chunked_output_destination)
+            .expect("valid layered chunked output path");
         let time_count = 49_usize;
         let fill = -999.0_f32;
         let time_fill = -999_i32;
         let mut dataset = netcdf::create(&input_path).expect("create vector fixture");
         dataset.add_dimension("time", time_count).expect("add time");
         dataset.add_dimension("nele", 2).expect("add elements");
+        dataset.add_dimension("siglay", 3).expect("add layers");
         {
             let mut variable = dataset
                 .add_variable::<i32>("Itime", &["time"])
@@ -1843,6 +2251,45 @@ mod tests {
             variable.set_fill_value(fill).expect("set va fill");
             variable.put_values(&northward, ..).expect("write va");
         }
+        let mut layered_eastward = Vec::with_capacity(time_count * 3 * 2);
+        let mut layered_northward = Vec::with_capacity(time_count * 3 * 2);
+        for time in 0..time_count {
+            for layer in 0..3 {
+                for element in 0..2 {
+                    let source = time * 2 + element;
+                    let eastward_value = eastward[source];
+                    let northward_value = northward[source];
+                    let layer_offset = [0.0_f32, 1.0, 2.0][layer];
+                    layered_eastward.push(if eastward_value.to_bits() == fill.to_bits() {
+                        fill
+                    } else {
+                        eastward_value + layer_offset
+                    });
+                    layered_northward.push(if northward_value.to_bits() == fill.to_bits() {
+                        fill
+                    } else {
+                        northward_value - 0.5 * layer_offset
+                    });
+                }
+            }
+        }
+        layered_northward[(8 * 3 + 2) * 2 + 1] = fill;
+        {
+            let mut variable = dataset
+                .add_variable::<f32>("u", &["time", "siglay", "nele"])
+                .expect("add u");
+            variable.set_fill_value(fill).expect("set u fill");
+            variable.put_values(&layered_eastward, ..).expect("write u");
+        }
+        {
+            let mut variable = dataset
+                .add_variable::<f32>("v", &["time", "siglay", "nele"])
+                .expect("add v");
+            variable.set_fill_value(fill).expect("set v fill");
+            variable
+                .put_values(&layered_northward, ..)
+                .expect("write v");
+        }
         dataset.close().expect("close vector fixture");
 
         let input = read_fvcom_vector(&input_path, &NodeSelection::Indices(vec![1, 0]))
@@ -1862,6 +2309,7 @@ mod tests {
             output: output_path.clone(),
             report: None,
             elements: NodeSelection::Indices(vec![1, 0]),
+            layers: None,
             constituent_selection: ConstituentSelection::Explicit(vec![
                 TidalConstituent::M2,
                 TidalConstituent::K1,
@@ -2030,11 +2478,116 @@ mod tests {
         );
         drop(output);
 
+        let mut layered_config = config.clone();
+        layered_config.output = layered_output_path.clone();
+        layered_config.layers = Some(NodeSelection::Indices(vec![2, 0]));
+        let layered_report =
+            analyze_vector(&layered_config).expect("analyze native sigma-layer currents");
+        let mut layered_chunked_config = layered_config.clone();
+        layered_chunked_config.output = layered_chunked_output_path.clone();
+        layered_chunked_config.chunk_series = Some(3);
+        let layered_chunked_report = analyze_vector(&layered_chunked_config)
+            .expect("analyze native sigma-layer currents across layer boundary");
+        assert_eq!(layered_report.vertical_mode, "sigma-layer");
+        assert_eq!(layered_report.element_count, 2);
+        assert_eq!(layered_report.series_count, 4);
+        assert_eq!(layered_report.layer_indices, Some(vec![2, 0]));
+        assert_eq!(layered_report.sample_results[0].layer_index, Some(2));
+        assert_eq!(layered_report.sample_results[0].element_index, 1);
+        assert_eq!(layered_report.sample_results[2].layer_index, Some(0));
+        assert_eq!(layered_chunked_report.chunk_series, 3);
+        assert_eq!(layered_chunked_report.chunk_count, 2);
+        assert_eq!(
+            layered_chunked_report.result_sha256,
+            layered_report.result_sha256
+        );
+        let layered_output = netcdf::open(&layered_output_path).expect("open layered output");
+        assert_eq!(
+            layered_output
+                .variable("siglay_index")
+                .expect("layer coordinate")
+                .get_values::<i64, _>(..)
+                .expect("read layer coordinate"),
+            [2, 0]
+        );
+        assert_eq!(
+            layered_output
+                .variable("element_index")
+                .expect("element coordinate")
+                .get_values::<i64, _>(..)
+                .expect("read element coordinate"),
+            [1, 0]
+        );
+        assert_eq!(
+            layered_output
+                .variable("observation_count")
+                .expect("layered observation counts")
+                .get_values::<i64, _>(..)
+                .expect("read layered observation counts"),
+            [46, 47, 47, 47]
+        );
+        assert_eq!(
+            layered_output
+                .variable("semi_major")
+                .expect("layered semi-major")
+                .dimensions()
+                .iter()
+                .map(netcdf::Dimension::name)
+                .collect::<Vec<_>>(),
+            ["siglay", "element", "constituent"]
+        );
+        assert_eq!(
+            layered_output
+                .variable("eastward_reconstruction")
+                .expect("layered eastward reconstruction")
+                .dimensions()
+                .iter()
+                .map(netcdf::Dimension::name)
+                .collect::<Vec<_>>(),
+            ["time", "siglay", "element"]
+        );
+        let eastward_means = layered_output
+            .variable("eastward_mean")
+            .expect("layered eastward means")
+            .get_values::<f64, _>(..)
+            .expect("read layered eastward means");
+        let northward_means = layered_output
+            .variable("northward_mean")
+            .expect("layered northward means")
+            .get_values::<f64, _>(..)
+            .expect("read layered northward means");
+        assert!((eastward_means[1] - eastward_means[3] - 2.0).abs() < 1e-6);
+        assert!((northward_means[1] - northward_means[3] + 1.0).abs() < 1e-6);
+        for name in [
+            "semi_major",
+            "semi_minor",
+            "inclination",
+            "phase",
+            "robust_weight",
+            "eastward_reconstruction",
+            "northward_reconstruction",
+        ] {
+            let whole = layered_output
+                .variable(name)
+                .expect("whole layered variable")
+                .get_values::<f64, _>(..)
+                .expect("read whole layered variable");
+            let chunked = netcdf::open(&layered_chunked_output_path)
+                .expect("open chunked layered output")
+                .variable(name)
+                .expect("chunked layered variable")
+                .get_values::<f64, _>(..)
+                .expect("read chunked layered variable");
+            assert_eq!(chunked, whole, "chunked layered {name} differs");
+        }
+        drop(layered_output);
+
         let inference_report = analyze_vector(&VectorAnalyzeConfig {
             input: input_path.clone(),
             output: inference_output_path.clone(),
             report: None,
             elements: NodeSelection::Indices(vec![1, 0]),
+            layers: None,
             constituent_selection: ConstituentSelection::Explicit(vec![
                 TidalConstituent::M2,
                 TidalConstituent::K1,
@@ -2224,6 +2777,8 @@ mod tests {
         fs::remove_file(input_path).expect("remove vector fixture");
         fs::remove_file(output_path).expect("remove vector output");
         fs::remove_file(chunked_output_path).expect("remove chunked vector output");
+        fs::remove_file(layered_output_path).expect("remove layered vector output");
+        fs::remove_file(layered_chunked_output_path).expect("remove chunked layered vector output");
         fs::remove_file(inference_output_path).expect("remove inferred vector output");
     }
 }
