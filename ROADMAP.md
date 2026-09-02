@@ -278,17 +278,14 @@ combinations must be rejected during validation rather than partially applied.
 - Add Python bindings only if a drop-in or mixed Python/Rust workflow is an
   actual user requirement, and publish reproducible release artifacts.
 
-Bounded spatial input is complete. The default 512 MiB promoted-observation
-budget reduced the 64-worker vector peak RSS from 2.23 GiB to 0.94 GiB with a
-9.5% median wall-time cost and identical whole-field digests; see
-`benchmarks/results/spatial-chunking-2026-09-02.md`. Compact coefficient and
-diagnostic results remain resident for a single high-throughput NetCDF output
-transaction. The complete ten-layer, 1,448,600-series OLS fixture remained at
-2.35 GiB peak RSS with a fixed 512 MiB observation bound; see
-`benchmarks/results/depth-resolved-fvcom-2026-09-02.md`. An incremental result
-sink therefore remains a targeted optimization for result-rich all-layer
-confidence, robust-diagnostic, or reconstruction workflows rather than a base
-OLS prerequisite.
+Bounded spatial input and incremental native-layer output are complete. The
+default 512 MiB promoted-observation budget reduced depth-averaged vector peak
+RSS from 2.23 GiB to 0.94 GiB; see
+`benchmarks/results/spatial-chunking-2026-09-02.md`. Streaming each sigma-layer
+result chunk—including confidence, ragged robust diagnostics, and
+reconstruction—reduced the ten-layer, 1,448,600-series OLS peak from 2.35 GiB to
+1.13 GiB with the identical v12 digest; see
+`benchmarks/results/incremental-layered-output-2026-09-02.md`.
 
 ## Definition of broad compatibility
 

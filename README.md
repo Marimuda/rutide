@@ -405,6 +405,15 @@ zero-based requested source order. These are native terrain-following model
 layers, not fixed physical depths; physical depth varies with bathymetry and the
 free surface, so fixed-depth interpolation remains a separate future workflow.
 
+Sigma-layer results are written incrementally to a temporary NetCDF file and
+atomically installed only after all chunks and the canonical digest complete.
+This includes confidence fields, ragged robust weights/leverage, and complete
+reconstruction. The JSON report and NetCDF `result_output` attribute identify
+this path as `incremental`; depth-averaged output remains `buffered`. On the
+1,448,600-series benchmark, incremental output preserved the v12 digest while
+reducing peak RSS from 2.35 GiB to 1.13 GiB; see
+[`benchmarks/results/incremental-layered-output-2026-09-02.md`](benchmarks/results/incremental-layered-output-2026-09-02.md).
+
 For compatibility, colored two-dimensional linear intervals reproduce the
 pinned Python UTide implementation exactly, including its asymmetric variance
 rescaling: the eastward coefficient pair retains the white estimate while the

@@ -10,9 +10,10 @@ use std::{
 use netcdf::{FileMut, Variable};
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
-    AnalysisError, Constituent, FitOptions, GreenwichNodalBatch, GreenwichNodalReconstructor,
-    NodalCorrections, PhaseReference, ReconstructionFilter, SolverOptions, TidalConstituent,
-    VectorInferenceBatch, VectorReconstruction, VectorSolution,
+    AnalysisError, COLORED_NOISE_FREQUENCY_BANDS_CPH, Constituent, FitOptions, GreenwichNodalBatch,
+    GreenwichNodalReconstructor, NodalCorrections, PhaseReference, ReconstructionFilter,
+    ResidualSpectrumMethod, SolverOptions, TidalConstituent, VectorInferenceBatch,
+    VectorReconstruction, VectorSolution,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -21,8 +22,8 @@ use super::{
     AnalysisMethod, AnalyzeConfig, AppError, ConfidenceInterval, ConstituentOrder,
     ConstituentOrderMap, ConstituentSelection, ConstituentSelectionReport, CoreSamplingDiagnostics,
     InferenceReport, NodeSelection, ReconstructionReport, ResolvedConstituentSelection,
-    RobustOptionsReport, SamplingSummary, SeriesSamplingDiagnostics, StageTimings,
-    VectorInferenceConfig, constituent_order_indices, diagnose_sampling, encode_hex,
+    RobustOptionsReport, SamplingSummary, SeriesSamplingDiagnostics, SpectralBandSummary,
+    StageTimings, VectorInferenceConfig, constituent_order_indices, diagnose_sampling, encode_hex,
     nodal_profile_component, normalize_source_observation, order_profile_suffix,
     read_fvcom_time_axis, read_selected_1d, read_selected_time_major, reconstruction_report,
     required_dimension_length, required_variable, resolve_constituent_selection,
@@ -150,6 +151,8 @@ pub struct VectorRunReport {
     pub output_path: String,
     /// Completed output file size.
     pub output_file_bytes: u64,
+    /// Result storage strategy: `buffered` or `incremental`.
+    pub result_output: &'static str,
     /// Number of finite timestamps retained for analysis.
     pub time_count: usize,
     /// Number of timestamps in the source time dimension.
@@ -310,6 +313,99 @@ impl VectorInputMetadata {
     }
 }
 
+struct SamplingSummaryAccumulator {
+    series_count: usize,
+    minimum_observation_count: usize,
+    maximum_observation_count: usize,
+    minimum_record_span_days: f64,
+    maximum_record_span_days: f64,
+    maximum_gap_hours: f64,
+    fft_series_count: usize,
+    lomb_scargle_series_count: usize,
+    minimum_band_bin_count: [usize; 9],
+    minimum_band_usable_bin_count: [usize; 9],
+    series_without_usable_bins: [usize; 9],
+}
+
+impl Default for SamplingSummaryAccumulator {
+    fn default() -> Self {
+        Self {
+            series_count: 0,
+            minimum_observation_count: usize::MAX,
+            maximum_observation_count: 0,
+            minimum_record_span_days: f64::INFINITY,
+            maximum_record_span_days: f64::NEG_INFINITY,
+            maximum_gap_hours: f64::NEG_INFINITY,
+            fft_series_count: 0,
+            lomb_scargle_series_count: 0,
+            minimum_band_bin_count: [usize::MAX; 9],
+            minimum_band_usable_bin_count: [usize::MAX; 9],
+            series_without_usable_bins: [0; 9],
+        }
+    }
+}
+
+impl SamplingSummaryAccumulator {
+    fn extend(&mut self, diagnostics: &[CoreSamplingDiagnostics]) {
+        for series in diagnostics {
+            self.series_count += 1;
+            self.minimum_observation_count =
+                self.minimum_observation_count.min(series.observation_count);
+            self.maximum_observation_count =
+                self.maximum_observation_count.max(series.observation_count);
+            self.minimum_record_span_days =
+                self.minimum_record_span_days.min(series.record_span_days);
+            self.maximum_record_span_days =
+                self.maximum_record_span_days.max(series.record_span_days);
+            self.maximum_gap_hours = self.maximum_gap_hours.max(series.largest_gap_hours);
+            match series.residual_spectrum_method {
+                ResidualSpectrumMethod::Fft => self.fft_series_count += 1,
+                ResidualSpectrumMethod::LombScargle => self.lomb_scargle_series_count += 1,
+            }
+            for band in 0..9 {
+                self.minimum_band_bin_count[band] =
+                    self.minimum_band_bin_count[band].min(series.spectral_band_bin_count[band]);
+                self.minimum_band_usable_bin_count[band] = self.minimum_band_usable_bin_count[band]
+                    .min(series.spectral_band_usable_bin_count[band]);
+                if series.spectral_band_usable_bin_count[band] == 0 {
+                    self.series_without_usable_bins[band] += 1;
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> Result<SamplingSummary, AppError> {
+        if self.series_count == 0 {
+            return Err(AppError::Invalid(
+                "sampling diagnostics require at least one spatial series".to_owned(),
+            ));
+        }
+        Ok(SamplingSummary {
+            minimum_observation_count: self.minimum_observation_count,
+            maximum_observation_count: self.maximum_observation_count,
+            minimum_record_span_days: self.minimum_record_span_days,
+            maximum_record_span_days: self.maximum_record_span_days,
+            maximum_gap_hours: self.maximum_gap_hours,
+            fft_series_count: self.fft_series_count,
+            lomb_scargle_series_count: self.lomb_scargle_series_count,
+            spectral_bands: COLORED_NOISE_FREQUENCY_BANDS_CPH
+                .iter()
+                .copied()
+                .enumerate()
+                .map(
+                    |(band, [lower_frequency_cph, upper_frequency_cph])| SpectralBandSummary {
+                        lower_frequency_cph,
+                        upper_frequency_cph,
+                        minimum_bin_count: self.minimum_band_bin_count[band],
+                        minimum_usable_bin_count: self.minimum_band_usable_bin_count[band],
+                        series_without_usable_bins: self.series_without_usable_bins[band],
+                    },
+                )
+                .collect(),
+        })
+    }
+}
+
 enum VectorAnalysisBatch {
     Standard(GreenwichNodalBatch),
     Inferred(VectorInferenceBatch),
@@ -437,13 +533,31 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
     if let Some(filter) = &config.reconstruction {
         validate_reconstruction_filter(filter, batch.tidal_constituents())?;
     }
-    let chunk_plan = spatial_chunk_plan(
+    // Robust sigma-layer chunks retain two diagnostic rows per observation while
+    // reconstruction can retain two more. Size automatic chunks by the largest
+    // concurrently resident time-major result set, then report the actual two
+    // promoted source-component buffers.
+    let resident_component_count =
+        if metadata.layer_indices.is_some() && config.analysis_method != AnalysisMethod::Ols {
+            4
+        } else {
+            2
+        };
+    let mut chunk_plan = spatial_chunk_plan(
         config.chunk_series,
         metadata.series_count(),
         metadata.source_time_count,
-        2,
+        resident_component_count,
         config.workers,
     )?;
+    chunk_plan.maximum_observation_buffer_bytes = u64::try_from(
+        chunk_plan
+            .series_per_chunk
+            .checked_mul(metadata.source_time_count)
+            .and_then(|value| value.checked_mul(2 * std::mem::size_of::<f64>()))
+            .ok_or_else(|| AppError::Invalid("observation chunk size exceeds usize".to_owned()))?,
+    )
+    .map_err(|_| AppError::Invalid("observation chunk size exceeds u64".to_owned()))?;
     let sampling_plan =
         rutide_core::SamplingDiagnosticsPlan::prepare(&metadata.modified_julian_days)?;
     let reconstructor = config
@@ -457,17 +571,80 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         .num_threads(config.workers)
         .build()?;
     let series_count = metadata.series_count();
-    let mut solutions = Vec::with_capacity(series_count);
-    let mut series_frequency_cph = Vec::with_capacity(series_count);
-    let mut sampling_diagnostics = Vec::with_capacity(series_count);
-    let mut observation_counts = Vec::with_capacity(series_count);
-    let mut reconstruction = config
-        .reconstruction
-        .as_ref()
-        .map(|_| Vec::with_capacity(series_count));
+    let mut input = VectorInputData {
+        modified_julian_days: metadata.modified_julian_days.clone(),
+        source_time_count: metadata.source_time_count,
+        discarded_timestamp_count: metadata.discarded_timestamp_count,
+        element_indices: metadata.element_indices.clone(),
+        layer_indices: metadata.layer_indices.clone(),
+        latitudes: metadata.latitudes.clone(),
+        #[cfg(test)]
+        eastward: Vec::new(),
+        #[cfg(test)]
+        northward: Vec::new(),
+        observation_counts: Vec::with_capacity(series_count),
+        input_file_bytes: metadata.input_file_bytes,
+        logical_input_bytes: metadata.logical_input_bytes,
+    };
+    let incremental_results = input.is_depth_resolved();
+    let mut solutions = if incremental_results {
+        Vec::new()
+    } else {
+        Vec::with_capacity(series_count)
+    };
+    let mut series_frequency_cph = if incremental_results {
+        Vec::new()
+    } else {
+        Vec::with_capacity(series_count)
+    };
+    let mut sampling_diagnostics = if incremental_results {
+        Vec::new()
+    } else {
+        Vec::with_capacity(series_count)
+    };
+    let mut reconstruction = if incremental_results {
+        None
+    } else {
+        config
+            .reconstruction
+            .as_ref()
+            .map(|_| Vec::with_capacity(series_count))
+    };
+    let mut sampling_accumulator = SamplingSummaryAccumulator::default();
+    let mut sample_results = Vec::with_capacity(3);
+    let mut first_frequency = None::<Vec<f64>>;
+    let mut frequency_varies_by_series = false;
+    let mut first_constituent_order = None::<Vec<u16>>;
+    let mut constituent_order_varies_by_series = false;
     let mut solve_seconds = 0.0;
     let mut reconstruction_seconds = 0.0;
     let mut result_processing_seconds = 0.0;
+    let mut output_seconds = 0.0;
+    let output_start = Instant::now();
+    let mut incremental_output = if incremental_results {
+        Some(IncrementalVectorOutput::create(
+            &config.output,
+            &VectorOutputDefinition {
+                input: &input,
+                constituents: batch.constituents(),
+                constituent_order: &config.constituent_order,
+                selection: &selection,
+                inference: config.inference.as_ref(),
+                fit_options: config.fit_options,
+                phase_reference: config.phase_reference,
+                nodal_corrections: config.nodal_corrections,
+                analysis_method: config.analysis_method,
+                confidence_interval: config.confidence_interval,
+                chunk_plan,
+                reference_time_modified_julian_day: batch.reference_time_modified_julian_day(),
+                reconstruction: config.reconstruction.as_ref(),
+                result_output: "incremental",
+            },
+        )?)
+    } else {
+        None
+    };
+    output_seconds += output_start.elapsed().as_secs_f64();
     for first_series in (0..series_count).step_by(chunk_plan.series_per_chunk) {
         let end_series = (first_series + chunk_plan.series_per_chunk).min(series_count);
         let read_start = Instant::now();
@@ -487,22 +664,6 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             config.confidence_interval,
         )?;
         solve_seconds += solve_start.elapsed().as_secs_f64();
-
-        let reconstruction_start = Instant::now();
-        if let (Some(reconstructor), Some(filter), Some(values)) = (
-            reconstructor.as_ref(),
-            config.reconstruction.as_ref(),
-            reconstruction.as_mut(),
-        ) {
-            values.extend(worker_pool.install(|| {
-                reconstructor.reconstruct_many_vectors_series_major(
-                    &chunk_solutions,
-                    &latitudes,
-                    filter,
-                )
-            })?);
-        }
-        reconstruction_seconds += reconstruction_start.elapsed().as_secs_f64();
 
         let result_start = Instant::now();
         let chunk_frequency_cph = vector_solution_frequencies(&batch, &chunk_solutions)?;
@@ -525,98 +686,211 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                     .to_owned(),
             ));
         }
-        observation_counts.extend_from_slice(&chunk.observation_counts);
-        series_frequency_cph.extend(chunk_frequency_cph);
-        sampling_diagnostics.extend(chunk_diagnostics);
-        solutions.extend(chunk_solutions);
+        let chunk_observation_counts = chunk.observation_counts.clone();
+        drop(chunk);
         result_processing_seconds += result_start.elapsed().as_secs_f64();
+
+        let reconstruction_start = Instant::now();
+        let chunk_reconstruction = if let (Some(reconstructor), Some(filter)) =
+            (reconstructor.as_ref(), config.reconstruction.as_ref())
+        {
+            Some(worker_pool.install(|| {
+                reconstructor.reconstruct_many_vectors_series_major(
+                    &chunk_solutions,
+                    &latitudes,
+                    filter,
+                )
+            })?)
+        } else {
+            None
+        };
+        reconstruction_seconds += reconstruction_start.elapsed().as_secs_f64();
+
+        input
+            .observation_counts
+            .extend_from_slice(&chunk_observation_counts);
+        if incremental_results {
+            let result_start = Instant::now();
+            let chunk_order = constituent_order_indices(
+                &config.constituent_order,
+                batch.constituents(),
+                &chunk_frequency_cph,
+                &chunk_solutions,
+            )?;
+            sampling_accumulator.extend(&chunk_diagnostics);
+            extend_retained_vector_samples(
+                &mut sample_results,
+                &input,
+                first_series,
+                &chunk_observation_counts,
+                &chunk_solutions,
+                &chunk_order,
+                &chunk_diagnostics,
+            );
+            for frequency in &chunk_frequency_cph {
+                if let Some(first) = &first_frequency {
+                    frequency_varies_by_series |= first != frequency;
+                } else {
+                    first_frequency = Some(frequency.clone());
+                }
+            }
+            for series in 0..chunk_solutions.len() {
+                let order = chunk_order.row(series);
+                if let Some(first) = &first_constituent_order {
+                    constituent_order_varies_by_series |= first.as_slice() != order;
+                } else {
+                    first_constituent_order = Some(order.to_vec());
+                }
+            }
+            result_processing_seconds += result_start.elapsed().as_secs_f64();
+            let output_start = Instant::now();
+            incremental_output
+                .as_mut()
+                .ok_or_else(|| {
+                    AppError::Invalid("incremental vector output was not initialized".to_owned())
+                })?
+                .write_chunk(
+                    first_series,
+                    &chunk_observation_counts,
+                    &chunk_frequency_cph,
+                    &chunk_solutions,
+                    &chunk_order,
+                    &chunk_diagnostics,
+                    chunk_reconstruction.as_deref(),
+                )?;
+            output_seconds += output_start.elapsed().as_secs_f64();
+        } else {
+            series_frequency_cph.extend(chunk_frequency_cph);
+            sampling_diagnostics.extend(chunk_diagnostics);
+            solutions.extend(chunk_solutions);
+            if let (Some(values), Some(chunk_values)) =
+                (reconstruction.as_mut(), chunk_reconstruction)
+            {
+                values.extend(chunk_values);
+            }
+        }
     }
     drop(dataset);
 
-    let input = VectorInputData {
-        modified_julian_days: metadata.modified_julian_days,
-        source_time_count: metadata.source_time_count,
-        discarded_timestamp_count: metadata.discarded_timestamp_count,
-        element_indices: metadata.element_indices,
-        layer_indices: metadata.layer_indices,
-        latitudes: metadata.latitudes,
-        #[cfg(test)]
-        eastward: Vec::new(),
-        #[cfg(test)]
-        northward: Vec::new(),
-        observation_counts,
-        input_file_bytes: metadata.input_file_bytes,
-        logical_input_bytes: metadata.logical_input_bytes,
-    };
+    let inference_report = config.inference.as_ref().map(VectorInferenceConfig::report);
+    let (
+        sampling_summary,
+        constituent_order_varies_by_series,
+        frequency_varies_by_series,
+        result_sha256,
+        sample_results,
+    ) = if incremental_results {
+        let output_start = Instant::now();
+        let mut output = incremental_output.take().ok_or_else(|| {
+            AppError::Invalid("incremental vector output was not initialized".to_owned())
+        })?;
+        output.close()?;
+        output_seconds += output_start.elapsed().as_secs_f64();
 
-    let result_start = Instant::now();
-    let sampling_summary = summarize_sampling(&sampling_diagnostics)?;
-    let constituent_index_by_rank = constituent_order_indices(
-        &config.constituent_order,
-        batch.constituents(),
-        &series_frequency_cph,
-        &solutions,
-    )?;
-    let result_sha256 = vector_result_digest(
-        &input,
-        batch.constituents(),
-        &series_frequency_cph,
-        &solutions,
-        config.fit_options,
-        config.phase_reference,
-        config.nodal_corrections,
-        &config.constituent_order,
-        &constituent_index_by_rank,
-        &sampling_diagnostics,
-        config.analysis_method,
-        config.confidence_interval,
-        config
-            .inference
-            .as_ref()
-            .map(VectorInferenceConfig::report)
-            .as_ref(),
-        config
-            .reconstruction
-            .as_ref()
-            .zip(reconstruction.as_deref()),
-    )?;
-    let sample_results = retained_vector_samples(
-        &input,
-        &solutions,
-        &constituent_index_by_rank,
-        &sampling_diagnostics,
-    );
-    result_processing_seconds += result_start.elapsed().as_secs_f64();
+        let result_start = Instant::now();
+        let result_sha256 = vector_result_digest_from_incremental_output(
+            output.temporary_path(),
+            &input,
+            batch.constituents(),
+            config.fit_options,
+            config.phase_reference,
+            config.nodal_corrections,
+            &config.constituent_order,
+            config.analysis_method,
+            config.confidence_interval,
+            inference_report.as_ref(),
+            config.reconstruction.as_ref(),
+        )?;
+        let sampling_summary = sampling_accumulator.finish()?;
+        result_processing_seconds += result_start.elapsed().as_secs_f64();
 
-    let output_start = Instant::now();
-    write_vector_output(
-        &config.output,
-        config.overwrite,
-        &VectorOutputData {
-            input: &input,
-            constituents: batch.constituents(),
-            series_frequency_cph: &series_frequency_cph,
-            solutions: &solutions,
-            constituent_order: &config.constituent_order,
-            constituent_index_by_rank: &constituent_index_by_rank,
-            sampling_diagnostics: &sampling_diagnostics,
-            result_sha256: &result_sha256,
-            selection: &selection,
-            inference: config.inference.as_ref(),
-            fit_options: config.fit_options,
-            phase_reference: config.phase_reference,
-            nodal_corrections: config.nodal_corrections,
-            analysis_method: config.analysis_method,
-            confidence_interval: config.confidence_interval,
-            chunk_plan,
-            reference_time_modified_julian_day: batch.reference_time_modified_julian_day(),
-            reconstruction: config
+        let output_start = Instant::now();
+        output.install(config.overwrite, &result_sha256)?;
+        output_seconds += output_start.elapsed().as_secs_f64();
+        (
+            sampling_summary,
+            constituent_order_varies_by_series,
+            frequency_varies_by_series,
+            result_sha256,
+            sample_results,
+        )
+    } else {
+        let result_start = Instant::now();
+        let sampling_summary = summarize_sampling(&sampling_diagnostics)?;
+        let constituent_index_by_rank = constituent_order_indices(
+            &config.constituent_order,
+            batch.constituents(),
+            &series_frequency_cph,
+            &solutions,
+        )?;
+        let result_sha256 = vector_result_digest(
+            &input,
+            batch.constituents(),
+            &series_frequency_cph,
+            &solutions,
+            config.fit_options,
+            config.phase_reference,
+            config.nodal_corrections,
+            &config.constituent_order,
+            &constituent_index_by_rank,
+            &sampling_diagnostics,
+            config.analysis_method,
+            config.confidence_interval,
+            inference_report.as_ref(),
+            config
                 .reconstruction
                 .as_ref()
                 .zip(reconstruction.as_deref()),
-        },
-    )?;
-    let output_seconds = output_start.elapsed().as_secs_f64();
+        )?;
+        let sample_results = retained_vector_samples(
+            &input,
+            &solutions,
+            &constituent_index_by_rank,
+            &sampling_diagnostics,
+        );
+        let order_varies = constituent_index_by_rank.varies_by_series();
+        let frequency_varies = series_frequency_cph
+            .windows(2)
+            .any(|pair| pair[0] != pair[1]);
+        result_processing_seconds += result_start.elapsed().as_secs_f64();
+
+        let output_start = Instant::now();
+        write_vector_output(
+            &config.output,
+            config.overwrite,
+            &VectorOutputData {
+                input: &input,
+                constituents: batch.constituents(),
+                series_frequency_cph: &series_frequency_cph,
+                solutions: &solutions,
+                constituent_order: &config.constituent_order,
+                constituent_index_by_rank: &constituent_index_by_rank,
+                sampling_diagnostics: &sampling_diagnostics,
+                result_sha256: &result_sha256,
+                selection: &selection,
+                inference: config.inference.as_ref(),
+                fit_options: config.fit_options,
+                phase_reference: config.phase_reference,
+                nodal_corrections: config.nodal_corrections,
+                analysis_method: config.analysis_method,
+                confidence_interval: config.confidence_interval,
+                chunk_plan,
+                reference_time_modified_julian_day: batch.reference_time_modified_julian_day(),
+                reconstruction: config
+                    .reconstruction
+                    .as_ref()
+                    .zip(reconstruction.as_deref()),
+            },
+        )?;
+        output_seconds += output_start.elapsed().as_secs_f64();
+        (
+            sampling_summary,
+            order_varies,
+            frequency_varies,
+            result_sha256,
+            sample_results,
+        )
+    };
     let total_seconds = total_start.elapsed().as_secs_f64();
     let output_file_bytes = fs::metadata(&config.output)?.len();
     let created_unix_seconds = SystemTime::now()
@@ -642,6 +916,11 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         logical_input_bytes: input.logical_input_bytes,
         output_path: config.output.to_string_lossy().into_owned(),
         output_file_bytes,
+        result_output: if incremental_results {
+            "incremental"
+        } else {
+            "buffered"
+        },
         time_count: input.modified_julian_days.len(),
         source_time_count: input.source_time_count,
         discarded_timestamp_count: input.discarded_timestamp_count,
@@ -674,7 +953,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         constituent_selection: selection.report,
         constituent_order: config.constituent_order.name(),
         explicit_constituent_order: config.constituent_order.explicit_names(),
-        constituent_order_varies_by_series: constituent_index_by_rank.varies_by_series(),
+        constituent_order_varies_by_series,
         inference: config.inference.as_ref().map(VectorInferenceConfig::report),
         confidence_interval: config.confidence_interval.method(),
         confidence_noise: config.confidence_interval.noise(),
@@ -700,9 +979,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             .iter()
             .map(|constituent| constituent.frequency_cph)
             .collect(),
-        frequency_varies_by_series: series_frequency_cph
-            .windows(2)
-            .any(|pair| pair[0] != pair[1]),
+        frequency_varies_by_series,
         result_sha256,
         timings: StageTimings {
             input_seconds,
@@ -1529,6 +1806,547 @@ fn vector_result_digest(
     Ok(encode_hex(&digest.finalize()))
 }
 
+fn read_layered_series_values<T: netcdf::NcTypeDescriptor + Copy>(
+    variable: &Variable<'_>,
+    element_count: usize,
+    first_series: usize,
+    row_count: usize,
+    row_width: usize,
+) -> Result<Vec<T>, AppError> {
+    let mut values = Vec::with_capacity(row_count * row_width);
+    let mut local_first = 0;
+    while local_first < row_count {
+        let global_first = first_series + local_first;
+        let layer = global_first / element_count;
+        let element = global_first % element_count;
+        let rows = (row_count - local_first).min(element_count - element);
+        let mut extents = vec![
+            netcdf::Extent::Index(layer),
+            netcdf::Extent::from(element..element + rows),
+        ];
+        if row_width > 1 {
+            extents.push(netcdf::Extent::from(..));
+        }
+        values.extend(variable.get_values::<T, _>(extents)?);
+        local_first += rows;
+    }
+    Ok(values)
+}
+
+fn required_output_variable<'file>(
+    output: &'file netcdf::File,
+    name: &str,
+) -> Result<Variable<'file>, AppError> {
+    output
+        .variable(name)
+        .ok_or_else(|| AppError::Invalid(format!("incremental output omitted {name}")))
+}
+
+fn digest_nonnegative_i64(
+    digest: &mut Sha256,
+    value: i64,
+    description: &str,
+) -> Result<(), AppError> {
+    digest.update(
+        u64::try_from(value)
+            .map_err(|_| AppError::Invalid(format!("negative {description} in output")))?
+            .to_le_bytes(),
+    );
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the read-back digest deliberately mirrors the established v12 byte order"
+)]
+fn vector_result_digest_from_incremental_output(
+    path: &Path,
+    input: &VectorInputData,
+    constituents: &[Constituent],
+    fit_options: FitOptions,
+    phase_reference: PhaseReference,
+    nodal_corrections: NodalCorrections,
+    constituent_order: &ConstituentOrder,
+    analysis_method: AnalysisMethod,
+    confidence_interval: ConfidenceInterval,
+    inference: Option<&InferenceReport>,
+    reconstruction: Option<&ReconstructionFilter>,
+) -> Result<String, AppError> {
+    const DIGEST_SERIES_CHUNK: usize = 8192;
+    const TARGET_RECONSTRUCTION_READ_BYTES: usize = 64 * 1024 * 1024;
+
+    if !input.is_depth_resolved() {
+        return Err(AppError::Invalid(
+            "incremental vector digest requires native sigma layers".to_owned(),
+        ));
+    }
+    let output = netcdf::open(path)?;
+    let element_count = input.element_indices.len();
+    let series_count = input.series_count();
+    let constituent_count = constituents.len();
+    let mut digest = Sha256::new();
+    digest.update(b"rutide-vector-sampling-v12\0");
+    digest.update([u8::from(fit_options.trend)]);
+    digest.update(phase_reference.name().as_bytes());
+    digest.update([0]);
+    digest.update(nodal_corrections.name().as_bytes());
+    digest.update([0]);
+    digest.update(constituent_order.name().as_bytes());
+    digest.update([0]);
+    if let Some(names) = constituent_order.explicit_names() {
+        for name in names {
+            digest.update(name.as_bytes());
+            digest.update([0]);
+        }
+    }
+    let order_variable = required_output_variable(&output, "constituent_index_by_rank")?;
+    for first_series in (0..series_count).step_by(DIGEST_SERIES_CHUNK) {
+        let rows = (series_count - first_series).min(DIGEST_SERIES_CHUNK);
+        let indices = read_layered_series_values::<i64>(
+            &order_variable,
+            element_count,
+            first_series,
+            rows,
+            constituent_count,
+        )?;
+        for index in indices {
+            digest_nonnegative_i64(&mut digest, index, "constituent index")?;
+        }
+    }
+
+    let observation_count = required_output_variable(&output, "observation_count")?;
+    let record_span = required_output_variable(&output, "sampling_record_span")?;
+    let mean_interval = required_output_variable(&output, "sampling_mean_interval")?;
+    let largest_gap = required_output_variable(&output, "sampling_largest_gap")?;
+    let spectrum_method = required_output_variable(&output, "residual_spectrum_method")?;
+    let spectrum_time_count = required_output_variable(&output, "residual_spectrum_time_count")?;
+    let band_count = required_output_variable(&output, "spectral_band_frequency_bin_count")?;
+    let usable_band_count = required_output_variable(&output, "spectral_band_usable_bin_count")?;
+    for first_series in (0..series_count).step_by(DIGEST_SERIES_CHUNK) {
+        let rows = (series_count - first_series).min(DIGEST_SERIES_CHUNK);
+        let observations = read_layered_series_values::<i64>(
+            &observation_count,
+            element_count,
+            first_series,
+            rows,
+            1,
+        )?;
+        let spans =
+            read_layered_series_values::<f64>(&record_span, element_count, first_series, rows, 1)?;
+        let intervals = read_layered_series_values::<f64>(
+            &mean_interval,
+            element_count,
+            first_series,
+            rows,
+            1,
+        )?;
+        let gaps =
+            read_layered_series_values::<f64>(&largest_gap, element_count, first_series, rows, 1)?;
+        let methods = read_layered_series_values::<i64>(
+            &spectrum_method,
+            element_count,
+            first_series,
+            rows,
+            1,
+        )?;
+        let spectrum_counts = read_layered_series_values::<i64>(
+            &spectrum_time_count,
+            element_count,
+            first_series,
+            rows,
+            1,
+        )?;
+        let bands =
+            read_layered_series_values::<i64>(&band_count, element_count, first_series, rows, 9)?;
+        let usable_bands = read_layered_series_values::<i64>(
+            &usable_band_count,
+            element_count,
+            first_series,
+            rows,
+            9,
+        )?;
+        for series in 0..rows {
+            digest_nonnegative_i64(&mut digest, observations[series], "observation count")?;
+            digest.update(spans[series].to_bits().to_le_bytes());
+            digest.update(intervals[series].to_bits().to_le_bytes());
+            digest.update(gaps[series].to_bits().to_le_bytes());
+            digest.update([match methods[series] {
+                0 => 0,
+                1 => 1,
+                value => {
+                    return Err(AppError::Invalid(format!(
+                        "invalid residual spectrum method {value} in output"
+                    )));
+                }
+            }]);
+            digest_nonnegative_i64(
+                &mut digest,
+                spectrum_counts[series],
+                "residual spectrum time count",
+            )?;
+            let band_start = series * 9;
+            for count in bands[band_start..band_start + 9]
+                .iter()
+                .chain(&usable_bands[band_start..band_start + 9])
+            {
+                digest_nonnegative_i64(&mut digest, *count, "spectral bin count")?;
+            }
+        }
+    }
+
+    digest.update(analysis_method.name().as_bytes());
+    if let AnalysisMethod::Robust(options) = analysis_method {
+        digest.update(options.tuning_constant.to_bits().to_le_bytes());
+        digest.update(options.tolerance.to_bits().to_le_bytes());
+        digest.update(
+            u64::try_from(options.max_iterations)
+                .map_err(|_| AppError::Invalid("robust iteration limit exceeds u64".to_owned()))?
+                .to_le_bytes(),
+        );
+    }
+    digest.update([0]);
+    digest.update(confidence_interval.method().as_bytes());
+    digest.update([0]);
+    if let Some(noise) = confidence_interval.noise() {
+        digest.update(noise.as_bytes());
+    }
+    if let Some(options) = confidence_interval.monte_carlo_options() {
+        digest.update(
+            u64::try_from(options.realizations)
+                .map_err(|_| {
+                    AppError::Invalid("Monte Carlo realization count exceeds u64".to_owned())
+                })?
+                .to_le_bytes(),
+        );
+        digest.update(options.seed.to_le_bytes());
+    }
+    digest.update([0]);
+    update_inference_digest(&mut digest, inference);
+    for constituent in constituents {
+        digest.update(constituent.name.as_bytes());
+        digest.update([0]);
+    }
+
+    let reference_time = required_output_variable(&output, "reference_time")?;
+    let frequency = required_output_variable(&output, "frequency")?;
+    let semi_major = required_output_variable(&output, "semi_major")?;
+    let semi_minor = required_output_variable(&output, "semi_minor")?;
+    let inclination = required_output_variable(&output, "inclination")?;
+    let phase = required_output_variable(&output, "phase")?;
+    let percent_energy = required_output_variable(&output, "percent_energy")?;
+    let confidence_variables = if confidence_interval == ConfidenceInterval::None {
+        None
+    } else {
+        Some([
+            required_output_variable(&output, "semi_major_ci")?,
+            required_output_variable(&output, "semi_minor_ci")?,
+            required_output_variable(&output, "inclination_ci")?,
+            required_output_variable(&output, "phase_ci")?,
+            required_output_variable(&output, "signal_to_noise")?,
+        ])
+    };
+    let eastward_mean = required_output_variable(&output, "eastward_mean")?;
+    let northward_mean = required_output_variable(&output, "northward_mean")?;
+    let eastward_slope = required_output_variable(&output, "eastward_slope")?;
+    let northward_slope = required_output_variable(&output, "northward_slope")?;
+    let robust_variables = if analysis_method == AnalysisMethod::Ols {
+        None
+    } else {
+        Some((
+            required_output_variable(&output, "robust_weight_row_size")?,
+            required_output_variable(&output, "robust_iterations")?,
+            required_output_variable(&output, "robust_termination")?,
+            required_output_variable(&output, "robust_residual_scale")?,
+            required_output_variable(&output, "robust_ols_rms_residual")?,
+            required_output_variable(&output, "robust_rms_residual")?,
+            required_output_variable(&output, "robust_weight")?,
+            required_output_variable(&output, "robust_leverage")?,
+        ))
+    };
+    let mut robust_offset = 0_usize;
+    for first_series in (0..series_count).step_by(DIGEST_SERIES_CHUNK) {
+        let rows = (series_count - first_series).min(DIGEST_SERIES_CHUNK);
+        let reference_times = read_layered_series_values::<f64>(
+            &reference_time,
+            element_count,
+            first_series,
+            rows,
+            1,
+        )?;
+        let matrices = [
+            read_layered_series_values::<f64>(
+                &frequency,
+                element_count,
+                first_series,
+                rows,
+                constituent_count,
+            )?,
+            read_layered_series_values::<f64>(
+                &semi_major,
+                element_count,
+                first_series,
+                rows,
+                constituent_count,
+            )?,
+            read_layered_series_values::<f64>(
+                &semi_minor,
+                element_count,
+                first_series,
+                rows,
+                constituent_count,
+            )?,
+            read_layered_series_values::<f64>(
+                &inclination,
+                element_count,
+                first_series,
+                rows,
+                constituent_count,
+            )?,
+            read_layered_series_values::<f64>(
+                &phase,
+                element_count,
+                first_series,
+                rows,
+                constituent_count,
+            )?,
+            read_layered_series_values::<f64>(
+                &percent_energy,
+                element_count,
+                first_series,
+                rows,
+                constituent_count,
+            )?,
+        ];
+        let confidence_matrices = confidence_variables
+            .as_ref()
+            .map(|variables| {
+                variables
+                    .iter()
+                    .map(|variable| {
+                        read_layered_series_values::<f64>(
+                            variable,
+                            element_count,
+                            first_series,
+                            rows,
+                            constituent_count,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        let eastward_means = read_layered_series_values::<f64>(
+            &eastward_mean,
+            element_count,
+            first_series,
+            rows,
+            1,
+        )?;
+        let northward_means = read_layered_series_values::<f64>(
+            &northward_mean,
+            element_count,
+            first_series,
+            rows,
+            1,
+        )?;
+        let eastward_slopes = read_layered_series_values::<f64>(
+            &eastward_slope,
+            element_count,
+            first_series,
+            rows,
+            1,
+        )?;
+        let northward_slopes = read_layered_series_values::<f64>(
+            &northward_slope,
+            element_count,
+            first_series,
+            rows,
+            1,
+        )?;
+        let robust_chunk = robust_variables
+            .as_ref()
+            .map(
+                |(
+                    row_size,
+                    iterations,
+                    termination,
+                    residual_scale,
+                    ols_rms,
+                    rms,
+                    weights,
+                    leverage,
+                )| {
+                    let row_sizes = read_layered_series_values::<i64>(
+                        row_size,
+                        element_count,
+                        first_series,
+                        rows,
+                        1,
+                    )?;
+                    let total = row_sizes.iter().try_fold(0_usize, |total, count| {
+                        total
+                            .checked_add(usize::try_from(*count).map_err(|_| {
+                                AppError::Invalid("negative robust row size in output".to_owned())
+                            })?)
+                            .ok_or_else(|| {
+                                AppError::Invalid("robust row-size sum overflows".to_owned())
+                            })
+                    })?;
+                    let end = robust_offset.checked_add(total).ok_or_else(|| {
+                        AppError::Invalid("robust digest offset overflows".to_owned())
+                    })?;
+                    Ok::<_, AppError>((
+                        row_sizes,
+                        read_layered_series_values::<i64>(
+                            iterations,
+                            element_count,
+                            first_series,
+                            rows,
+                            1,
+                        )?,
+                        read_layered_series_values::<i64>(
+                            termination,
+                            element_count,
+                            first_series,
+                            rows,
+                            1,
+                        )?,
+                        read_layered_series_values::<f64>(
+                            residual_scale,
+                            element_count,
+                            first_series,
+                            rows,
+                            1,
+                        )?,
+                        read_layered_series_values::<f64>(
+                            ols_rms,
+                            element_count,
+                            first_series,
+                            rows,
+                            1,
+                        )?,
+                        read_layered_series_values::<f64>(
+                            rms,
+                            element_count,
+                            first_series,
+                            rows,
+                            1,
+                        )?,
+                        weights.get_values::<f64, _>(robust_offset..end)?,
+                        leverage.get_values::<f64, _>(robust_offset..end)?,
+                    ))
+                },
+            )
+            .transpose()?;
+        let mut robust_local_offset = 0;
+        for local_series in 0..rows {
+            let series = first_series + local_series;
+            let (layer_index, element_index, latitude) = input.series_coordinates(series);
+            if let Some(layer) = layer_index {
+                digest.update(
+                    u64::try_from(layer)
+                        .map_err(|_| AppError::Invalid("layer index exceeds u64".to_owned()))?
+                        .to_le_bytes(),
+                );
+            }
+            digest.update(
+                u64::try_from(element_index)
+                    .map_err(|_| AppError::Invalid("element index exceeds u64".to_owned()))?
+                    .to_le_bytes(),
+            );
+            digest.update(latitude.to_bits().to_le_bytes());
+            digest.update(reference_times[local_series].to_bits().to_le_bytes());
+            let start = local_series * constituent_count;
+            let end = start + constituent_count;
+            for matrix in &matrices {
+                for value in &matrix[start..end] {
+                    digest.update(value.to_bits().to_le_bytes());
+                }
+            }
+            if let Some(confidence_matrices) = &confidence_matrices {
+                for matrix in confidence_matrices {
+                    for value in &matrix[start..end] {
+                        digest.update(value.to_bits().to_le_bytes());
+                    }
+                }
+            }
+            for value in [
+                eastward_means[local_series],
+                northward_means[local_series],
+                eastward_slopes[local_series],
+                northward_slopes[local_series],
+            ] {
+                digest.update(value.to_bits().to_le_bytes());
+            }
+            if let Some((
+                row_sizes,
+                iterations,
+                termination,
+                residual_scales,
+                ols_rms,
+                rms,
+                weights,
+                leverage,
+            )) = &robust_chunk
+            {
+                digest_nonnegative_i64(
+                    &mut digest,
+                    iterations[local_series],
+                    "robust iteration count",
+                )?;
+                digest.update(residual_scales[local_series].to_bits().to_le_bytes());
+                digest.update(ols_rms[local_series].to_bits().to_le_bytes());
+                digest.update(rms[local_series].to_bits().to_le_bytes());
+                digest.update(termination[local_series].to_le_bytes());
+                let row_size = usize::try_from(row_sizes[local_series]).map_err(|_| {
+                    AppError::Invalid("negative robust row size in output".to_owned())
+                })?;
+                let row_end = robust_local_offset + row_size;
+                for values in [weights, leverage] {
+                    for value in &values[robust_local_offset..row_end] {
+                        digest.update(value.to_bits().to_le_bytes());
+                    }
+                }
+                robust_local_offset = row_end;
+            }
+        }
+        robust_offset += robust_local_offset;
+    }
+
+    if let Some(filter) = reconstruction {
+        update_reconstruction_filter_digest(&mut digest, filter);
+        let time_count = input.modified_julian_days.len();
+        let rows_per_block = (TARGET_RECONSTRUCTION_READ_BYTES
+            / (time_count.max(1) * std::mem::size_of::<f64>()))
+        .max(1);
+        let eastward = required_output_variable(&output, "eastward_reconstruction")?;
+        let northward = required_output_variable(&output, "northward_reconstruction")?;
+        let mut first_series = 0;
+        while first_series < series_count {
+            let layer = first_series / element_count;
+            let element = first_series % element_count;
+            let rows = (series_count - first_series)
+                .min(element_count - element)
+                .min(rows_per_block);
+            let eastward_values =
+                eastward.get_values::<f64, _>((.., layer, element..element + rows))?;
+            let northward_values =
+                northward.get_values::<f64, _>((.., layer, element..element + rows))?;
+            for series in 0..rows {
+                for values in [&eastward_values, &northward_values] {
+                    for time in 0..time_count {
+                        digest.update(values[time * rows + series].to_bits().to_le_bytes());
+                    }
+                }
+            }
+            first_series += rows;
+        }
+    } else {
+        digest.update(b"no-reconstruction\0");
+    }
+    Ok(encode_hex(&digest.finalize()))
+}
+
 fn retained_vector_samples(
     input: &VectorInputData,
     solutions: &[VectorSolution],
@@ -1577,6 +2395,51 @@ fn retained_vector_samples(
         .collect()
 }
 
+fn extend_retained_vector_samples(
+    retained: &mut Vec<VectorSampleResult>,
+    input: &VectorInputData,
+    first_series: usize,
+    observation_counts: &[usize],
+    solutions: &[VectorSolution],
+    constituent_index_by_rank: &ConstituentOrderMap,
+    sampling_diagnostics: &[CoreSamplingDiagnostics],
+) {
+    let remaining = 3_usize.saturating_sub(retained.len());
+    for local_series in 0..solutions.len().min(remaining) {
+        let series = first_series + local_series;
+        let solution = &solutions[local_series];
+        let (layer_index, element_index, latitude_degrees_north) = input.series_coordinates(series);
+        retained.push(VectorSampleResult {
+            element_index,
+            layer_index,
+            latitude_degrees_north,
+            semi_major: solution.semi_major.clone(),
+            semi_minor: solution.semi_minor.clone(),
+            inclination_degrees: solution.inclination_degrees.clone(),
+            phase_degrees: solution.phase_degrees.clone(),
+            percent_energy: solution.percent_energy.clone(),
+            constituent_index_by_rank: constituent_index_by_rank
+                .row(local_series)
+                .iter()
+                .copied()
+                .map(usize::from)
+                .collect(),
+            semi_major_ci: solution.semi_major_ci.clone(),
+            semi_minor_ci: solution.semi_minor_ci.clone(),
+            inclination_ci_degrees: solution.inclination_ci_degrees.clone(),
+            phase_ci_degrees: solution.phase_ci_degrees.clone(),
+            signal_to_noise: solution.signal_to_noise.clone(),
+            eastward_mean: solution.eastward_mean,
+            northward_mean: solution.northward_mean,
+            eastward_slope_per_day: solution.eastward_slope_per_day,
+            northward_slope_per_day: solution.northward_slope_per_day,
+            observation_count: observation_counts[local_series],
+            sampling: SeriesSamplingDiagnostics::from(&sampling_diagnostics[local_series]),
+            reference_time_modified_julian_day: solution.reference_time_days,
+        });
+    }
+}
+
 struct VectorOutputData<'data> {
     input: &'data VectorInputData,
     constituents: &'data [Constituent],
@@ -1598,29 +2461,31 @@ struct VectorOutputData<'data> {
     reconstruction: Option<(&'data ReconstructionFilter, &'data [VectorReconstruction])>,
 }
 
-fn write_vector_output(
-    path: &Path,
-    overwrite: bool,
-    data: &VectorOutputData<'_>,
-) -> Result<(), AppError> {
-    let temporary = temporary_sibling(path)?;
-    if let Err(error) = write_vector_output_file(&temporary, data) {
-        let _ignored = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    if path.exists() && !overwrite {
-        let _ignored = fs::remove_file(&temporary);
-        return Err(AppError::DestinationExists(path.to_owned()));
-    }
-    fs::rename(&temporary, path)?;
-    Ok(())
+struct VectorOutputDefinition<'data> {
+    input: &'data VectorInputData,
+    constituents: &'data [Constituent],
+    constituent_order: &'data ConstituentOrder,
+    selection: &'data ResolvedConstituentSelection,
+    inference: Option<&'data VectorInferenceConfig>,
+    fit_options: FitOptions,
+    phase_reference: PhaseReference,
+    nodal_corrections: NodalCorrections,
+    analysis_method: AnalysisMethod,
+    confidence_interval: ConfidenceInterval,
+    chunk_plan: super::SpatialChunkPlan,
+    reference_time_modified_julian_day: f64,
+    reconstruction: Option<&'data ReconstructionFilter>,
+    result_output: &'static str,
 }
 
 #[allow(
     clippy::too_many_lines,
-    reason = "the vector NetCDF schema is one visible transaction"
+    reason = "the vector NetCDF metadata contract is kept together"
 )]
-fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<(), AppError> {
+fn create_vector_output_base(
+    path: &Path,
+    data: &VectorOutputDefinition<'_>,
+) -> Result<FileMut, AppError> {
     let input = data.input;
     let mut output = netcdf::create(path)?;
     if let Some(layers) = &input.layer_indices {
@@ -1651,6 +2516,7 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
         i64::from(VECTOR_OUTPUT_SCHEMA_VERSION),
     )?;
     output.add_attribute("rutide_version", rutide_core::VERSION)?;
+    output.add_attribute("result_output", data.result_output)?;
     output.add_attribute(
         "source_time_count",
         i64::try_from(input.source_time_count)
@@ -1767,7 +2633,6 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
         "reference_time_modified_julian_day",
         data.reference_time_modified_julian_day,
     )?;
-    output.add_attribute("result_sha256", data.result_sha256)?;
 
     let element_indices = input
         .element_indices
@@ -1808,6 +2673,849 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
             "1",
         )?;
     }
+    Ok(output)
+}
+
+struct IncrementalVectorOutput {
+    destination: PathBuf,
+    temporary: PathBuf,
+    output: Option<FileMut>,
+    element_count: usize,
+    time_count: usize,
+    constituent_count: usize,
+    analysis_method: AnalysisMethod,
+    confidence_interval: ConfidenceInterval,
+    robust_observation_offset: usize,
+    installed: bool,
+}
+
+impl IncrementalVectorOutput {
+    fn create(destination: &Path, data: &VectorOutputDefinition<'_>) -> Result<Self, AppError> {
+        if !data.input.is_depth_resolved() {
+            return Err(AppError::Invalid(
+                "incremental vector output currently requires native sigma layers".to_owned(),
+            ));
+        }
+        let temporary = temporary_sibling(destination)?;
+        let output = match create_vector_output_base(&temporary, data) {
+            Ok(output) => output,
+            Err(error) => {
+                let _ignored = fs::remove_file(&temporary);
+                return Err(error);
+            }
+        };
+        let mut sink = Self {
+            destination: destination.to_owned(),
+            temporary,
+            output: Some(output),
+            element_count: data.input.element_indices.len(),
+            time_count: data.input.modified_julian_days.len(),
+            constituent_count: data.constituents.len(),
+            analysis_method: data.analysis_method,
+            confidence_interval: data.confidence_interval,
+            robust_observation_offset: 0,
+            installed: false,
+        };
+        let output = sink.output.as_mut().ok_or_else(|| {
+            AppError::Invalid("incremental output closed during initialization".to_owned())
+        })?;
+        define_incremental_vector_variables(output, data)?;
+        Ok(sink)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "chunk-local arrays remain explicit at the transactional sink boundary"
+    )]
+    fn write_chunk(
+        &mut self,
+        first_series: usize,
+        observation_counts: &[usize],
+        frequencies: &[Vec<f64>],
+        solutions: &[VectorSolution],
+        constituent_order: &ConstituentOrderMap,
+        sampling: &[CoreSamplingDiagnostics],
+        reconstruction: Option<&[VectorReconstruction]>,
+    ) -> Result<(), AppError> {
+        let output = self
+            .output
+            .as_mut()
+            .ok_or_else(|| AppError::Invalid("incremental output is already closed".to_owned()))?;
+        write_incremental_vector_chunk(
+            output,
+            self.element_count,
+            self.time_count,
+            self.constituent_count,
+            self.analysis_method,
+            self.confidence_interval,
+            first_series,
+            observation_counts,
+            frequencies,
+            solutions,
+            constituent_order,
+            sampling,
+            reconstruction,
+            &mut self.robust_observation_offset,
+        )
+    }
+
+    fn close(&mut self) -> Result<(), AppError> {
+        if let Some(output) = self.output.take() {
+            output.close()?;
+        }
+        Ok(())
+    }
+
+    fn temporary_path(&self) -> &Path {
+        &self.temporary
+    }
+
+    fn install(mut self, overwrite: bool, result_sha256: &str) -> Result<(), AppError> {
+        self.close()?;
+        let mut output = netcdf::append(&self.temporary)?;
+        output.add_attribute("result_sha256", result_sha256)?;
+        output.close()?;
+        if self.destination.exists() && !overwrite {
+            return Err(AppError::DestinationExists(self.destination.clone()));
+        }
+        fs::rename(&self.temporary, &self.destination)?;
+        self.installed = true;
+        Ok(())
+    }
+}
+
+impl Drop for IncrementalVectorOutput {
+    fn drop(&mut self) {
+        if !self.installed {
+            let _ignored = self.output.take().and_then(|output| output.close().ok());
+            let _ignored = fs::remove_file(&self.temporary);
+        }
+    }
+}
+
+fn add_variable_with_units<T: netcdf::NcTypeDescriptor>(
+    output: &mut FileMut,
+    name: &str,
+    dimensions: &[&str],
+    units: &str,
+) -> Result<(), AppError> {
+    output
+        .add_variable::<T>(name, dimensions)?
+        .put_attribute("units", units)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the incremental schema mirrors the buffered vector schema"
+)]
+fn define_incremental_vector_variables(
+    output: &mut FileMut,
+    data: &VectorOutputDefinition<'_>,
+) -> Result<(), AppError> {
+    let series_dimensions = data.input.series_dimensions();
+    let solution_dimensions = data.input.solution_dimensions();
+    add_variable_with_units::<i64>(output, "observation_count", series_dimensions, "1")?;
+    add_variable_with_units::<f64>(
+        output,
+        "reference_time",
+        series_dimensions,
+        "days since 1858-11-17 00:00:00 UTC",
+    )?;
+    add_variable_with_units::<f64>(output, "frequency", &solution_dimensions, "cycles per hour")?;
+    let mut order_dimensions = series_dimensions.to_vec();
+    order_dimensions.push("presentation_rank");
+    let mut order = output.add_variable::<i64>("constituent_index_by_rank", &order_dimensions)?;
+    order.put_attribute(
+        "long_name",
+        "stable constituent index at each requested presentation rank",
+    )?;
+    order.put_attribute("start_index", 0_i64)?;
+
+    let lower = COLORED_NOISE_FREQUENCY_BANDS_CPH.map(|band| band[0]);
+    let upper = COLORED_NOISE_FREQUENCY_BANDS_CPH.map(|band| band[1]);
+    write_variable(
+        &mut output.add_variable::<f64>("spectral_band_lower_frequency", &["spectral_band"])?,
+        &lower,
+        "cycles per hour",
+    )?;
+    write_variable(
+        &mut output.add_variable::<f64>("spectral_band_upper_frequency", &["spectral_band"])?,
+        &upper,
+        "cycles per hour",
+    )?;
+    for (name, units) in [
+        ("sampling_record_span", "days"),
+        ("sampling_mean_interval", "hours"),
+        ("sampling_largest_gap", "hours"),
+    ] {
+        add_variable_with_units::<f64>(output, name, series_dimensions, units)?;
+    }
+    let mut spectrum_method =
+        output.add_variable::<i64>("residual_spectrum_method", series_dimensions)?;
+    spectrum_method.put_attribute("flag_values", vec![0_i64, 1])?;
+    spectrum_method.put_attribute("flag_meanings", "fft lomb_scargle")?;
+    add_variable_with_units::<i64>(
+        output,
+        "residual_spectrum_time_count",
+        series_dimensions,
+        "1",
+    )?;
+    let mut spectral_dimensions = series_dimensions.to_vec();
+    spectral_dimensions.push("spectral_band");
+    for name in [
+        "spectral_band_frequency_bin_count",
+        "spectral_band_usable_bin_count",
+    ] {
+        add_variable_with_units::<i64>(output, name, &spectral_dimensions, "1")?;
+    }
+
+    for (name, units) in [
+        ("semi_major", "source velocity units"),
+        ("semi_minor", "source velocity units"),
+        ("inclination", "degrees"),
+        ("phase", "degrees"),
+        ("percent_energy", "percent"),
+    ] {
+        add_variable_with_units::<f64>(output, name, &solution_dimensions, units)?;
+    }
+    if data.confidence_interval != ConfidenceInterval::None {
+        for (name, units) in [
+            ("semi_major_ci", "source velocity units"),
+            ("semi_minor_ci", "source velocity units"),
+            ("inclination_ci", "degrees"),
+            ("phase_ci", "degrees"),
+            ("signal_to_noise", "1"),
+        ] {
+            add_variable_with_units::<f64>(output, name, &solution_dimensions, units)?;
+        }
+    }
+    for (name, units) in [
+        ("eastward_mean", "source velocity units"),
+        ("northward_mean", "source velocity units"),
+        ("eastward_slope", "source velocity units per day"),
+        ("northward_slope", "source velocity units per day"),
+    ] {
+        add_variable_with_units::<f64>(output, name, series_dimensions, units)?;
+    }
+
+    if data.analysis_method != AnalysisMethod::Ols {
+        output.add_unlimited_dimension("robust_observation")?;
+        for name in ["robust_weight_row_size", "robust_iterations"] {
+            add_variable_with_units::<i64>(output, name, series_dimensions, "1")?;
+        }
+        output
+            .variable_mut("robust_weight_row_size")
+            .ok_or_else(|| {
+                AppError::Invalid("robust row-size variable was not created".to_owned())
+            })?
+            .put_attribute("sample_dimension", "robust_observation")?;
+        let mut termination =
+            output.add_variable::<i64>("robust_termination", series_dimensions)?;
+        termination.put_attribute("units", "1")?;
+        termination.put_attribute("flag_values", vec![0_i64, 1, 2])?;
+        termination.put_attribute("flag_meanings", "tolerance objective_increase exact_fit")?;
+        for name in [
+            "robust_residual_scale",
+            "robust_ols_rms_residual",
+            "robust_rms_residual",
+        ] {
+            add_variable_with_units::<f64>(
+                output,
+                name,
+                series_dimensions,
+                "source velocity units",
+            )?;
+        }
+        for name in ["robust_weight", "robust_leverage"] {
+            add_variable_with_units::<f64>(output, name, &["robust_observation"], "1")?;
+        }
+    }
+
+    if let Some(filter) = data.reconstruction {
+        let report = reconstruction_report(filter, data.input.modified_julian_days.len());
+        output.add_attribute("reconstruction_filter", report.filter)?;
+        if let Some(constituents) = report.constituents {
+            output.add_attribute("reconstruction_constituents", constituents.join(","))?;
+        }
+        if let Some(value) = report.minimum_percent_energy {
+            output.add_attribute("reconstruction_minimum_percent_energy", value)?;
+        }
+        if let Some(value) = report.minimum_signal_to_noise {
+            output.add_attribute("reconstruction_minimum_signal_to_noise", value)?;
+        }
+        write_variable(
+            &mut output.add_variable::<f64>("time", &["time"])?,
+            &data.input.modified_julian_days,
+            "days since 1858-11-17 00:00:00 UTC",
+        )?;
+        for name in ["eastward_reconstruction", "northward_reconstruction"] {
+            add_variable_with_units::<f64>(
+                output,
+                name,
+                &["time", "siglay", "element"],
+                "source velocity units",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn put_layered_series_values<T: netcdf::NcTypeDescriptor + Copy>(
+    output: &mut FileMut,
+    variable_name: &str,
+    element_count: usize,
+    first_series: usize,
+    row_width: usize,
+    values: &[T],
+) -> Result<(), AppError> {
+    if element_count == 0 || row_width == 0 || !values.len().is_multiple_of(row_width) {
+        return Err(AppError::Invalid(format!(
+            "invalid incremental shape for {variable_name}"
+        )));
+    }
+    let row_count = values.len() / row_width;
+    let mut local_first = 0;
+    while local_first < row_count {
+        let global_first = first_series + local_first;
+        let layer = global_first / element_count;
+        let element = global_first % element_count;
+        let rows = (row_count - local_first).min(element_count - element);
+        let value_first = local_first * row_width;
+        let value_end = (local_first + rows) * row_width;
+        let mut extents = vec![
+            netcdf::Extent::Index(layer),
+            netcdf::Extent::from(element..element + rows),
+        ];
+        if row_width > 1 {
+            extents.push(netcdf::Extent::from(..));
+        }
+        output
+            .variable_mut(variable_name)
+            .ok_or_else(|| AppError::Invalid(format!("missing output variable {variable_name}")))?
+            .put_values(&values[value_first..value_end], extents)?;
+        local_first += rows;
+    }
+    Ok(())
+}
+
+fn write_layered_reconstruction_chunk(
+    output: &mut FileMut,
+    element_count: usize,
+    time_count: usize,
+    first_series: usize,
+    values: &[VectorReconstruction],
+) -> Result<(), AppError> {
+    const TARGET_TRANSPOSE_BYTES: usize = 64 * 1024 * 1024;
+    if values
+        .iter()
+        .any(|series| series.eastward.len() != time_count || series.northward.len() != time_count)
+    {
+        return Err(AppError::Invalid(
+            "vector reconstruction shape does not match incremental output".to_owned(),
+        ));
+    }
+    let rows_per_buffer =
+        (TARGET_TRANSPOSE_BYTES / (time_count.max(1) * std::mem::size_of::<f64>())).max(1);
+    for (name, eastward) in [
+        ("eastward_reconstruction", true),
+        ("northward_reconstruction", false),
+    ] {
+        let mut local_first = 0;
+        while local_first < values.len() {
+            let global_first = first_series + local_first;
+            let layer = global_first / element_count;
+            let element = global_first % element_count;
+            let rows = (values.len() - local_first)
+                .min(element_count - element)
+                .min(rows_per_buffer);
+            let block = &values[local_first..local_first + rows];
+            let mut time_major = Vec::with_capacity(time_count * rows);
+            for time in 0..time_count {
+                time_major.extend(block.iter().map(|series| {
+                    if eastward {
+                        series.eastward[time]
+                    } else {
+                        series.northward[time]
+                    }
+                }));
+            }
+            output
+                .variable_mut(name)
+                .ok_or_else(|| AppError::Invalid(format!("missing output variable {name}")))?
+                .put_values(&time_major, (.., layer, element..element + rows))?;
+            local_first += rows;
+        }
+    }
+    Ok(())
+}
+
+fn collect_vector_solution_field<F>(
+    solutions: &[VectorSolution],
+    constituent_count: usize,
+    field: F,
+) -> Result<Vec<f64>, AppError>
+where
+    F: for<'solution> Fn(&'solution VectorSolution) -> &'solution [f64],
+{
+    let mut values = Vec::with_capacity(solutions.len() * constituent_count);
+    for (series, solution) in solutions.iter().enumerate() {
+        let row = field(solution);
+        if row.len() != constituent_count {
+            return Err(AppError::Invalid(format!(
+                "vector result series {series} contains {} constituents; expected {constituent_count}",
+                row.len()
+            )));
+        }
+        values.extend_from_slice(row);
+    }
+    Ok(values)
+}
+
+fn write_vector_solution_field<F>(
+    output: &mut FileMut,
+    name: &str,
+    element_count: usize,
+    first_series: usize,
+    constituent_count: usize,
+    solutions: &[VectorSolution],
+    field: F,
+) -> Result<(), AppError>
+where
+    F: for<'solution> Fn(&'solution VectorSolution) -> &'solution [f64],
+{
+    let values = collect_vector_solution_field(solutions, constituent_count, field)?;
+    put_layered_series_values(
+        output,
+        name,
+        element_count,
+        first_series,
+        constituent_count,
+        &values,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one chunk writer validates and serializes the complete vector schema"
+)]
+fn write_incremental_vector_chunk(
+    output: &mut FileMut,
+    element_count: usize,
+    time_count: usize,
+    constituent_count: usize,
+    analysis_method: AnalysisMethod,
+    confidence_interval: ConfidenceInterval,
+    first_series: usize,
+    observation_counts: &[usize],
+    frequencies: &[Vec<f64>],
+    solutions: &[VectorSolution],
+    constituent_order: &ConstituentOrderMap,
+    sampling: &[CoreSamplingDiagnostics],
+    reconstruction: Option<&[VectorReconstruction]>,
+    robust_observation_offset: &mut usize,
+) -> Result<(), AppError> {
+    let series_count = solutions.len();
+    if observation_counts.len() != series_count
+        || frequencies.len() != series_count
+        || sampling.len() != series_count
+        || !constituent_order.is_valid_for(series_count, constituent_count)
+        || reconstruction.is_some_and(|values| values.len() != series_count)
+    {
+        return Err(AppError::Invalid(
+            "incremental vector chunk shapes differ".to_owned(),
+        ));
+    }
+
+    let observation_counts = observation_counts
+        .iter()
+        .copied()
+        .map(|count| {
+            i64::try_from(count)
+                .map_err(|_| AppError::Invalid("observation count exceeds i64".to_owned()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    put_layered_series_values(
+        output,
+        "observation_count",
+        element_count,
+        first_series,
+        1,
+        &observation_counts,
+    )?;
+    let reference_times = solutions
+        .iter()
+        .map(|solution| solution.reference_time_days)
+        .collect::<Vec<_>>();
+    put_layered_series_values(
+        output,
+        "reference_time",
+        element_count,
+        first_series,
+        1,
+        &reference_times,
+    )?;
+    if frequencies
+        .iter()
+        .any(|frequency| frequency.len() != constituent_count)
+    {
+        return Err(AppError::Invalid(
+            "frequency result shape does not match incremental output".to_owned(),
+        ));
+    }
+    let frequency_values = frequencies.iter().flatten().copied().collect::<Vec<_>>();
+    put_layered_series_values(
+        output,
+        "frequency",
+        element_count,
+        first_series,
+        constituent_count,
+        &frequency_values,
+    )?;
+    let mut order_values = Vec::with_capacity(series_count * constituent_count);
+    for series in 0..series_count {
+        order_values.extend(constituent_order.row(series).iter().copied().map(i64::from));
+    }
+    put_layered_series_values(
+        output,
+        "constituent_index_by_rank",
+        element_count,
+        first_series,
+        constituent_count,
+        &order_values,
+    )?;
+
+    for (name, values) in [
+        (
+            "sampling_record_span",
+            sampling
+                .iter()
+                .map(|series| series.record_span_days)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "sampling_mean_interval",
+            sampling
+                .iter()
+                .map(|series| series.mean_sample_interval_hours)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "sampling_largest_gap",
+            sampling
+                .iter()
+                .map(|series| series.largest_gap_hours)
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        put_layered_series_values(output, name, element_count, first_series, 1, &values)?;
+    }
+    let spectrum_methods = sampling
+        .iter()
+        .map(|series| match series.residual_spectrum_method {
+            ResidualSpectrumMethod::Fft => 0_i64,
+            ResidualSpectrumMethod::LombScargle => 1_i64,
+        })
+        .collect::<Vec<_>>();
+    put_layered_series_values(
+        output,
+        "residual_spectrum_method",
+        element_count,
+        first_series,
+        1,
+        &spectrum_methods,
+    )?;
+    let spectrum_time_counts = sampling
+        .iter()
+        .map(|series| {
+            i64::try_from(series.residual_spectrum_time_count).map_err(|_| {
+                AppError::Invalid("residual spectrum time count exceeds i64".to_owned())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    put_layered_series_values(
+        output,
+        "residual_spectrum_time_count",
+        element_count,
+        first_series,
+        1,
+        &spectrum_time_counts,
+    )?;
+    for (name, counts) in [
+        (
+            "spectral_band_frequency_bin_count",
+            sampling
+                .iter()
+                .flat_map(|series| series.spectral_band_bin_count)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "spectral_band_usable_bin_count",
+            sampling
+                .iter()
+                .flat_map(|series| series.spectral_band_usable_bin_count)
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        let counts = counts
+            .into_iter()
+            .map(|count| {
+                i64::try_from(count)
+                    .map_err(|_| AppError::Invalid("spectral bin count exceeds i64".to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        put_layered_series_values(output, name, element_count, first_series, 9, &counts)?;
+    }
+
+    write_vector_solution_field(
+        output,
+        "semi_major",
+        element_count,
+        first_series,
+        constituent_count,
+        solutions,
+        |solution| &solution.semi_major,
+    )?;
+    write_vector_solution_field(
+        output,
+        "semi_minor",
+        element_count,
+        first_series,
+        constituent_count,
+        solutions,
+        |solution| &solution.semi_minor,
+    )?;
+    write_vector_solution_field(
+        output,
+        "inclination",
+        element_count,
+        first_series,
+        constituent_count,
+        solutions,
+        |solution| &solution.inclination_degrees,
+    )?;
+    write_vector_solution_field(
+        output,
+        "phase",
+        element_count,
+        first_series,
+        constituent_count,
+        solutions,
+        |solution| &solution.phase_degrees,
+    )?;
+    write_vector_solution_field(
+        output,
+        "percent_energy",
+        element_count,
+        first_series,
+        constituent_count,
+        solutions,
+        |solution| &solution.percent_energy,
+    )?;
+    if confidence_interval != ConfidenceInterval::None {
+        for (name, selector) in [
+            ("semi_major_ci", 0_u8),
+            ("semi_minor_ci", 1),
+            ("inclination_ci", 2),
+            ("phase_ci", 3),
+            ("signal_to_noise", 4),
+        ] {
+            let mut values = Vec::with_capacity(series_count * constituent_count);
+            for solution in solutions {
+                let confidence = vector_confidence_values(solution, confidence_interval)?
+                    .ok_or_else(|| {
+                        AppError::Invalid("vector confidence output was omitted".to_owned())
+                    })?;
+                values.extend_from_slice(match selector {
+                    0 => confidence.0,
+                    1 => confidence.1,
+                    2 => confidence.2,
+                    3 => confidence.3,
+                    4 => confidence.4,
+                    _ => unreachable!("confidence selector is internal"),
+                });
+            }
+            put_layered_series_values(
+                output,
+                name,
+                element_count,
+                first_series,
+                constituent_count,
+                &values,
+            )?;
+        }
+    }
+    for (name, values) in [
+        (
+            "eastward_mean",
+            solutions
+                .iter()
+                .map(|solution| solution.eastward_mean)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "northward_mean",
+            solutions
+                .iter()
+                .map(|solution| solution.northward_mean)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "eastward_slope",
+            solutions
+                .iter()
+                .map(|solution| solution.eastward_slope_per_day)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "northward_slope",
+            solutions
+                .iter()
+                .map(|solution| solution.northward_slope_per_day)
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        put_layered_series_values(output, name, element_count, first_series, 1, &values)?;
+    }
+
+    if analysis_method == AnalysisMethod::Ols {
+        if solutions.iter().any(|solution| solution.robust.is_some()) {
+            return Err(AppError::Invalid(
+                "OLS solver returned unexpected robust diagnostics".to_owned(),
+            ));
+        }
+    } else {
+        let diagnostics = solutions
+            .iter()
+            .map(|solution| {
+                solution.robust.as_ref().ok_or_else(|| {
+                    AppError::Invalid("robust solver omitted diagnostics".to_owned())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut row_size = Vec::with_capacity(series_count);
+        let mut iterations = Vec::with_capacity(series_count);
+        let mut termination = Vec::with_capacity(series_count);
+        let mut residual_scale = Vec::with_capacity(series_count);
+        let mut ols_rms_residual = Vec::with_capacity(series_count);
+        let mut rms_residual = Vec::with_capacity(series_count);
+        let total_observations = diagnostics
+            .iter()
+            .map(|diagnostics| diagnostics.weights.len())
+            .sum();
+        for diagnostics in &diagnostics {
+            if diagnostics.weights.len() != diagnostics.leverage.len() {
+                return Err(AppError::Invalid(
+                    "robust weight and leverage lengths differ".to_owned(),
+                ));
+            }
+            row_size.push(i64::try_from(diagnostics.weights.len()).map_err(|_| {
+                AppError::Invalid("robust observation count exceeds i64".to_owned())
+            })?);
+            iterations.push(
+                i64::try_from(diagnostics.iterations).map_err(|_| {
+                    AppError::Invalid("robust iteration count exceeds i64".to_owned())
+                })?,
+            );
+            termination.push(robust_termination_code(diagnostics.termination));
+            residual_scale.push(diagnostics.residual_scale);
+            ols_rms_residual.push(diagnostics.ols_rms_residual);
+            rms_residual.push(diagnostics.rms_residual);
+        }
+        for (name, values) in [
+            ("robust_weight_row_size", &row_size),
+            ("robust_iterations", &iterations),
+            ("robust_termination", &termination),
+        ] {
+            put_layered_series_values(output, name, element_count, first_series, 1, values)?;
+        }
+        for (name, values) in [
+            ("robust_residual_scale", &residual_scale),
+            ("robust_ols_rms_residual", &ols_rms_residual),
+            ("robust_rms_residual", &rms_residual),
+        ] {
+            put_layered_series_values(output, name, element_count, first_series, 1, values)?;
+        }
+        let end = robust_observation_offset
+            .checked_add(total_observations)
+            .ok_or_else(|| AppError::Invalid("robust observation offset overflows".to_owned()))?;
+        let weights = diagnostics
+            .iter()
+            .flat_map(|diagnostics| diagnostics.weights.iter().copied())
+            .collect::<Vec<_>>();
+        output
+            .variable_mut("robust_weight")
+            .ok_or_else(|| AppError::Invalid("missing robust weight output".to_owned()))?
+            .put_values(&weights, *robust_observation_offset..end)?;
+        drop(weights);
+        let leverage = diagnostics
+            .iter()
+            .flat_map(|diagnostics| diagnostics.leverage.iter().copied())
+            .collect::<Vec<_>>();
+        output
+            .variable_mut("robust_leverage")
+            .ok_or_else(|| AppError::Invalid("missing robust leverage output".to_owned()))?
+            .put_values(&leverage, *robust_observation_offset..end)?;
+        *robust_observation_offset = end;
+    }
+
+    if let Some(reconstruction) = reconstruction {
+        write_layered_reconstruction_chunk(
+            output,
+            element_count,
+            time_count,
+            first_series,
+            reconstruction,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_vector_output(
+    path: &Path,
+    overwrite: bool,
+    data: &VectorOutputData<'_>,
+) -> Result<(), AppError> {
+    let temporary = temporary_sibling(path)?;
+    if let Err(error) = write_vector_output_file(&temporary, data) {
+        let _ignored = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if path.exists() && !overwrite {
+        let _ignored = fs::remove_file(&temporary);
+        return Err(AppError::DestinationExists(path.to_owned()));
+    }
+    fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the vector NetCDF schema is one visible transaction"
+)]
+fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<(), AppError> {
+    let input = data.input;
+    let mut output = create_vector_output_base(
+        path,
+        &VectorOutputDefinition {
+            input,
+            constituents: data.constituents,
+            constituent_order: data.constituent_order,
+            selection: data.selection,
+            inference: data.inference,
+            fit_options: data.fit_options,
+            phase_reference: data.phase_reference,
+            nodal_corrections: data.nodal_corrections,
+            analysis_method: data.analysis_method,
+            confidence_interval: data.confidence_interval,
+            chunk_plan: data.chunk_plan,
+            reference_time_modified_julian_day: data.reference_time_modified_julian_day,
+            reconstruction: data.reconstruction.map(|(filter, _)| filter),
+            result_output: "buffered",
+        },
+    )?;
+    output.add_attribute("result_sha256", data.result_sha256)?;
     let observation_counts = input
         .observation_counts
         .iter()
@@ -2337,6 +4045,7 @@ mod tests {
             overwrite: false,
         };
         let report = analyze_vector(&config).expect("analyze vector fixture");
+        assert_eq!(report.result_output, "buffered");
         let mut chunked_config = config.clone();
         chunked_config.output = chunked_output_path.clone();
         chunked_config.chunk_series = Some(1);
@@ -2484,6 +4193,10 @@ mod tests {
         layered_config.layers = Some(NodeSelection::Indices(vec![2, 0]));
         let layered_report =
             analyze_vector(&layered_config).expect("analyze native sigma-layer currents");
+        assert_eq!(
+            layered_report.result_sha256,
+            "037de642b316829ecbc498e261c5f8e95c73fe880be1dd5a5dd3e092716ca065"
+        );
         let mut layered_chunked_config = layered_config.clone();
         layered_chunked_config.output = layered_chunked_output_path.clone();
         layered_chunked_config.chunk_series = Some(3);
@@ -2502,7 +4215,25 @@ mod tests {
             layered_chunked_report.result_sha256,
             layered_report.result_sha256
         );
+        assert_eq!(layered_report.result_output, "incremental");
+        assert_eq!(layered_chunked_report.result_output, "incremental");
+        assert_eq!(
+            layered_chunked_report.sampling.minimum_observation_count,
+            layered_report.sampling.minimum_observation_count
+        );
+        assert_eq!(
+            layered_chunked_report.sample_results[0].semi_major,
+            layered_report.sample_results[0].semi_major
+        );
         let layered_output = netcdf::open(&layered_output_path).expect("open layered output");
+        assert_eq!(
+            layered_output
+                .attribute("result_output")
+                .expect("incremental result-output metadata")
+                .value()
+                .expect("read result-output metadata"),
+            netcdf::AttributeValue::Str("incremental".to_owned())
+        );
         assert_eq!(
             layered_output
                 .variable("siglay_index")

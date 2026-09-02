@@ -47,7 +47,6 @@ the single-hyperslab path. Sparse selections instead traverse records in storage
 order and coalesce nearby elements, avoiding repeated whole-file seeks while
 preserving the exact requested output order.
 
-Base all-layer OLS is practical without an incremental result sink on this host.
-Such a sink remains a targeted future optimization for result-rich combinations
-such as Monte Carlo confidence, robust ragged diagnostics, or complete
-three-dimensional reconstruction, not a prerequisite for native-layer analysis.
+This table records the original buffered-result implementation. The subsequent
+incremental sink preserved the all-layer digest while reducing peak RSS by
+52.0%; see `incremental-layered-output-2026-09-02.md`.

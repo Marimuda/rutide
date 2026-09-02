@@ -213,11 +213,11 @@
     {
       "id": "incremental-result-output",
       "title": "Incremental result output for result-heavy layered fields",
-      "support": "planned",
+      "support": "supported",
       "scopes": ["fvcom-vector", "output"],
       "parity": "not-applicable",
-      "evidence": [],
-      "limitations": ["Current implementation retains compact results until one transactional NetCDF write"]
+      "evidence": ["benchmarks/results/incremental-layered-output-2026-09-02.md"],
+      "limitations": ["Depth-averaged vector and scalar results retain their compact whole-domain coefficient arrays"]
     },
     {
       "id": "fixed-depth-currents",
