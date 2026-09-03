@@ -7,6 +7,8 @@ published API and file-schema contracts.
 
 ## Unreleased
 
+## 0.3.0 - 2026-09-03
+
 ### Added
 
 - Typed real pre-filter transfer-function correction across Rust scalar/vector
