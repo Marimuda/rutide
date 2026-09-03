@@ -50,7 +50,7 @@ the largest FVCOM fixture:
 python -m rutide_baseline.real_data_acceptance \
   --adcp /path/to/OS_CCE1_11_D_ADCP.nc \
   --fvcom ../projects/fvcom/claude_scratchpad/baroclinic_vikc1701/run/frs2f_0001.nc \
-  --fvcom-series 4096 --workers 16 --expected-version 0.2.0 \
+  --fvcom-series 4096 --workers 16 --expected-version 0.3.0 \
   --output benchmark-results/real-data-acceptance.json
 ```
 

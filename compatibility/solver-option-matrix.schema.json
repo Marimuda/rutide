@@ -43,6 +43,7 @@
         "nodal_corrections",
         "confidence_method",
         "confidence_noise",
+        "constituent_diagnostics",
         "constituent_order",
         "reconstruction"
       ],
@@ -58,6 +59,7 @@
         "nodal_corrections": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
         "confidence_method": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
         "confidence_noise": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
+        "constituent_diagnostics": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
         "constituent_order": { "$ref": "#/$defs/nonEmptyUniqueStrings" },
         "reconstruction": { "$ref": "#/$defs/nonEmptyUniqueStrings" }
       }

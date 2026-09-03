@@ -14,33 +14,38 @@ use netcdf::{
 };
 use rayon::{ThreadPoolBuilder, prelude::*};
 use rutide_core::{
-    AnalysisError, COLORED_NOISE_FREQUENCY_BANDS_CPH, Constituent, FitOptions, GreenwichNodalBatch,
-    GreenwichNodalReconstructor, NodalCorrections, PhaseReference, ReconstructionFilter,
-    ResidualSpectrumMethod, RobustDiagnostics, RobustTermination, SolverOptions, TidalConstituent,
-    VectorInferenceBatch, VectorReconstruction, VectorSolution,
+    AnalysisError, COLORED_NOISE_FREQUENCY_BANDS_CPH, Constituent, ConstituentDiagnosticsOptions,
+    ConstituentSelectionDiagnostics, FitOptions, GreenwichNodalBatch, GreenwichNodalReconstructor,
+    NodalCorrections, PhaseReference, ReconstructionFilter, ResidualSpectrumMethod,
+    RobustDiagnostics, RobustTermination, SolverOptions, TidalConstituent, VectorInferenceBatch,
+    VectorReconstruction, VectorSolution,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::{
     AnalysisMethod, AnalyzeConfig, AppError, BoundedInputPipeline, ConfidenceInterval,
-    ConstituentOrder, ConstituentOrderMap, ConstituentSelection, ConstituentSelectionReport,
-    CoreSamplingDiagnostics, InferenceReport, NodeSelection, ReconstructionReport,
-    ResolvedConstituentSelection, RobustOptionsReport, SamplingSummary, SeriesSamplingDiagnostics,
-    SpectralBandSummary, StageTimings, VectorInferenceConfig, constituent_order_indices,
-    diagnose_sampling, encode_hex, nodal_profile_component, normalize_source_observation,
-    order_profile_suffix, read_fvcom_time_axis, read_selected_1d, read_selected_time_major,
-    reconstruction_report, required_dimension_length, required_variable,
+    ConstituentDiagnosticsReport, ConstituentOrder, ConstituentOrderMap, ConstituentSelection,
+    ConstituentSelectionReport, CoreSamplingDiagnostics, InferenceReport, NodeSelection,
+    ReconstructionReport, ResolvedConstituentSelection, RobustOptionsReport, SamplingSummary,
+    SeriesSamplingDiagnostics, SpectralBandSummary, StageTimings, VectorInferenceConfig,
+    constituent_order_indices, define_constituent_diagnostic_variables, diagnose_sampling,
+    diagnostic_neighbor_value, diagnostic_scalar_value, encode_hex, nodal_profile_component,
+    normalize_source_observation, order_profile_suffix, read_fvcom_time_axis, read_selected_1d,
+    read_selected_time_major, reconstruction_report, required_dimension_length, required_variable,
     resolve_constituent_selection, retain_time_major_rows, robust_termination_code,
-    spatial_chunk_plan, summarize_sampling, temporary_sibling, update_constituent_order_digest,
+    spatial_chunk_plan, summarize_sampling, temporary_sibling,
+    update_constituent_diagnostics_digest, update_constituent_order_digest,
     update_inference_digest, update_reconstruction_filter_digest, update_robust_options_digest,
-    update_sampling_digest, validate_config, validate_dimensions, validate_reconstruction_filter,
-    validate_source_value, write_constituent_order_indices, write_inference_metadata,
-    write_json_report, write_robust_schema_metadata, write_sampling_diagnostics, write_variable,
+    update_sampling_digest, validate_config, validate_constituent_diagnostics_shape,
+    validate_dimensions, validate_reconstruction_filter, validate_source_value,
+    write_constituent_diagnostics, write_constituent_diagnostics_attributes,
+    write_constituent_order_indices, write_inference_metadata, write_json_report,
+    write_robust_schema_metadata, write_sampling_diagnostics, write_variable,
 };
 
 /// `NetCDF` and JSON report schema emitted by vector-current analyses.
-pub const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 14;
+pub const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 15;
 const FIXED_DEPTH_ZETA_SPAN_AMPLIFICATION: usize = 6;
 
 /// Configuration for one FVCOM current analysis.
@@ -77,6 +82,8 @@ pub struct VectorAnalyzeConfig {
     pub confidence_interval: ConfidenceInterval,
     /// Ordinary or configured robust least squares.
     pub analysis_method: AnalysisMethod,
+    /// Optional extended constituent-identifiability diagnostics.
+    pub constituent_diagnostics: Option<ConstituentDiagnosticsOptions>,
     /// Optional complete-series reconstruction and constituent filter.
     pub reconstruction: Option<ReconstructionFilter>,
     /// Number of outer spatial worker threads.
@@ -236,6 +243,9 @@ pub struct VectorRunReport {
     /// Root random seed for Monte Carlo confidence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monte_carlo_seed: Option<u64>,
+    /// Extended constituent-identifiability diagnostics, when enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constituent_diagnostics: Option<ConstituentDiagnosticsReport>,
     /// Complete-series reconstruction configuration, when enabled.
     pub reconstruction: Option<ReconstructionReport>,
     /// Constituent names in coefficient order.
@@ -755,6 +765,24 @@ impl VectorAnalysisBatch {
             Self::Inferred(batch) => batch.reconstructor_modified_julian_days(times),
         }
     }
+
+    fn diagnose_vector_time_major(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        solutions: &[VectorSolution],
+        options: ConstituentDiagnosticsOptions,
+    ) -> Result<Vec<ConstituentSelectionDiagnostics>, AnalysisError> {
+        match self {
+            Self::Standard(batch) => {
+                batch.diagnose_vector_time_major(eastward, northward, latitudes, solutions, options)
+            }
+            Self::Inferred(batch) => {
+                batch.diagnose_vector_time_major(eastward, northward, latitudes, solutions, options)
+            }
+        }
+    }
 }
 
 /// Analyze depth-averaged, native sigma-layer, or fixed-depth FVCOM currents.
@@ -968,6 +996,13 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
     } else {
         Vec::with_capacity(series_count)
     };
+    let mut constituent_diagnostics = if incremental_results {
+        None
+    } else {
+        config
+            .constituent_diagnostics
+            .map(|_| Vec::with_capacity(series_count))
+    };
     let mut reconstruction = if incremental_results {
         None
     } else {
@@ -1001,6 +1036,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                 nodal_corrections: config.nodal_corrections,
                 analysis_method: config.analysis_method,
                 confidence_interval: config.confidence_interval,
+                constituent_diagnostics: config.constituent_diagnostics,
                 chunk_plan,
                 input_pipeline,
                 reference_time_modified_julian_day: batch.reference_time_modified_julian_day(),
@@ -1134,6 +1170,36 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                 },
             )?
         };
+        let chunk_constituent_diagnostics = config
+            .constituent_diagnostics
+            .map(|options| {
+                if input.is_fixed_depth() {
+                    diagnose_vector_with_unavailable(
+                        &worker_pool,
+                        &batch,
+                        &chunk.eastward,
+                        &chunk.northward,
+                        &latitudes,
+                        &chunk.observation_counts,
+                        minimum_fit_observations,
+                        &chunk_solutions,
+                        options,
+                    )
+                } else {
+                    worker_pool
+                        .install(|| {
+                            batch.diagnose_vector_time_major(
+                                &chunk.eastward,
+                                &chunk.northward,
+                                &latitudes,
+                                &chunk_solutions,
+                                options,
+                            )
+                        })
+                        .map(|values| values.into_iter().map(Some).collect())
+                }
+            })
+            .transpose()?;
         if chunk_diagnostics
             .iter()
             .zip(&chunk.observation_counts)
@@ -1234,12 +1300,19 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                     &chunk_solutions,
                     &chunk_order,
                     &chunk_diagnostics,
+                    chunk_constituent_diagnostics.as_deref(),
                     chunk_reconstruction.as_deref(),
                 )?;
             output_seconds += output_start.elapsed().as_secs_f64();
         } else {
             series_frequency_cph.extend(chunk_frequency_cph);
             sampling_diagnostics.extend(chunk_diagnostics);
+            if let (Some(all), Some(chunk)) = (
+                constituent_diagnostics.as_mut(),
+                chunk_constituent_diagnostics,
+            ) {
+                all.extend(chunk);
+            }
             solutions.extend(chunk_solutions);
             if let (Some(values), Some(chunk_values)) =
                 (reconstruction.as_mut(), chunk_reconstruction)
@@ -1279,6 +1352,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             &config.constituent_order,
             config.analysis_method,
             config.confidence_interval,
+            config.constituent_diagnostics,
             inference_report.as_ref(),
             config.reconstruction.as_ref(),
         )?;
@@ -1322,6 +1396,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             &sampling_diagnostics,
             config.analysis_method,
             config.confidence_interval,
+            constituent_diagnostics.as_deref(),
             inference_report.as_ref(),
             config
                 .reconstruction
@@ -1352,6 +1427,8 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                 constituent_order: &config.constituent_order,
                 constituent_index_by_rank: &constituent_index_by_rank,
                 sampling_diagnostics: &sampling_diagnostics,
+                constituent_diagnostics: constituent_diagnostics.as_deref(),
+                constituent_diagnostics_options: config.constituent_diagnostics,
                 result_sha256: &result_sha256,
                 selection: &selection,
                 inference: config.inference.as_ref(),
@@ -1464,6 +1541,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             .confidence_interval
             .monte_carlo_options()
             .map(|options| options.seed),
+        constituent_diagnostics: config.constituent_diagnostics.map(Into::into),
         reconstruction: config
             .reconstruction
             .as_ref()
@@ -1779,6 +1857,82 @@ fn solve_vector_input_with_unavailable(
         .collect()
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "fixed-depth diagnostic compaction mirrors the rectangular solver path"
+)]
+fn diagnose_vector_with_unavailable(
+    worker_pool: &rayon::ThreadPool,
+    batch: &VectorAnalysisBatch,
+    eastward: &[f64],
+    northward: &[f64],
+    latitudes: &[f64],
+    observation_counts: &[usize],
+    minimum_observations: usize,
+    solutions: &[VectorSolution],
+    options: ConstituentDiagnosticsOptions,
+) -> Result<Vec<Option<ConstituentSelectionDiagnostics>>, AnalysisError> {
+    let series_count = latitudes.len();
+    if observation_counts.len() != series_count
+        || solutions.len() != series_count
+        || eastward.len() != northward.len()
+        || !eastward.len().is_multiple_of(series_count)
+    {
+        return Err(AnalysisError::SamplingMaskShape {
+            actual: observation_counts.len(),
+            expected: series_count,
+        });
+    }
+    if observation_counts
+        .iter()
+        .all(|count| *count >= minimum_observations)
+    {
+        return worker_pool
+            .install(|| {
+                batch.diagnose_vector_time_major(eastward, northward, latitudes, solutions, options)
+            })
+            .map(|values| values.into_iter().map(Some).collect());
+    }
+    let active = observation_counts
+        .iter()
+        .enumerate()
+        .filter_map(|(series, count)| (*count >= minimum_observations).then_some(series))
+        .collect::<Vec<_>>();
+    let mut diagnostics = (0..series_count).map(|_| None).collect::<Vec<_>>();
+    if active.is_empty() {
+        return Ok(diagnostics);
+    }
+    let time_count = eastward.len() / series_count;
+    let mut active_eastward = Vec::with_capacity(time_count * active.len());
+    let mut active_northward = Vec::with_capacity(time_count * active.len());
+    for time in 0..time_count {
+        let row = time * series_count;
+        active_eastward.extend(active.iter().map(|series| eastward[row + series]));
+        active_northward.extend(active.iter().map(|series| northward[row + series]));
+    }
+    let active_latitudes = active
+        .iter()
+        .map(|series| latitudes[*series])
+        .collect::<Vec<_>>();
+    let active_solutions = active
+        .iter()
+        .map(|series| solutions[*series].clone())
+        .collect::<Vec<_>>();
+    let active_diagnostics = worker_pool.install(|| {
+        batch.diagnose_vector_time_major(
+            &active_eastward,
+            &active_northward,
+            &active_latitudes,
+            &active_solutions,
+            options,
+        )
+    })?;
+    for (series, series_diagnostics) in active.into_iter().zip(active_diagnostics) {
+        diagnostics[series] = Some(series_diagnostics);
+    }
+    Ok(diagnostics)
+}
+
 fn diagnose_vector_sampling_with_unavailable(
     worker_pool: &rayon::ThreadPool,
     plan: &rutide_core::SamplingDiagnosticsPlan,
@@ -1879,6 +2033,7 @@ fn validate_vector_config(config: &VectorAnalyzeConfig) -> Result<(), AppError> 
         nodal_corrections: config.nodal_corrections,
         confidence_interval: config.confidence_interval,
         analysis_method: config.analysis_method,
+        constituent_diagnostics: config.constituent_diagnostics,
         reconstruction: config.reconstruction.clone(),
         workers: config.workers,
         chunk_series: config.chunk_series,
@@ -3224,6 +3379,7 @@ fn vector_result_digest(
     sampling_diagnostics: &[CoreSamplingDiagnostics],
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
+    constituent_diagnostics: Option<&[Option<ConstituentSelectionDiagnostics>]>,
     inference: Option<&InferenceReport>,
     reconstruction: Option<(&ReconstructionFilter, &[VectorReconstruction])>,
 ) -> Result<String, AppError> {
@@ -3268,6 +3424,7 @@ fn vector_result_digest(
         digest.update(options.seed.to_le_bytes());
     }
     digest.update([0]);
+    update_constituent_diagnostics_digest(&mut digest, constituent_diagnostics)?;
     update_inference_digest(&mut digest, inference);
     for constituent in constituents {
         digest.update(constituent.name.as_bytes());
@@ -3458,6 +3615,7 @@ fn vector_result_digest_from_incremental_output(
     constituent_order: &ConstituentOrder,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
+    constituent_diagnostics: Option<ConstituentDiagnosticsOptions>,
     inference: Option<&InferenceReport>,
     reconstruction: Option<&ReconstructionFilter>,
 ) -> Result<String, AppError> {
@@ -3627,6 +3785,112 @@ fn vector_result_digest_from_incremental_output(
         digest.update(options.seed.to_le_bytes());
     }
     digest.update([0]);
+    if let Some(options) = constituent_diagnostics {
+        digest.update(b"constituent-diagnostics-v1\0");
+        let scalar_variables = [
+            "diagnostic_basis_condition_number",
+            "diagnostic_all_constituent_signal_to_noise",
+            "diagnostic_condition_adjusted_signal_to_noise",
+            "diagnostic_raw_tidal_variance",
+            "diagnostic_all_constituent_tidal_variance",
+            "diagnostic_significant_constituent_tidal_variance",
+            "diagnostic_all_constituent_percent_tidal_variance",
+            "diagnostic_significant_constituent_percent_tidal_variance",
+        ]
+        .into_iter()
+        .map(|name| required_output_variable(&output, name))
+        .collect::<Result<Vec<_>, _>>()?;
+        let lower_index = required_output_variable(&output, "diagnostic_lower_neighbor_index")?;
+        let higher_index = required_output_variable(&output, "diagnostic_higher_neighbor_index")?;
+        let lower_variables = [
+            "diagnostic_lower_rayleigh_criterion",
+            "diagnostic_lower_noise_modified_rayleigh_criterion",
+            "diagnostic_lower_maximum_correlation",
+        ]
+        .into_iter()
+        .map(|name| required_output_variable(&output, name))
+        .collect::<Result<Vec<_>, _>>()?;
+        let higher_variables = [
+            "diagnostic_higher_rayleigh_criterion",
+            "diagnostic_higher_noise_modified_rayleigh_criterion",
+            "diagnostic_higher_maximum_correlation",
+        ]
+        .into_iter()
+        .map(|name| required_output_variable(&output, name))
+        .collect::<Result<Vec<_>, _>>()?;
+        for first_series in (0..series_count).step_by(DIGEST_SERIES_CHUNK) {
+            let rows = (series_count - first_series).min(DIGEST_SERIES_CHUNK);
+            let statuses = read_layered_series_values::<i64>(
+                &analysis_status,
+                element_count,
+                first_series,
+                rows,
+                1,
+            )?;
+            let scalar_values = scalar_variables
+                .iter()
+                .map(|variable| {
+                    read_layered_series_values::<f64>(
+                        variable,
+                        element_count,
+                        first_series,
+                        rows,
+                        1,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let neighbor_indices = [&lower_index, &higher_index]
+                .into_iter()
+                .map(|variable| {
+                    read_layered_series_values::<i64>(
+                        variable,
+                        element_count,
+                        first_series,
+                        rows,
+                        constituent_count,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let neighbor_values = [&lower_variables, &higher_variables]
+                .into_iter()
+                .map(|variables| {
+                    variables
+                        .iter()
+                        .map(|variable| {
+                            read_layered_series_values::<f64>(
+                                variable,
+                                element_count,
+                                first_series,
+                                rows,
+                                constituent_count,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for series in 0..rows {
+                if input.is_fixed_depth() && statuses[series] == 1 {
+                    digest.update([0]);
+                    continue;
+                }
+                digest.update([1]);
+                digest.update(options.rayleigh_minimum().to_bits().to_le_bytes());
+                digest.update(options.minimum_signal_to_noise().to_bits().to_le_bytes());
+                for values in &scalar_values {
+                    digest.update(values[series].to_bits().to_le_bytes());
+                }
+                for constituent in 0..constituent_count {
+                    let index = series * constituent_count + constituent;
+                    for direction in 0..2 {
+                        digest.update(neighbor_indices[direction][index].to_le_bytes());
+                        for values in &neighbor_values[direction] {
+                            digest.update(values[index].to_bits().to_le_bytes());
+                        }
+                    }
+                }
+            }
+        }
+    }
     update_inference_digest(&mut digest, inference);
     for constituent in constituents {
         digest.update(constituent.name.as_bytes());
@@ -4072,6 +4336,8 @@ struct VectorOutputData<'data> {
     constituent_order: &'data ConstituentOrder,
     constituent_index_by_rank: &'data ConstituentOrderMap,
     sampling_diagnostics: &'data [CoreSamplingDiagnostics],
+    constituent_diagnostics: Option<&'data [Option<ConstituentSelectionDiagnostics>]>,
+    constituent_diagnostics_options: Option<ConstituentDiagnosticsOptions>,
     result_sha256: &'data str,
     selection: &'data ResolvedConstituentSelection,
     inference: Option<&'data VectorInferenceConfig>,
@@ -4097,6 +4363,7 @@ struct VectorOutputDefinition<'data> {
     nodal_corrections: NodalCorrections,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
+    constituent_diagnostics: Option<ConstituentDiagnosticsOptions>,
     chunk_plan: super::SpatialChunkPlan,
     input_pipeline: bool,
     reference_time_modified_julian_day: f64,
@@ -4250,6 +4517,7 @@ fn create_vector_output_base(
         output.add_attribute("monte_carlo_seed", options.seed)?;
         output.add_attribute("monte_carlo_rng", "rand_chacha-0.9-ChaCha12Rng")?;
     }
+    write_constituent_diagnostics_attributes(&mut output, data.constituent_diagnostics)?;
     output.add_attribute("constituent_selection", data.selection.report.method)?;
     if let Some(value) = data.selection.report.rayleigh_min {
         output.add_attribute("rayleigh_min", value)?;
@@ -4385,6 +4653,7 @@ impl IncrementalVectorOutput {
         solutions: &[VectorSolution],
         constituent_order: &ConstituentOrderMap,
         sampling: &[CoreSamplingDiagnostics],
+        constituent_diagnostics: Option<&[Option<ConstituentSelectionDiagnostics>]>,
         reconstruction: Option<&[VectorReconstruction]>,
     ) -> Result<(), AppError> {
         let output = self
@@ -4404,6 +4673,7 @@ impl IncrementalVectorOutput {
             solutions,
             constituent_order,
             sampling,
+            constituent_diagnostics,
             reconstruction,
             &mut self.robust_observation_offset,
         )
@@ -4522,6 +4792,13 @@ fn define_incremental_vector_variables(
         "spectral_band_usable_bin_count",
     ] {
         add_variable_with_units::<i64>(output, name, &spectral_dimensions, "1")?;
+    }
+    if data.constituent_diagnostics.is_some() {
+        define_constituent_diagnostic_variables(
+            output,
+            series_dimensions,
+            "source velocity units squared",
+        )?;
     }
 
     for (name, units) in [
@@ -4767,6 +5044,101 @@ where
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
+    reason = "incremental diagnostics preserve the shared field order without whole-run buffers"
+)]
+fn write_incremental_constituent_diagnostics(
+    output: &mut FileMut,
+    element_count: usize,
+    first_series: usize,
+    constituent_count: usize,
+    diagnostics: &[Option<ConstituentSelectionDiagnostics>],
+) -> Result<(), AppError> {
+    validate_constituent_diagnostics_shape(diagnostics, diagnostics.len(), constituent_count)?;
+    for (name, selector) in [
+        ("diagnostic_basis_condition_number", 0_u8),
+        ("diagnostic_all_constituent_signal_to_noise", 1),
+        ("diagnostic_condition_adjusted_signal_to_noise", 2),
+        ("diagnostic_raw_tidal_variance", 3),
+        ("diagnostic_all_constituent_tidal_variance", 4),
+        ("diagnostic_significant_constituent_tidal_variance", 5),
+        ("diagnostic_all_constituent_percent_tidal_variance", 6),
+        (
+            "diagnostic_significant_constituent_percent_tidal_variance",
+            7,
+        ),
+    ] {
+        let values = diagnostics
+            .iter()
+            .map(|diagnostics| diagnostic_scalar_value(diagnostics.as_ref(), selector))
+            .collect::<Vec<_>>();
+        put_layered_series_values(output, name, element_count, first_series, 1, &values)?;
+    }
+    for (higher, direction) in [(false, "lower"), (true, "higher")] {
+        let mut indices = Vec::with_capacity(diagnostics.len().saturating_mul(constituent_count));
+        for row in diagnostics {
+            if let Some(row) = row {
+                for constituent in &row.constituents {
+                    let neighbor = if higher {
+                        constituent.higher.as_ref()
+                    } else {
+                        constituent.lower.as_ref()
+                    };
+                    indices.push(match neighbor {
+                        Some(neighbor) => i64::try_from(neighbor.index).map_err(|_| {
+                            AppError::Invalid("diagnostic neighbor index exceeds i64".to_owned())
+                        })?,
+                        None => -1,
+                    });
+                }
+            } else {
+                indices.extend(std::iter::repeat_n(-1, constituent_count));
+            }
+        }
+        put_layered_series_values(
+            output,
+            &format!("diagnostic_{direction}_neighbor_index"),
+            element_count,
+            first_series,
+            constituent_count,
+            &indices,
+        )?;
+        for (suffix, selector) in [
+            ("rayleigh_criterion", 0_u8),
+            ("noise_modified_rayleigh_criterion", 1),
+            ("maximum_correlation", 2),
+        ] {
+            let mut values =
+                Vec::with_capacity(diagnostics.len().saturating_mul(constituent_count));
+            for row in diagnostics {
+                if let Some(row) = row {
+                    values.extend(row.constituents.iter().map(|constituent| {
+                        let neighbor = if higher {
+                            constituent.higher.as_ref()
+                        } else {
+                            constituent.lower.as_ref()
+                        };
+                        diagnostic_neighbor_value(neighbor, selector)
+                    }));
+                } else {
+                    values.extend(std::iter::repeat_n(f64::NAN, constituent_count));
+                }
+            }
+            put_layered_series_values(
+                output,
+                &format!("diagnostic_{direction}_{suffix}"),
+                element_count,
+                first_series,
+                constituent_count,
+                &values,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "one chunk writer validates and serializes the complete vector schema"
 )]
 fn write_incremental_vector_chunk(
@@ -4782,6 +5154,7 @@ fn write_incremental_vector_chunk(
     solutions: &[VectorSolution],
     constituent_order: &ConstituentOrderMap,
     sampling: &[CoreSamplingDiagnostics],
+    constituent_diagnostics: Option<&[Option<ConstituentSelectionDiagnostics>]>,
     reconstruction: Option<&[VectorReconstruction]>,
     robust_observation_offset: &mut usize,
 ) -> Result<(), AppError> {
@@ -4789,6 +5162,7 @@ fn write_incremental_vector_chunk(
     if observation_counts.len() != series_count
         || frequencies.len() != series_count
         || sampling.len() != series_count
+        || constituent_diagnostics.is_some_and(|values| values.len() != series_count)
         || !constituent_order.is_valid_for(series_count, constituent_count)
         || reconstruction.is_some_and(|values| values.len() != series_count)
     {
@@ -4947,6 +5321,15 @@ fn write_incremental_vector_chunk(
             })
             .collect::<Result<Vec<_>, _>>()?;
         put_layered_series_values(output, name, element_count, first_series, 9, &counts)?;
+    }
+    if let Some(diagnostics) = constituent_diagnostics {
+        write_incremental_constituent_diagnostics(
+            output,
+            element_count,
+            first_series,
+            constituent_count,
+            diagnostics,
+        )?;
     }
 
     write_vector_solution_field(
@@ -5208,6 +5591,7 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
             nodal_corrections: data.nodal_corrections,
             analysis_method: data.analysis_method,
             confidence_interval: data.confidence_interval,
+            constituent_diagnostics: data.constituent_diagnostics_options,
             chunk_plan: data.chunk_plan,
             input_pipeline: data.input_pipeline,
             reference_time_modified_julian_day: data.reference_time_modified_julian_day,
@@ -5282,6 +5666,14 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
         data.solutions.len(),
         data.sampling_diagnostics,
         input.series_dimensions(),
+    )?;
+    write_constituent_diagnostics(
+        &mut output,
+        data.solutions.len(),
+        data.constituents.len(),
+        data.constituent_diagnostics,
+        input.series_dimensions(),
+        "source velocity units squared",
     )?;
     write_vector_solution_variables(
         &mut output,
@@ -5594,9 +5986,9 @@ mod tests {
 
     use rayon::ThreadPoolBuilder;
     use rutide_core::{
-        FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections,
-        PhaseReference, ReconstructionFilter, RobustOptions, RobustWeightFunction,
-        TidalConstituent, VectorInferenceRelation,
+        ConstituentDiagnosticsOptions, FitOptions, InferenceMode, LinearConfidence,
+        MonteCarloOptions, NodalCorrections, PhaseReference, ReconstructionFilter, RobustOptions,
+        RobustWeightFunction, TidalConstituent, VectorInferenceRelation,
     };
 
     use super::{
@@ -5866,6 +6258,7 @@ mod tests {
                 tolerance: 0.01,
                 ..RobustOptions::default()
             }),
+            constituent_diagnostics: Some(ConstituentDiagnosticsOptions::default()),
             reconstruction: Some(ReconstructionFilter::All),
             workers: 2,
             chunk_series: None,
@@ -5910,6 +6303,16 @@ mod tests {
         );
         assert_eq!(
             output
+                .variable("diagnostic_basis_condition_number")
+                .expect("fixed-depth condition numbers")
+                .dimensions()
+                .iter()
+                .map(netcdf::Dimension::name)
+                .collect::<Vec<_>>(),
+            ["depth", "element"]
+        );
+        assert_eq!(
+            output
                 .variable("eastward_reconstruction")
                 .expect("fixed-depth reconstruction")
                 .dimensions()
@@ -5951,6 +6354,18 @@ mod tests {
                 "chunked fixed-depth {name} differs"
             );
         }
+        assert_eq!(
+            output
+                .variable("diagnostic_basis_condition_number")
+                .expect("whole fixed-depth condition numbers")
+                .get_values::<f64, _>(..)
+                .expect("read whole fixed-depth condition numbers"),
+            chunked_output
+                .variable("diagnostic_basis_condition_number")
+                .expect("chunked fixed-depth condition numbers")
+                .get_values::<f64, _>(..)
+                .expect("read chunked fixed-depth condition numbers")
+        );
         drop(output);
         drop(chunked_output);
 
@@ -5982,6 +6397,24 @@ mod tests {
                 .expect("read unavailable semi-major")
                 .iter()
                 .all(|value| value.is_nan())
+        );
+        assert!(
+            unavailable_output
+                .variable("diagnostic_basis_condition_number")
+                .expect("unavailable condition number")
+                .get_values::<f64, _>(..)
+                .expect("read unavailable condition number")
+                .iter()
+                .all(|value| value.is_nan())
+        );
+        assert!(
+            unavailable_output
+                .variable("diagnostic_lower_neighbor_index")
+                .expect("unavailable neighbor index")
+                .get_values::<i64, _>(..)
+                .expect("read unavailable neighbor index")
+                .iter()
+                .all(|value| *value == -1)
         );
         drop(unavailable_output);
 
@@ -6234,6 +6667,7 @@ mod tests {
                 tolerance: 0.01,
                 ..RobustOptions::default()
             }),
+            constituent_diagnostics: Some(ConstituentDiagnosticsOptions::default()),
             reconstruction: Some(ReconstructionFilter::All),
             workers: 2,
             chunk_series: None,
@@ -6256,6 +6690,8 @@ mod tests {
             "semi_minor",
             "inclination",
             "phase",
+            "diagnostic_basis_condition_number",
+            "diagnostic_higher_maximum_correlation",
             "robust_weight",
             "eastward_reconstruction",
             "northward_reconstruction",
@@ -6272,7 +6708,13 @@ mod tests {
                 .expect("chunked variable")
                 .get_values::<f64, _>(..)
                 .expect("read chunked variable");
-            assert_eq!(chunked, whole, "chunked {name} differs");
+            assert_eq!(chunked.len(), whole.len(), "chunked {name} shape differs");
+            assert!(
+                chunked.iter().zip(&whole).all(|(left, right)| {
+                    (left.is_nan() && right.is_nan()) || left.to_bits() == right.to_bits()
+                }),
+                "chunked {name} differs"
+            );
         }
         assert_eq!(report.series_count, 2);
         assert_eq!(report.source_time_count, 49);
@@ -6294,6 +6736,16 @@ mod tests {
         assert_eq!(report.confidence_interval, "monte-carlo");
         assert_eq!(report.monte_carlo_realizations, Some(64));
         assert_eq!(report.monte_carlo_seed, Some(42));
+        assert!(
+            (report
+                .constituent_diagnostics
+                .as_ref()
+                .expect("diagnostic report")
+                .minimum_signal_to_noise
+                - 2.0)
+                .abs()
+                < f64::EPSILON
+        );
         let output = netcdf::open(&output_path).expect("open vector output");
         assert_eq!(
             output
@@ -6361,6 +6813,13 @@ mod tests {
         assert_eq!(output.variable("semi_major").expect("semi-major").len(), 4);
         assert_eq!(
             output
+                .variable("diagnostic_basis_condition_number")
+                .expect("condition-number diagnostics")
+                .len(),
+            2
+        );
+        assert_eq!(
+            output
                 .variable("robust_weight_row_size")
                 .expect("robust row sizes")
                 .get_values::<i64, _>(..)
@@ -6400,7 +6859,7 @@ mod tests {
             analyze_vector(&layered_config).expect("analyze native sigma-layer currents");
         assert_eq!(
             layered_report.result_sha256,
-            "543ba2dc64417be2f78d0b497eb70f0b365137629bd1b7ed532515ba025757da"
+            "0d480957ea28a127f32d81520a625a025fa160fb607a0958cd7d8b88d283fbf2"
         );
         let mut layered_chunked_config = layered_config.clone();
         layered_chunked_config.output = layered_chunked_output_path.clone();
@@ -6567,6 +7026,7 @@ mod tests {
                 tolerance: 0.01,
                 ..RobustOptions::default()
             }),
+            constituent_diagnostics: None,
             reconstruction: Some(ReconstructionFilter::All),
             workers: 2,
             chunk_series: Some(1),

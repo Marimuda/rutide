@@ -19,14 +19,14 @@ use netcdf::{FileMut, Variable, VariableMut};
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use rutide_core::{
-    AnalysisError, COLORED_NOISE_FREQUENCY_BANDS_CPH, Constituent, FitOptions, GreenwichNodalBatch,
-    GreenwichNodalReconstructor, InferenceMode, LinearConfidence, MonteCarloOptions,
-    NodalCorrections, NormalizedTimeAxis, PhaseReference, RayleighSelection, ReconstructionFilter,
-    ResidualSpectrumMethod, RobustOptions, RobustTermination, RobustWeightFunction,
-    SamplingDiagnostics as CoreSamplingDiagnostics, SamplingDiagnosticsPlan, ScalarInferenceBatch,
-    ScalarInferenceRelation, ScalarSolution, SolverOptions, TidalConstituent, TimeEpoch,
-    VectorInferenceRelation, VectorSolution, normalize_numeric_time,
-    select_constituents_by_rayleigh,
+    AnalysisError, COLORED_NOISE_FREQUENCY_BANDS_CPH, Constituent, ConstituentDiagnosticsOptions,
+    ConstituentSelectionDiagnostics, FitOptions, GreenwichNodalBatch, GreenwichNodalReconstructor,
+    InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections, NormalizedTimeAxis,
+    PhaseReference, RayleighSelection, ReconstructionFilter, ResidualSpectrumMethod, RobustOptions,
+    RobustTermination, RobustWeightFunction, SamplingDiagnostics as CoreSamplingDiagnostics,
+    SamplingDiagnosticsPlan, ScalarInferenceBatch, ScalarInferenceRelation, ScalarSolution,
+    SolverOptions, TidalConstituent, TimeEpoch, VectorInferenceRelation, VectorSolution,
+    normalize_numeric_time, select_constituents_by_rayleigh,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -40,7 +40,7 @@ pub use vector::{
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
 /// `NetCDF` and JSON report schema emitted by scalar analyses.
-pub const SCALAR_OUTPUT_SCHEMA_VERSION: u32 = 16;
+pub const SCALAR_OUTPUT_SCHEMA_VERSION: u32 = 17;
 /// Schema version of the embedded machine-readable compatibility matrix.
 pub const FEATURE_MATRIX_SCHEMA_VERSION: u32 = 1;
 /// Machine-readable feature and Python-oracle compatibility status.
@@ -488,6 +488,8 @@ pub struct AnalyzeConfig {
     pub confidence_interval: ConfidenceInterval,
     /// Ordinary or configured robust least squares.
     pub analysis_method: AnalysisMethod,
+    /// Optional extended constituent-identifiability diagnostics.
+    pub constituent_diagnostics: Option<ConstituentDiagnosticsOptions>,
     /// Optional complete-series reconstruction and its constituent filter.
     pub reconstruction: Option<ReconstructionFilter>,
     /// Number of outer spatial worker threads.
@@ -736,6 +738,24 @@ pub struct ReconstructionReport {
     pub time_count: usize,
 }
 
+/// Configuration of the extended constituent-identifiability diagnostics.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct ConstituentDiagnosticsReport {
+    /// Denominator used by the conventional Rayleigh criterion.
+    pub rayleigh_minimum: f64,
+    /// Inclusive SNR threshold used for significant-subset tidal variance.
+    pub minimum_signal_to_noise: f64,
+}
+
+impl From<ConstituentDiagnosticsOptions> for ConstituentDiagnosticsReport {
+    fn from(options: ConstituentDiagnosticsOptions) -> Self {
+        Self {
+            rayleigh_minimum: options.rayleigh_minimum(),
+            minimum_signal_to_noise: options.minimum_signal_to_noise(),
+        }
+    }
+}
+
 /// Machine-readable summary of one completed application run.
 #[derive(Clone, Debug, Serialize)]
 pub struct RunReport {
@@ -811,6 +831,9 @@ pub struct RunReport {
     /// Root random seed for Monte Carlo confidence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monte_carlo_seed: Option<u64>,
+    /// Extended constituent-identifiability diagnostics, when enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constituent_diagnostics: Option<ConstituentDiagnosticsReport>,
     /// Complete-series reconstruction configuration, when enabled.
     pub reconstruction: Option<ReconstructionReport>,
     /// Constituent names in coefficient order.
@@ -1238,6 +1261,23 @@ impl ScalarAnalysisBatch {
             Self::Inferred(batch) => batch.reconstructor_modified_julian_days(times),
         }
     }
+
+    fn diagnose_time_major(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        solutions: &[ScalarSolution],
+        options: ConstituentDiagnosticsOptions,
+    ) -> Result<Vec<ConstituentSelectionDiagnostics>, AnalysisError> {
+        match self {
+            Self::Standard(batch) => {
+                batch.diagnose_time_major(observations, latitudes, solutions, options)
+            }
+            Self::Inferred(batch) => {
+                batch.diagnose_time_major(observations, latitudes, solutions, options)
+            }
+        }
+    }
 }
 
 struct ResolvedConstituentSelection {
@@ -1353,6 +1393,9 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
     let mut series_frequency_cph = Vec::with_capacity(series_count);
     let mut sampling_diagnostics = Vec::with_capacity(series_count);
     let mut observation_counts = Vec::with_capacity(series_count);
+    let mut constituent_diagnostics = config
+        .constituent_diagnostics
+        .map(|_| Vec::with_capacity(series_count));
     let mut reconstruction = config
         .reconstruction
         .as_ref()
@@ -1414,6 +1457,22 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         )?;
         solve_seconds += solve_start.elapsed().as_secs_f64();
 
+        let diagnostic_start = Instant::now();
+        let chunk_constituent_diagnostics = config
+            .constituent_diagnostics
+            .map(|options| {
+                worker_pool.install(|| {
+                    batch.diagnose_time_major(
+                        &chunk.observations,
+                        latitudes,
+                        &chunk_solutions,
+                        options,
+                    )
+                })
+            })
+            .transpose()?;
+        result_processing_seconds += diagnostic_start.elapsed().as_secs_f64();
+
         let reconstruction_start = Instant::now();
         if let (Some(reconstructor), Some(filter), Some(values)) = (
             reconstructor.as_ref(),
@@ -1446,6 +1505,12 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         observation_counts.extend_from_slice(&chunk.observation_counts);
         series_frequency_cph.extend(chunk_frequency_cph);
         sampling_diagnostics.extend(chunk_diagnostics);
+        if let (Some(all), Some(chunk)) = (
+            constituent_diagnostics.as_mut(),
+            chunk_constituent_diagnostics,
+        ) {
+            all.extend(chunk.into_iter().map(Some));
+        }
         solutions.extend(chunk_solutions);
         result_processing_seconds += result_start.elapsed().as_secs_f64();
     }
@@ -1492,6 +1557,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         &sampling_diagnostics,
         config.analysis_method,
         config.confidence_interval,
+        constituent_diagnostics.as_deref(),
         config
             .inference
             .as_ref()
@@ -1528,6 +1594,8 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             constituent_order: &config.constituent_order,
             constituent_index_by_rank: &constituent_index_by_rank,
             sampling_diagnostics: &sampling_diagnostics,
+            constituent_diagnostics: constituent_diagnostics.as_deref(),
+            constituent_diagnostics_options: config.constituent_diagnostics,
             result_sha256: &result_sha256,
             selection: &selection,
             inference: config.inference.as_ref(),
@@ -1613,6 +1681,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             .confidence_interval
             .monte_carlo_options()
             .map(|options| options.seed),
+        constituent_diagnostics: config.constituent_diagnostics.map(Into::into),
         reconstruction: config
             .reconstruction
             .as_ref()
@@ -1873,6 +1942,7 @@ fn validate_config(config: &AnalyzeConfig) -> Result<(), AppError> {
             "SNR constituent ordering requires confidence intervals".to_owned(),
         ));
     }
+    validate_constituent_diagnostics(config.constituent_diagnostics, config.confidence_interval)?;
     if let ConstituentOrder::Explicit(constituents) = &config.constituent_order {
         if constituents.is_empty() {
             return Err(AppError::Invalid(
@@ -1951,6 +2021,31 @@ fn validate_config(config: &AnalyzeConfig) -> Result<(), AppError> {
         if report.exists() && !config.overwrite {
             return Err(AppError::DestinationExists(report.clone()));
         }
+    }
+    Ok(())
+}
+
+fn validate_constituent_diagnostics(
+    options: Option<ConstituentDiagnosticsOptions>,
+    confidence_interval: ConfidenceInterval,
+) -> Result<(), AppError> {
+    let Some(options) = options else {
+        return Ok(());
+    };
+    if confidence_interval == ConfidenceInterval::None {
+        return Err(AppError::Invalid(
+            "constituent diagnostics require confidence intervals".to_owned(),
+        ));
+    }
+    if !options.rayleigh_minimum().is_finite() || options.rayleigh_minimum() <= 0.0 {
+        return Err(AppError::Invalid(
+            "diagnostic Rayleigh minimum must be finite and greater than zero".to_owned(),
+        ));
+    }
+    if !options.minimum_signal_to_noise().is_finite() || options.minimum_signal_to_noise() < 0.0 {
+        return Err(AppError::Invalid(
+            "diagnostic SNR threshold must be finite and nonnegative".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -2603,6 +2698,7 @@ fn result_digest(
     sampling_diagnostics: &[CoreSamplingDiagnostics],
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
+    constituent_diagnostics: Option<&[Option<ConstituentSelectionDiagnostics>]>,
     inference: Option<&InferenceReport>,
     reconstruction: Option<(&ReconstructionFilter, &[Vec<f64>])>,
 ) -> Result<String, AppError> {
@@ -2636,6 +2732,7 @@ fn result_digest(
         digest.update(options.seed.to_le_bytes());
     }
     digest.update([0]);
+    update_constituent_diagnostics_digest(&mut digest, constituent_diagnostics)?;
     update_inference_digest(&mut digest, inference);
     for constituent in constituents {
         digest.update(constituent.name.as_bytes());
@@ -2762,6 +2859,68 @@ fn update_sampling_digest(
                     .map_err(|_| AppError::Invalid("spectral bin count exceeds u64".to_owned()))?
                     .to_le_bytes(),
             );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn update_constituent_diagnostics_digest(
+    digest: &mut Sha256,
+    diagnostics: Option<&[Option<ConstituentSelectionDiagnostics>]>,
+) -> Result<(), AppError> {
+    let Some(diagnostics) = diagnostics else {
+        return Ok(());
+    };
+    digest.update(b"constituent-diagnostics-v1\0");
+    for diagnostics in diagnostics {
+        let Some(diagnostics) = diagnostics else {
+            digest.update([0]);
+            continue;
+        };
+        digest.update([1]);
+        digest.update(diagnostics.rayleigh_minimum.to_bits().to_le_bytes());
+        digest.update(diagnostics.minimum_signal_to_noise.to_bits().to_le_bytes());
+        for selector in 0..8 {
+            digest.update(
+                diagnostic_scalar_value(Some(diagnostics), selector)
+                    .to_bits()
+                    .to_le_bytes(),
+            );
+        }
+        for constituent in &diagnostics.constituents {
+            for neighbor in [constituent.lower.as_ref(), constituent.higher.as_ref()] {
+                if let Some(neighbor) = neighbor {
+                    digest.update(
+                        i64::try_from(neighbor.index)
+                            .map_err(|_| {
+                                AppError::Invalid(
+                                    "diagnostic neighbor index exceeds i64".to_owned(),
+                                )
+                            })?
+                            .to_le_bytes(),
+                    );
+                    digest.update(neighbor.rayleigh_criterion.to_bits().to_le_bytes());
+                    digest.update(
+                        neighbor
+                            .noise_modified_rayleigh_criterion
+                            .unwrap_or(f64::NAN)
+                            .to_bits()
+                            .to_le_bytes(),
+                    );
+                    digest.update(
+                        neighbor
+                            .maximum_correlation
+                            .unwrap_or(f64::NAN)
+                            .to_bits()
+                            .to_le_bytes(),
+                    );
+                } else {
+                    digest.update((-1_i64).to_le_bytes());
+                    for _ in 0..3 {
+                        digest.update(f64::NAN.to_bits().to_le_bytes());
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -2923,6 +3082,8 @@ struct OutputData<'data> {
     constituent_order: &'data ConstituentOrder,
     constituent_index_by_rank: &'data ConstituentOrderMap,
     sampling_diagnostics: &'data [CoreSamplingDiagnostics],
+    constituent_diagnostics: Option<&'data [Option<ConstituentSelectionDiagnostics>]>,
+    constituent_diagnostics_options: Option<ConstituentDiagnosticsOptions>,
     result_sha256: &'data str,
     selection: &'data ResolvedConstituentSelection,
     inference: Option<&'data ScalarInferenceConfig>,
@@ -2970,6 +3131,8 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         constituent_order,
         constituent_index_by_rank,
         sampling_diagnostics,
+        constituent_diagnostics,
+        constituent_diagnostics_options,
         result_sha256,
         selection,
         inference,
@@ -3072,6 +3235,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         output.add_attribute("monte_carlo_seed", options.seed)?;
         output.add_attribute("monte_carlo_rng", "rand_chacha-0.9-ChaCha12Rng")?;
     }
+    write_constituent_diagnostics_attributes(&mut output, constituent_diagnostics_options)?;
     output.add_attribute("constituent_selection", selection.report.method)?;
     if let Some(rayleigh_min) = selection.report.rayleigh_min {
         output.add_attribute("rayleigh_min", rayleigh_min)?;
@@ -3168,6 +3332,14 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         solutions.len(),
         sampling_diagnostics,
         &["series"],
+    )?;
+    write_constituent_diagnostics(
+        &mut output,
+        solutions.len(),
+        constituents.len(),
+        constituent_diagnostics,
+        &["series"],
+        "source variable units squared",
     )?;
 
     write_solution_variables(
@@ -3355,6 +3527,268 @@ fn write_sampling_diagnostics(
         )?;
     }
     Ok(())
+}
+
+pub(crate) fn write_constituent_diagnostics_attributes(
+    output: &mut FileMut,
+    options: Option<ConstituentDiagnosticsOptions>,
+) -> Result<(), AppError> {
+    output.add_attribute("constituent_diagnostics", i64::from(options.is_some()))?;
+    if let Some(options) = options {
+        output.add_attribute("diagnostic_rayleigh_minimum", options.rayleigh_minimum())?;
+        output.add_attribute(
+            "diagnostic_minimum_signal_to_noise",
+            options.minimum_signal_to_noise(),
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn define_constituent_diagnostic_variables(
+    output: &mut FileMut,
+    series_dimensions: &[&str],
+    variance_units: &str,
+) -> Result<(), AppError> {
+    for (name, units) in [
+        ("diagnostic_basis_condition_number", "1"),
+        ("diagnostic_all_constituent_signal_to_noise", "1"),
+        ("diagnostic_condition_adjusted_signal_to_noise", "1"),
+        ("diagnostic_raw_tidal_variance", variance_units),
+        ("diagnostic_all_constituent_tidal_variance", variance_units),
+        (
+            "diagnostic_significant_constituent_tidal_variance",
+            variance_units,
+        ),
+        (
+            "diagnostic_all_constituent_percent_tidal_variance",
+            "percent",
+        ),
+        (
+            "diagnostic_significant_constituent_percent_tidal_variance",
+            "percent",
+        ),
+    ] {
+        let mut variable = output.add_variable::<f64>(name, series_dimensions)?;
+        variable.put_attribute("units", units)?;
+    }
+    let mut constituent_dimensions = series_dimensions.to_vec();
+    constituent_dimensions.push("constituent");
+    for direction in ["lower", "higher"] {
+        let mut index = output.add_variable::<i64>(
+            &format!("diagnostic_{direction}_neighbor_index"),
+            &constituent_dimensions,
+        )?;
+        index.put_attribute("units", "1")?;
+        index.put_attribute("start_index", 0_i64)?;
+        index.put_attribute("missing_value", -1_i64)?;
+        for suffix in [
+            "rayleigh_criterion",
+            "noise_modified_rayleigh_criterion",
+            "maximum_correlation",
+        ] {
+            output
+                .add_variable::<f64>(
+                    &format!("diagnostic_{direction}_{suffix}"),
+                    &constituent_dimensions,
+                )?
+                .put_attribute("units", "1")?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the constituent-diagnostic NetCDF schema is kept together and field aligned"
+)]
+pub(crate) fn write_constituent_diagnostics(
+    output: &mut FileMut,
+    series_count: usize,
+    constituent_count: usize,
+    diagnostics: Option<&[Option<ConstituentSelectionDiagnostics>]>,
+    series_dimensions: &[&str],
+    variance_units: &str,
+) -> Result<(), AppError> {
+    let Some(diagnostics) = diagnostics else {
+        return Ok(());
+    };
+    validate_constituent_diagnostics_shape(diagnostics, series_count, constituent_count)?;
+    define_constituent_diagnostic_variables(output, series_dimensions, variance_units)?;
+    let scalar_fields = [
+        ("diagnostic_basis_condition_number", "1", 0_u8),
+        ("diagnostic_all_constituent_signal_to_noise", "1", 1),
+        ("diagnostic_condition_adjusted_signal_to_noise", "1", 2),
+        ("diagnostic_raw_tidal_variance", variance_units, 3),
+        (
+            "diagnostic_all_constituent_tidal_variance",
+            variance_units,
+            4,
+        ),
+        (
+            "diagnostic_significant_constituent_tidal_variance",
+            variance_units,
+            5,
+        ),
+        (
+            "diagnostic_all_constituent_percent_tidal_variance",
+            "percent",
+            6,
+        ),
+        (
+            "diagnostic_significant_constituent_percent_tidal_variance",
+            "percent",
+            7,
+        ),
+    ];
+    for (name, units, selector) in scalar_fields {
+        let values = diagnostics
+            .iter()
+            .map(|diagnostics| diagnostic_scalar_value(diagnostics.as_ref(), selector))
+            .collect::<Vec<_>>();
+        let mut variable = output.variable_mut(name).ok_or_else(|| {
+            AppError::Invalid(format!(
+                "constituent diagnostic variable {name} was not created"
+            ))
+        })?;
+        write_variable(&mut variable, &values, units)?;
+    }
+
+    for (direction, direction_name) in [(false, "lower"), (true, "higher")] {
+        let mut indices = Vec::with_capacity(series_count.saturating_mul(constituent_count));
+        for row in diagnostics {
+            if let Some(row) = row {
+                for constituent in &row.constituents {
+                    let neighbor = if direction {
+                        constituent.higher.as_ref()
+                    } else {
+                        constituent.lower.as_ref()
+                    };
+                    indices.push(match neighbor {
+                        Some(neighbor) => i64::try_from(neighbor.index).map_err(|_| {
+                            AppError::Invalid("diagnostic neighbor index exceeds i64".to_owned())
+                        })?,
+                        None => -1,
+                    });
+                }
+            } else {
+                indices.extend(std::iter::repeat_n(-1, constituent_count));
+            }
+        }
+        let index_name = format!("diagnostic_{direction_name}_neighbor_index");
+        let mut variable = output.variable_mut(&index_name).ok_or_else(|| {
+            AppError::Invalid(format!(
+                "constituent diagnostic variable {index_name} was not created"
+            ))
+        })?;
+        variable.put_values(&indices, ..)?;
+
+        for (suffix, selector) in [
+            ("rayleigh_criterion", 0_u8),
+            ("noise_modified_rayleigh_criterion", 1),
+            ("maximum_correlation", 2),
+        ] {
+            let mut values = Vec::with_capacity(series_count.saturating_mul(constituent_count));
+            for row in diagnostics {
+                if let Some(row) = row {
+                    values.extend(row.constituents.iter().map(|constituent| {
+                        let neighbor = if direction {
+                            constituent.higher.as_ref()
+                        } else {
+                            constituent.lower.as_ref()
+                        };
+                        diagnostic_neighbor_value(neighbor, selector)
+                    }));
+                } else {
+                    values.extend(std::iter::repeat_n(f64::NAN, constituent_count));
+                }
+            }
+            let name = format!("diagnostic_{direction_name}_{suffix}");
+            output
+                .variable_mut(&name)
+                .ok_or_else(|| {
+                    AppError::Invalid(format!(
+                        "constituent diagnostic variable {name} was not created"
+                    ))
+                })?
+                .put_values(&values, ..)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_constituent_diagnostics_shape(
+    diagnostics: &[Option<ConstituentSelectionDiagnostics>],
+    series_count: usize,
+    constituent_count: usize,
+) -> Result<(), AppError> {
+    if diagnostics.len() != series_count {
+        return Err(AppError::Invalid(format!(
+            "constituent diagnostics contain {} series; expected {series_count}",
+            diagnostics.len()
+        )));
+    }
+    if diagnostics
+        .iter()
+        .flatten()
+        .any(|diagnostics| diagnostics.constituents.len() != constituent_count)
+    {
+        return Err(AppError::Invalid(
+            "constituent diagnostic shape does not match the output constituents".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn diagnostic_scalar_value(
+    diagnostics: Option<&ConstituentSelectionDiagnostics>,
+    selector: u8,
+) -> f64 {
+    let Some(diagnostics) = diagnostics else {
+        return f64::NAN;
+    };
+    match selector {
+        0 => diagnostics.whole_model.basis_condition_number,
+        1 => diagnostics
+            .whole_model
+            .all_constituent_signal_to_noise
+            .unwrap_or(f64::NAN),
+        2 => diagnostics
+            .whole_model
+            .condition_adjusted_signal_to_noise
+            .unwrap_or(f64::NAN),
+        3 => diagnostics.tidal_variance.raw_tidal_variance,
+        4 => diagnostics.tidal_variance.all_constituent_tidal_variance,
+        5 => diagnostics
+            .tidal_variance
+            .significant_constituent_tidal_variance
+            .unwrap_or(f64::NAN),
+        6 => diagnostics
+            .tidal_variance
+            .all_constituent_percent_tidal_variance
+            .unwrap_or(f64::NAN),
+        7 => diagnostics
+            .tidal_variance
+            .significant_constituent_percent_tidal_variance
+            .unwrap_or(f64::NAN),
+        _ => unreachable!("diagnostic scalar selector is internal"),
+    }
+}
+
+pub(crate) fn diagnostic_neighbor_value(
+    neighbor: Option<&rutide_core::NeighboringConstituentDiagnostics>,
+    selector: u8,
+) -> f64 {
+    let Some(neighbor) = neighbor else {
+        return f64::NAN;
+    };
+    match selector {
+        0 => neighbor.rayleigh_criterion,
+        1 => neighbor
+            .noise_modified_rayleigh_criterion
+            .unwrap_or(f64::NAN),
+        2 => neighbor.maximum_correlation.unwrap_or(f64::NAN),
+        _ => unreachable!("diagnostic neighbor selector is internal"),
+    }
 }
 
 fn write_reconstruction_variables(
@@ -3666,13 +4100,17 @@ mod tests {
         SOLVER_OPTION_MATRIX_SCHEMA_VERSION, ScalarInferenceConfig, VECTOR_OUTPUT_SCHEMA_VERSION,
         constituent_order_indices, encode_hex, normalize_source_observation, read_fvcom_scalar,
         resolve_node_selection, scalar_chunk_plan, spatial_chunk_plan, summarize_sampling,
-        temporary_sibling, update_robust_options_digest, write_inference_metadata,
+        temporary_sibling, update_robust_options_digest, write_constituent_diagnostics,
+        write_constituent_diagnostics_attributes, write_inference_metadata,
         write_reconstruction_variables, write_sampling_diagnostics,
     };
     use rutide_core::{
-        CATALOG_ORACLE_REVISION, Constituent, GreenwichNodalOls, InferenceMode, LinearConfidence,
-        ReconstructionFilter, RobustOptions, RobustWeightFunction, SamplingDiagnosticsPlan,
-        ScalarInferenceRelation, ScalarSolution, TidalConstituent,
+        CATALOG_ORACLE_REVISION, Constituent, ConstituentDiagnosticsOptions,
+        ConstituentIndependenceDiagnostics, ConstituentSelectionDiagnostics, GreenwichNodalOls,
+        InferenceMode, LinearConfidence, NeighboringConstituentDiagnostics, ReconstructionFilter,
+        RobustOptions, RobustWeightFunction, SamplingDiagnosticsPlan, ScalarInferenceRelation,
+        ScalarSolution, TidalConstituent, TidalVarianceDiagnostics,
+        WholeModelIndependenceDiagnostics,
     };
     use serde_json::Value;
     use sha2::{Digest, Sha256};
@@ -3786,6 +4224,7 @@ mod tests {
             "analysis_method",
             "confidence_method",
             "confidence_noise",
+            "constituent_diagnostics",
             "constituent_order",
             "constituent_selection",
             "inference",
@@ -4242,6 +4681,106 @@ mod tests {
         );
         drop(dataset);
         fs::remove_file(path).expect("remove sampling output");
+    }
+
+    #[test]
+    fn constituent_diagnostics_are_written_with_explicit_missing_values() {
+        let neighbor = NeighboringConstituentDiagnostics {
+            index: 1,
+            name: "S2".to_owned(),
+            frequency_cph: 1.0 / 12.0,
+            rayleigh_criterion: 1.25,
+            noise_modified_rayleigh_criterion: Some(1.5),
+            maximum_correlation: Some(0.125),
+        };
+        let diagnostics = ConstituentSelectionDiagnostics {
+            constituents: vec![
+                ConstituentIndependenceDiagnostics {
+                    lower: None,
+                    higher: Some(neighbor.clone()),
+                },
+                ConstituentIndependenceDiagnostics {
+                    lower: Some(NeighboringConstituentDiagnostics {
+                        index: 0,
+                        name: "M2".to_owned(),
+                        ..neighbor
+                    }),
+                    higher: None,
+                },
+            ],
+            whole_model: WholeModelIndependenceDiagnostics {
+                basis_condition_number: 2.5,
+                all_constituent_signal_to_noise: Some(20.0),
+                condition_adjusted_signal_to_noise: Some(8.0),
+            },
+            tidal_variance: TidalVarianceDiagnostics {
+                raw_tidal_variance: 4.0,
+                all_constituent_tidal_variance: 3.0,
+                significant_constituent_tidal_variance: Some(2.0),
+                all_constituent_percent_tidal_variance: Some(75.0),
+                significant_constituent_percent_tidal_variance: Some(50.0),
+            },
+            rayleigh_minimum: 1.0,
+            minimum_signal_to_noise: 2.0,
+        };
+        let destination = std::env::temp_dir().join("rutide-identifiability-output-test.nc");
+        let path = temporary_sibling(&destination).expect("valid temporary path");
+        let mut dataset = netcdf::create(&path).expect("create diagnostic output");
+        dataset.add_dimension("series", 2).expect("add series");
+        dataset
+            .add_dimension("constituent", 2)
+            .expect("add constituents");
+        write_constituent_diagnostics_attributes(
+            &mut dataset,
+            Some(ConstituentDiagnosticsOptions::default()),
+        )
+        .expect("write diagnostic attributes");
+        write_constituent_diagnostics(
+            &mut dataset,
+            2,
+            2,
+            Some(&[Some(diagnostics), None]),
+            &["series"],
+            "source variable units squared",
+        )
+        .expect("write constituent diagnostics");
+        dataset.close().expect("close diagnostic output");
+
+        let dataset = netcdf::open(&path).expect("open diagnostic output");
+        assert_eq!(
+            dataset
+                .variable("diagnostic_higher_neighbor_index")
+                .expect("higher neighbor")
+                .get_values::<i64, _>(..)
+                .expect("read higher neighbor"),
+            [1, -1, -1, -1]
+        );
+        assert_eq!(
+            dataset
+                .variable("diagnostic_lower_neighbor_index")
+                .expect("lower neighbor")
+                .get_values::<i64, _>(..)
+                .expect("read lower neighbor"),
+            [-1, 0, -1, -1]
+        );
+        let condition_number = dataset
+            .variable("diagnostic_basis_condition_number")
+            .expect("condition number")
+            .get_values::<f64, _>(..)
+            .expect("read condition number");
+        assert!((condition_number[0] - 2.5).abs() < f64::EPSILON);
+        assert!(condition_number[1].is_nan());
+        assert!(
+            dataset
+                .variable("diagnostic_higher_rayleigh_criterion")
+                .expect("higher Rayleigh")
+                .get_values::<f64, _>(..)
+                .expect("read higher Rayleigh")[1..]
+                .iter()
+                .all(|value| value.is_nan())
+        );
+        drop(dataset);
+        fs::remove_file(path).expect("remove diagnostic output");
     }
 
     #[test]

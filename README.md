@@ -113,7 +113,7 @@ selections coalesce nearby elements and traverse classic NetCDF record variables
 in file order; requested layer and element order is still preserved. Chunk-local
 masks are grouped exactly as before, and global Monte Carlo stream offsets make
 results independent of chunk size and worker scheduling. JSON reports and
-scalar/vector NetCDF schemas v16/v14 record the input-pipeline mode, actual chunk
+scalar/vector NetCDF schemas v17/v15 record the input-pipeline mode, actual chunk
 count and series count, and maximum logical bytes across concurrent observation
 buffers. When input is overlapped, active stage durations are not additive;
 `total_seconds` remains the authoritative elapsed application time.
@@ -348,6 +348,33 @@ the fitted reference-time frequency can vary between records. Retained JSON
 samples carry the same mapping, and reports state the requested order and whether
 it actually varies by series. Shared selection/explicit maps are stored compactly
 in memory and expanded in bounded chunks only while writing NetCDF output.
+
+Add `--constituent-diagnostics` to compute Codiga's extended constituent-
+selection evidence: adjacent RR/RNM/Corrmax, whole-model `K`, `SNRallc`, and
+condition-adjusted SNR, plus raw, all-constituent, and SNR-filtered tidal
+variance. This is deliberately opt-in and requires `--confidence linear` or
+`--confidence monte-carlo`; `--diagnostic-min-snr` changes the inclusive
+significant-subset threshold from its default of 2. For automatic selection the
+configured Rayleigh minimum is reused as the RR denominator, while explicit
+lists use the conventional value 1. For example:
+
+```console
+cargo run --release --bin rutide -- analyze-scalar \
+  --input /path/to/fvcom.nc \
+  --output diagnostic-coefficients.nc \
+  --constituents auto --confidence linear \
+  --constituent-diagnostics --diagnostic-min-snr 2 \
+  --workers 64
+```
+
+Schemas 17/15 store the configuration as global attributes and the complete
+per-series and per-constituent result arrays under descriptive
+`diagnostic_*` variable names. Missing neighbors and unavailable fixed-depth
+records use index `-1` and `NaN` floating fields. `K` and Corrmax use the actual
+retained design matrix, but conventional RR/RNM reduce irregular sampling to an
+effective record length and remain advisory for heavily gapped records. See
+[`DIAGNOSTICS.md`](DIAGNOSTICS.md) for definitions and the measured full-field
+cost.
 
 Add one repeatable `--infer INFERRED:REFERENCE:AMPLITUDE_RATIO:PHASE_OFFSET`
 for each constrained scalar constituent. Exact astronomical inference is the

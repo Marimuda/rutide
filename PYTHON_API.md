@@ -259,7 +259,7 @@ SNR filtering requires a fit with confidence intervals. Set `min_SNR=None` for
 PE-only filtering or to reconstruct a fit made with `conf_int="none"`. An
 explicit `constit=[...]` selection takes precedence over diagnostic thresholds.
 
-Version `0.2` does not import arbitrary Python UTide coefficient dictionaries.
+RUTide does not import arbitrary Python UTide coefficient dictionaries.
 `solve_many` covers in-memory station and model matrices. The CLI remains the
 appropriate interface when FVCOM NetCDF input and incremental output must stay
 bounded rather than materializing the complete array in Python.

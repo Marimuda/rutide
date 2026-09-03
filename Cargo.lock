@@ -1183,7 +1183,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rutide-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "faer",
  "mimalloc",
@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "rutide-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "faer",
  "rand",
@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "rutide-python"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "numpy",
  "pyo3",

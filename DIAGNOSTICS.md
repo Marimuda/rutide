@@ -105,9 +105,15 @@ record.
 4. Structured Rust and Python results plus compact human-readable presentation
    — done.
 5. Scalar NetCDF schema 17, vector schema 15, and backward-readable Python
-   coefficient snapshot schema 2 — Python snapshot done; NetCDF remains.
-6. MATLAB-derived oracle fixtures and measured whole-field overhead before the
-   new diagnostics become a default application profile.
+   coefficient snapshot schema 2 — done.
+6. MATLAB-derived equation fixtures and measured whole-field overhead — done.
+
+The suite remains opt-in. On the retained full FVCOM field it changed scalar
+process wall from 1.07 s to 2.01 s and vector wall from 3.03 s to 4.92 s while
+adding roughly 82 MiB and 67 MiB of median peak RSS, respectively. The default
+path retains its prior digest and avoids diagnostic work. Detailed commands,
+repetitions, storage costs, and stage timings are recorded in
+[`benchmarks/results/constituent-diagnostics-2026-09-03.md`](benchmarks/results/constituent-diagnostics-2026-09-03.md).
 
 ## Sources
 

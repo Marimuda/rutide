@@ -20,7 +20,7 @@ faer = { version = "=0.24.4", default-features = false, features = ["linalg", "r
 mimalloc = "=0.1.52"
 netcdf = { version = "=0.12.1", default-features = false }
 rayon = "=1.12.0"
-rutide-core = { path = "../rutide-core", version = "=0.2.0" }
+rutide-core = { path = "../rutide-core", version = "=0.3.0" }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.11.0"

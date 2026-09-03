@@ -13,8 +13,8 @@ use rutide_cli::{
     VectorInferenceConfig, analyze_scalar, analyze_vector,
 };
 use rutide_core::{
-    FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections,
-    PhaseReference, ReconstructionFilter, RobustOptions, RobustWeightFunction,
+    ConstituentDiagnosticsOptions, FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions,
+    NodalCorrections, PhaseReference, ReconstructionFilter, RobustOptions, RobustWeightFunction,
     ScalarInferenceRelation, TidalConstituent, VectorInferenceRelation,
 };
 
@@ -61,6 +61,10 @@ Options:
   --white-noise       Use white noise instead of colored residual bands
   --mc-realizations N Coefficient draws for monte-carlo confidence (default: 200)
   --mc-seed N         Reproducible unsigned 64-bit root seed (default: 0)
+  --constituent-diagnostics
+                      Write RR/RNM/Corrmax, K/SNRallc, and tidal variance
+  --diagnostic-min-snr X
+                      Significant-subset SNR threshold (default: 2.0)
   --reconstruct       Write complete original-time reconstruction to the output
   --reconstruct-constituents LIST
                       Reconstruct only these fitted constituent names
@@ -175,6 +179,8 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let mut white_noise = false;
     let mut monte_carlo_realizations = None;
     let mut monte_carlo_seed = None;
+    let mut constituent_diagnostics = false;
+    let mut diagnostic_min_signal_to_noise = None;
     let mut reconstruct = false;
     let mut reconstruction_constituents = None;
     let mut minimum_percent_energy = None;
@@ -409,6 +415,16 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                 monte_carlo_seed =
                     Some(parse_u64(&required_value(&mut arguments, option)?, option)?);
             }
+            "--constituent-diagnostics" => constituent_diagnostics = true,
+            "--diagnostic-min-snr" => {
+                if diagnostic_min_signal_to_noise.is_some() {
+                    return Err("--diagnostic-min-snr may only be supplied once".to_owned());
+                }
+                diagnostic_min_signal_to_noise = Some(parse_nonnegative_f64(
+                    &required_value(&mut arguments, option)?,
+                    option,
+                )?);
+            }
             "--reconstruct" => reconstruct = true,
             "--reconstruct-constituents" => {
                 if reconstruction_constituents.is_some() {
@@ -470,6 +486,12 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     {
         return Err("--order snr requires confidence intervals".to_owned());
     }
+    if diagnostic_min_signal_to_noise.is_some() && !constituent_diagnostics {
+        return Err("--diagnostic-min-snr requires --constituent-diagnostics".to_owned());
+    }
+    if constituent_diagnostics && confidence_interval == ConfidenceInterval::None {
+        return Err("--constituent-diagnostics requires confidence intervals".to_owned());
+    }
     if inference_approximate
         && scalar_inference_relationships.is_empty()
         && vector_inference_relationships.is_empty()
@@ -486,6 +508,15 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     };
     let phase_reference = phase_reference.unwrap_or_default();
     let nodal_corrections = nodal_corrections.unwrap_or_default();
+    let diagnostic_rayleigh_minimum = match &constituent_selection {
+        ConstituentSelection::Rayleigh { minimum } => *minimum,
+        ConstituentSelection::Explicit(_) => 1.0,
+    };
+    let constituent_diagnostics = constituent_diagnostics.then(|| {
+        ConstituentDiagnosticsOptions::default()
+            .with_rayleigh_minimum(diagnostic_rayleigh_minimum)
+            .with_minimum_signal_to_noise(diagnostic_min_signal_to_noise.unwrap_or(2.0))
+    });
     let reconstruction = resolve_reconstruction(
         reconstruct,
         reconstruction_constituents,
@@ -523,6 +554,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             nodal_corrections,
             confidence_interval,
             analysis_method,
+            constituent_diagnostics,
             reconstruction,
             workers,
             chunk_series,
@@ -547,6 +579,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             nodal_corrections,
             confidence_interval,
             analysis_method,
+            constituent_diagnostics,
             reconstruction,
             workers,
             chunk_series,
@@ -1489,6 +1522,57 @@ mod tests {
                 panic!("expected analyze command");
             };
             assert_eq!(config.confidence_interval, expected);
+        }
+    }
+
+    #[test]
+    fn parses_constituent_diagnostics_and_rejects_incomplete_configuration() {
+        let command = parse_arguments(args(&[
+            "analyze-vector",
+            "--input",
+            "input.nc",
+            "--output",
+            "output.nc",
+            "--constituents",
+            "auto",
+            "--rayleigh-min",
+            "0.9",
+            "--confidence",
+            "linear",
+            "--constituent-diagnostics",
+            "--diagnostic-min-snr",
+            "3.5",
+        ]))
+        .expect("valid constituent diagnostics");
+        let Command::AnalyzeVector(config) = command else {
+            panic!("expected vector command");
+        };
+        let options = config
+            .constituent_diagnostics
+            .expect("constituent diagnostics enabled");
+        assert!((options.rayleigh_minimum() - 0.9).abs() < f64::EPSILON);
+        assert!((options.minimum_signal_to_noise() - 3.5).abs() < f64::EPSILON);
+
+        for extra in [
+            &["--constituent-diagnostics"][..],
+            &["--confidence", "linear", "--diagnostic-min-snr", "2.0"][..],
+            &[
+                "--confidence",
+                "linear",
+                "--constituent-diagnostics",
+                "--diagnostic-min-snr",
+                "-1",
+            ][..],
+        ] {
+            let mut values = vec![
+                "analyze-scalar",
+                "--input",
+                "input.nc",
+                "--output",
+                "output.nc",
+            ];
+            values.extend_from_slice(extra);
+            assert!(parse_arguments(args(&values)).is_err());
         }
     }
 

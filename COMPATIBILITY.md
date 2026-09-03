@@ -1,9 +1,9 @@
 # Compatibility and stability contracts
 
-RUTide is currently version `0.2.0`. The numerical and file-format contracts are
-explicitly versioned, but the Rust crates remain pre-1.0 and are not published to
-crates.io yet. This document defines what downstream users can rely on while the
-remaining product work is completed.
+The current source tree is the unreleased RUTide `0.3.0` line. The numerical and
+file-format contracts are explicitly versioned, but the Rust crates remain
+pre-1.0 and are not published to crates.io yet. This document defines what
+downstream users can rely on while the remaining product work is completed.
 
 ## Rust API
 
@@ -24,8 +24,11 @@ The workspace and Python distribution share one Cargo-sourced version.
 
 The compiled schema constants are public as
 `rutide_cli::SCALAR_OUTPUT_SCHEMA_VERSION` and
-`rutide_cli::VECTOR_OUTPUT_SCHEMA_VERSION`. They currently identify scalar v16
-and vector v14.
+`rutide_cli::VECTOR_OUTPUT_SCHEMA_VERSION`. They currently identify scalar v17
+and vector v15. These versions add opt-in constituent-identifiability
+configuration and complete per-series/per-constituent diagnostic fields. When
+disabled, the canonical digest retains the preceding profile's content and the
+application avoids diagnostic calculation.
 
 A schema version covers dimension names and order, required variables, variable
 meaning and units, enumerated flag values, required global attributes, and JSON
@@ -84,12 +87,12 @@ limitations are defined in [`PYTHON_API.md`](PYTHON_API.md). The batch endpoint
 uses stable `(series, constituent)` result axes and separate per-series
 presentation maps; missing masks never reorder the constituent dimension.
 
-The pickle-free Python coefficient archive is independently versioned as schema
-1. RUTide accepts it only within the matching workspace major/minor release
-line, while patch releases preserve the schema and reconstruction behavior.
-Archives store fitted native state and the retained timestamp/model recipe, but
-not the source observations. Arbitrary Python UTide coefficient dictionaries
-remain outside this contract.
+The pickle-free Python coefficient archive container remains schema 1. RUTide
+0.3 writes native coefficient snapshot schema 2 inside that container and reads
+both native schemas 1 and 2; schema-1 snapshots restore with no extended
+constituent diagnostics. Archives store fitted native state and the retained
+timestamp/model recipe, but not the source observations. Arbitrary Python UTide
+coefficient dictionaries remain outside this contract.
 
 Within the pre-1.0 series, Python breaking changes require a workspace minor
 version and changelog migration note. Patch releases preserve documented

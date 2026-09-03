@@ -92,7 +92,7 @@
               "enum": ["core", "fvcom-scalar", "fvcom-vector", "python-api", "output"]
             }
           },
-          "parity": { "enum": ["python-oracle", "rust-extension", "not-applicable"] },
+          "parity": { "enum": ["python-oracle", "matlab-restoration", "rust-extension", "not-applicable"] },
           "evidence": { "type": "array", "items": { "type": "string" } },
           "limitations": { "type": "array", "items": { "type": "string" } }
         }

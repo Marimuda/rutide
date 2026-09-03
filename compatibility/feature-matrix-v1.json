@@ -1,8 +1,8 @@
 {
   "$schema": "./feature-matrix.schema.json",
   "matrix_schema_version": 1,
-  "project_version": "0.2.0",
-  "last_reviewed": "2026-09-02",
+  "project_version": "0.3.0",
+  "last_reviewed": "2026-09-03",
   "python_oracle": {
     "implementation": "UTide",
     "revision": "8fabe121752bc317931472a10a42e306715106de"
@@ -19,8 +19,8 @@
       "coefficient_schema": 1
     },
     "netcdf": {
-      "scalar_schema_version": 16,
-      "vector_schema_version": 14
+      "scalar_schema_version": 17,
+      "vector_schema_version": 15
     },
     "json_report": {
       "version_source": "matching-netcdf-schema"
@@ -173,6 +173,14 @@
       "scopes": ["core", "fvcom-scalar", "fvcom-vector", "output"],
       "parity": "python-oracle",
       "evidence": ["crates/rutide-core/tests/python_oracle_greenwich_nodal.rs"]
+    },
+    {
+      "id": "constituent-identifiability-diagnostics",
+      "title": "Codiga RR, RNM, Corrmax, K/SNRallc, and tidal-variance diagnostics",
+      "support": "supported",
+      "scopes": ["core", "python-api", "fvcom-scalar", "fvcom-vector", "output"],
+      "parity": "matlab-restoration",
+      "evidence": ["DIAGNOSTICS.md", "crates/rutide-core/src/diagnostics.rs", "crates/rutide-core/tests/matlab_diagnostic_equations.rs", "benchmarks/results/constituent-diagnostics-2026-09-03.md", "crates/rutide-core/tests/python_oracle_inference.rs", "crates/rutide-cli/src/lib.rs", "crates/rutide-cli/src/vector.rs"]
     },
     {
       "id": "reconstruction",

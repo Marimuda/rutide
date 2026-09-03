@@ -347,24 +347,26 @@ reconstruction—reduced the ten-layer, 1,448,600-series OLS peak from 2.35 GiB 
 1.13 GiB with the identical v12 digest; see
 `benchmarks/results/incremental-layered-output-2026-09-02.md`.
 
-## 7. Constituent identifiability diagnostics — next
+## 7. Constituent identifiability diagnostics — complete
 
-- Restore Codiga's conventional and noise-modified adjacent-frequency Rayleigh
+- Restored Codiga's conventional and noise-modified adjacent-frequency Rayleigh
   diagnostics, whole-basis condition number relative to all-constituent SNR,
   maximum adjacent-parameter correlation, and raw/all/significant-subset tidal
   variance diagnostics.
-- Keep diagnostics advisory and retain explicit constituent selection. Inferred
+- Diagnostics remain advisory and retain explicit constituent selection. Inferred
   constituents are excluded from directly modeled neighbor pairs, and irregular
   records retain an explicit interpretation warning alongside their sampling
   diagnostics.
-- Cover scalar/vector, ordinary/inferred, OLS/robust, regular/irregular, missing,
+- Covered scalar/vector, ordinary/inferred, OLS/robust, regular/irregular, missing,
   batch, Python, and FVCOM paths without slowing analysis profiles that do not
   request the extended suite.
-- Version the completed public surface as RUTide 0.3.0 with scalar/vector NetCDF
-  schemas 17/15 and backward-readable Python coefficient snapshot schema 2.
+- Versioned the completed source surface as unreleased RUTide 0.3.0 with
+  scalar/vector NetCDF schemas 17/15 and backward-readable Python coefficient
+  snapshot schema 2.
 
-The equation-level conventions and incremental acceptance plan are maintained in
-`DIAGNOSTICS.md`.
+The equation-level conventions are maintained in `DIAGNOSTICS.md`; the retained
+whole-field cost and demonstrated next optimization target are in
+`benchmarks/results/constituent-diagnostics-2026-09-03.md`.
 
 ## Definition of broad compatibility
 

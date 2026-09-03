@@ -23,6 +23,11 @@ published API and file-schema contracts.
   and missing-value scalar/vector batches with retained-record timing.
 - Opt-in `diagnostics=True` Python results with MATLAB-inspired short fields,
   descriptive aliases, dense batch arrays, and compact single-series tables.
+- Opt-in scalar/vector FVCOM constituent diagnostics in NetCDF schemas 17/15,
+  including configuration metadata, explicit missing-neighbor values, bounded
+  incremental layered output, and diagnostic-aware canonical digests.
+- MATLAB-equation regression fixtures and a matched full-field FVCOM benchmark
+  covering the enabled/disabled diagnostic time, memory, and storage costs.
 - An installed-wheel acceptance harness for a public NOAA/NDBC ADCP profile and
   a domain-spanning selection from the 25.78 GB FVCOM fixture, including
   reconstruction and coefficient-persistence validation.

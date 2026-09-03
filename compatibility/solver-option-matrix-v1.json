@@ -1,7 +1,7 @@
 {
   "$schema": "./solver-option-matrix.schema.json",
   "matrix_schema_version": 1,
-  "last_reviewed": "2026-09-02",
+  "last_reviewed": "2026-09-03",
   "python_oracle_revision": "8fabe121752bc317931472a10a42e306715106de",
   "composition": {
     "default_status": "supported",
@@ -30,6 +30,7 @@
     "nodal_corrections": ["exact", "linear-time", "disabled"],
     "confidence_method": ["none", "linear", "monte-carlo"],
     "confidence_noise": ["not-applicable", "white", "colored"],
+    "constituent_diagnostics": ["disabled", "enabled"],
     "constituent_order": [
       "selection",
       "frequency",
@@ -79,6 +80,13 @@
       "status": "rejected",
       "rule": "constituent_order=signal-to-noise requires confidence_method!=none",
       "reason": "Signal-to-noise ratios are derived from confidence intervals.",
+      "evidence": ["crates/rutide-cli/src/lib.rs", "crates/rutide-cli/src/main.rs"]
+    },
+    {
+      "id": "constituent-diagnostics-require-confidence",
+      "status": "rejected",
+      "rule": "constituent_diagnostics=enabled requires confidence_method!=none",
+      "reason": "RNM, significant-subset tidal variance, and whole-model SNR require constituent signal-to-noise ratios.",
       "evidence": ["crates/rutide-cli/src/lib.rs", "crates/rutide-cli/src/main.rs"]
     },
     {
@@ -177,6 +185,7 @@
         "nodal_corrections": ["exact", "linear-time", "disabled"],
         "confidence_method": ["none"],
         "confidence_noise": ["not-applicable"],
+        "constituent_diagnostics": ["disabled"],
         "constituent_order": ["selection"],
         "reconstruction": ["none"]
       },
@@ -205,6 +214,26 @@
       "evidence": [
         "crates/rutide-core/tests/python_oracle_greenwich_nodal.rs",
         "crates/rutide-core/tests/python_oracle_inference.rs"
+      ]
+    },
+    {
+      "id": "extended-constituent-diagnostics",
+      "kind": "application-integration",
+      "covers": {
+        "scope": ["scalar", "vector"],
+        "sampling": ["regular", "gappy-regular-grid", "irregular"],
+        "inference": ["none", "exact", "approximate"],
+        "analysis_method": ["ols", "robust"],
+        "confidence_method": ["linear", "monte-carlo"],
+        "confidence_noise": ["white", "colored"],
+        "constituent_diagnostics": ["enabled"]
+      },
+      "evidence": [
+        "DIAGNOSTICS.md",
+        "crates/rutide-core/src/diagnostics.rs",
+        "crates/rutide-core/tests/python_oracle_inference.rs",
+        "crates/rutide-cli/src/lib.rs",
+        "crates/rutide-cli/src/vector.rs"
       ]
     },
     {
