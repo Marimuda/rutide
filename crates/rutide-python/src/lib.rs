@@ -1129,6 +1129,9 @@ fn add_vector_summary(
     solution: &VectorSolution,
     order: &[usize],
 ) -> PyResult<()> {
+    let cartesian = solution
+        .cartesian()
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
     let semi_major = reordered(&solution.semi_major, order);
     let semi_minor = reordered(&solution.semi_minor, order);
     let inclination = reordered(&solution.inclination_degrees, order);
@@ -1159,6 +1162,26 @@ fn add_vector_summary(
     output.set_item("phase_ci_degrees", &phase_ci)?;
     output.set_item("percent_energy", &percent_energy)?;
     output.set_item("signal_to_noise", &signal_to_noise)?;
+    for (name, values) in [
+        (
+            "eastward_cosine_coefficient",
+            &cartesian.eastward_cosine_coefficient,
+        ),
+        (
+            "eastward_sine_coefficient",
+            &cartesian.eastward_sine_coefficient,
+        ),
+        (
+            "northward_cosine_coefficient",
+            &cartesian.northward_cosine_coefficient,
+        ),
+        (
+            "northward_sine_coefficient",
+            &cartesian.northward_sine_coefficient,
+        ),
+    ] {
+        output.set_item(name, reordered(values, order))?;
+    }
     output.set_item("umean", solution.eastward_mean)?;
     output.set_item("vmean", solution.northward_mean)?;
     output.set_item("uslope", solution.eastward_slope_per_day)?;

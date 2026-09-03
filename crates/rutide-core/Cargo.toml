@@ -39,5 +39,9 @@ harness = false
 name = "inference_throughput"
 harness = false
 
+[[bench]]
+name = "temporal_query_throughput"
+harness = false
+
 [lints]
 workspace = true

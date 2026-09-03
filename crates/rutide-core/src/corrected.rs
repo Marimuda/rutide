@@ -14,10 +14,10 @@ use faer::{
 use rayon::prelude::*;
 
 use crate::{
-    AnalysisError, Constituent, ConstituentDiagnosticsOptions, ConstituentIndependenceDiagnostics,
-    ConstituentSelectionDiagnostics, DiagnosticConstituentRole, FitOptions, FixedRawOls,
-    LinearConfidence, MonteCarloOptions, RobustDiagnostics, RobustOptions, ScalarSolution,
-    TidalConstituent, VectorReconstruction, VectorSolution,
+    AnalysisError, CartesianVectorSolution, Constituent, ConstituentDiagnosticsOptions,
+    ConstituentIndependenceDiagnostics, ConstituentSelectionDiagnostics, DiagnosticConstituentRole,
+    FitOptions, FixedRawOls, LinearConfidence, MonteCarloOptions, RobustDiagnostics, RobustOptions,
+    ScalarSolution, TidalConstituent, VectorCurrent, VectorReconstruction, VectorSolution,
     astronomy::at_modified_julian_day,
     catalog::{CONSTITUENT_COUNT, Metadata},
     diagnostics::{
@@ -3165,6 +3165,21 @@ pub enum ReconstructionFilter {
     },
 }
 
+/// Non-harmonic terms included in a temporal prediction.
+///
+/// The explicit policy prevents a fitted detrending term from being
+/// unintentionally extrapolated by long-running transport simulations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NonHarmonicTerms {
+    /// Reconstruct only the selected tidal constituents.
+    TidesOnly,
+    /// Add the fitted constant current but omit the linear trend.
+    Mean,
+    /// Add both the fitted constant current and linear trend.
+    #[default]
+    MeanAndTrend,
+}
+
 /// A reusable configurable-phase and configurable-nodal reconstruction basis.
 ///
 /// Astronomy is prepared once and can then reconstruct many scalar solutions at
@@ -3491,6 +3506,202 @@ impl GreenwichNodalReconstructor {
             .collect()
     }
 
+    /// Reconstruct cached Cartesian current solutions in parallel.
+    ///
+    /// This is the allocation-reduced path intended for repeated forcing
+    /// queries. Call [`VectorSolution::cartesian`] once per fitted location and
+    /// retain the returned values across prediction timesteps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for inconsistent series counts, latitude,
+    /// solution-shape, or filter inputs.
+    pub fn reconstruct_many_cartesian_vectors_series_major(
+        &self,
+        solutions: &[CartesianVectorSolution],
+        latitudes: &[f64],
+        filter: &ReconstructionFilter,
+        non_harmonic_terms: NonHarmonicTerms,
+    ) -> Result<Vec<VectorReconstruction>, AnalysisError> {
+        if solutions.is_empty() {
+            return Err(AnalysisError::EmptySeries);
+        }
+        if solutions.len() != latitudes.len() {
+            return Err(AnalysisError::ObservationShape {
+                actual: latitudes.len(),
+                expected: solutions.len(),
+            });
+        }
+        solutions
+            .par_iter()
+            .zip(latitudes.par_iter().copied())
+            .map(|(solution, latitude)| {
+                self.reconstruct_cartesian_vector_at_latitude(
+                    solution,
+                    latitude,
+                    filter,
+                    non_harmonic_terms,
+                )
+            })
+            .collect()
+    }
+
+    /// Evaluate cached Cartesian current solutions at one prepared timestamp.
+    ///
+    /// The result contains one compact current per input solution in caller
+    /// order. This is the query-oriented temporal kernel for particle forcing:
+    /// prepare simulation timestamps once, cache Cartesian solutions once, and
+    /// request only the timestep currently needed by the transport model.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for an invalid time index, inconsistent series
+    /// counts, invalid latitude, solution shape, or filter.
+    pub fn reconstruct_cartesian_vectors_at_time_index(
+        &self,
+        time_index: usize,
+        solutions: &[CartesianVectorSolution],
+        latitudes: &[f64],
+        filter: &ReconstructionFilter,
+        non_harmonic_terms: NonHarmonicTerms,
+    ) -> Result<Vec<VectorCurrent>, AnalysisError> {
+        let terms = self.time_terms.get(time_index).ok_or(
+            AnalysisError::ReconstructionTimeIndexOutOfBounds {
+                index: time_index,
+                time_count: self.time_terms.len(),
+            },
+        )?;
+        if solutions.is_empty() {
+            return Err(AnalysisError::EmptySeries);
+        }
+        if solutions.len() != latitudes.len() {
+            return Err(AnalysisError::ObservationShape {
+                actual: latitudes.len(),
+                expected: solutions.len(),
+            });
+        }
+        solutions
+            .par_iter()
+            .zip(latitudes.par_iter().copied())
+            .map(|(solution, latitude)| {
+                validate_latitude(latitude)?;
+                validate_cartesian_vector_solution(solution, self.tidal_constituents.len())?;
+                let selected = reconstruction_indices_from_diagnostics(
+                    &self.tidal_constituents,
+                    &solution.percent_energy,
+                    solution.signal_to_noise.as_deref(),
+                    filter,
+                )?;
+                let base_corrections = cartesian_base_nodal_corrections(
+                    self.nodal_corrections,
+                    &terms.base_nodal_terms,
+                    &self.reference_base_nodal_terms,
+                    latitude_factors(latitude),
+                );
+                let mut eastward_harmonics = 0.0;
+                let mut northward_harmonics = 0.0;
+                for constituent in selected {
+                    let nodal =
+                        self.recipes[constituent].combine_cartesian_nodal(&base_corrections);
+                    let corrected = nodal * terms.astronomical_basis[constituent];
+                    eastward_harmonics += corrected.re
+                        * solution.eastward_cosine_coefficient[constituent]
+                        + corrected.im * solution.eastward_sine_coefficient[constituent];
+                    northward_harmonics += corrected.re
+                        * solution.northward_cosine_coefficient[constituent]
+                        + corrected.im * solution.northward_sine_coefficient[constituent];
+                }
+                let elapsed_days = terms.modified_julian_day - solution.reference_time_days;
+                let (eastward_non_harmonic, northward_non_harmonic) = match non_harmonic_terms {
+                    NonHarmonicTerms::TidesOnly => (0.0, 0.0),
+                    NonHarmonicTerms::Mean => (solution.eastward_mean, solution.northward_mean),
+                    NonHarmonicTerms::MeanAndTrend => (
+                        solution.eastward_mean + solution.eastward_slope_per_day * elapsed_days,
+                        solution.northward_mean + solution.northward_slope_per_day * elapsed_days,
+                    ),
+                };
+                Ok(VectorCurrent {
+                    eastward: eastward_non_harmonic + eastward_harmonics,
+                    northward: northward_non_harmonic + northward_harmonics,
+                })
+            })
+            .collect()
+    }
+
+    /// Reconstruct one Cartesian current solution at a specified latitude.
+    ///
+    /// Cartesian coefficients avoid the ellipse-to-component polar round trips
+    /// of the compatibility API. The caller explicitly chooses whether mean and
+    /// trend terms are suitable for the prediction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid latitude, solution shape, or filter.
+    pub fn reconstruct_cartesian_vector_at_latitude(
+        &self,
+        solution: &CartesianVectorSolution,
+        latitude_degrees_north: f64,
+        filter: &ReconstructionFilter,
+        non_harmonic_terms: NonHarmonicTerms,
+    ) -> Result<VectorReconstruction, AnalysisError> {
+        validate_latitude(latitude_degrees_north)?;
+        validate_cartesian_vector_solution(solution, self.tidal_constituents.len())?;
+        let selected = reconstruction_indices_from_diagnostics(
+            &self.tidal_constituents,
+            &solution.percent_energy,
+            solution.signal_to_noise.as_deref(),
+            filter,
+        )?;
+        let latitude_factors = latitude_factors(latitude_degrees_north);
+        let mut base_corrections = cartesian_base_nodal_corrections(
+            self.nodal_corrections,
+            &self.time_terms[0].base_nodal_terms,
+            &self.reference_base_nodal_terms,
+            latitude_factors,
+        );
+        let mut reconstruction = VectorReconstruction {
+            eastward: Vec::with_capacity(self.time_terms.len()),
+            northward: Vec::with_capacity(self.time_terms.len()),
+        };
+        for terms in &self.time_terms {
+            if self.nodal_corrections == NodalCorrections::Exact {
+                update_cartesian_base_nodal_corrections(
+                    &mut base_corrections,
+                    &terms.base_nodal_terms,
+                    latitude_factors,
+                );
+            }
+            let mut eastward_harmonics = 0.0;
+            let mut northward_harmonics = 0.0;
+            for constituent in selected.iter().copied() {
+                let nodal = self.recipes[constituent].combine_cartesian_nodal(&base_corrections);
+                let corrected = nodal * terms.astronomical_basis[constituent];
+                eastward_harmonics += corrected.re
+                    * solution.eastward_cosine_coefficient[constituent]
+                    + corrected.im * solution.eastward_sine_coefficient[constituent];
+                northward_harmonics += corrected.re
+                    * solution.northward_cosine_coefficient[constituent]
+                    + corrected.im * solution.northward_sine_coefficient[constituent];
+            }
+            let elapsed_days = terms.modified_julian_day - solution.reference_time_days;
+            let (eastward_non_harmonic, northward_non_harmonic) = match non_harmonic_terms {
+                NonHarmonicTerms::TidesOnly => (0.0, 0.0),
+                NonHarmonicTerms::Mean => (solution.eastward_mean, solution.northward_mean),
+                NonHarmonicTerms::MeanAndTrend => (
+                    solution.eastward_mean + solution.eastward_slope_per_day * elapsed_days,
+                    solution.northward_mean + solution.northward_slope_per_day * elapsed_days,
+                ),
+            };
+            reconstruction
+                .eastward
+                .push(eastward_non_harmonic + eastward_harmonics);
+            reconstruction
+                .northward
+                .push(northward_non_harmonic + northward_harmonics);
+        }
+        Ok(reconstruction)
+    }
+
     /// Reconstruct one current-ellipse solution at a specified latitude.
     ///
     /// # Errors
@@ -3502,11 +3713,12 @@ impl GreenwichNodalReconstructor {
         latitude_degrees_north: f64,
         filter: &ReconstructionFilter,
     ) -> Result<VectorReconstruction, AnalysisError> {
-        let (eastward, northward) = solution.component_solutions();
-        Ok(VectorReconstruction {
-            eastward: self.reconstruct_at_latitude(&eastward, latitude_degrees_north, filter)?,
-            northward: self.reconstruct_at_latitude(&northward, latitude_degrees_north, filter)?,
-        })
+        self.reconstruct_cartesian_vector_at_latitude(
+            &solution.cartesian()?,
+            latitude_degrees_north,
+            filter,
+            NonHarmonicTerms::MeanAndTrend,
+        )
     }
 }
 
@@ -6641,6 +6853,62 @@ fn reconstruction_indices(
         }
     }
 
+    reconstruction_indices_from_diagnostics(
+        constituents,
+        &solution.percent_energy,
+        solution.signal_to_noise.as_deref(),
+        filter,
+    )
+}
+
+fn validate_cartesian_vector_solution(
+    solution: &CartesianVectorSolution,
+    expected: usize,
+) -> Result<(), AnalysisError> {
+    for (field, actual) in [
+        (
+            "eastward_cosine_coefficient",
+            solution.eastward_cosine_coefficient.len(),
+        ),
+        (
+            "eastward_sine_coefficient",
+            solution.eastward_sine_coefficient.len(),
+        ),
+        (
+            "northward_cosine_coefficient",
+            solution.northward_cosine_coefficient.len(),
+        ),
+        (
+            "northward_sine_coefficient",
+            solution.northward_sine_coefficient.len(),
+        ),
+    ] {
+        if actual != expected {
+            return Err(AnalysisError::InvalidSolutionShape {
+                field,
+                actual,
+                expected,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn reconstruction_indices_from_diagnostics(
+    constituents: &[TidalConstituent],
+    percent_energy: &[f64],
+    signal_to_noise: Option<&[f64]>,
+    filter: &ReconstructionFilter,
+) -> Result<Vec<usize>, AnalysisError> {
+    let expected = constituents.len();
+    if percent_energy.len() != expected {
+        return Err(AnalysisError::InvalidSolutionShape {
+            field: "percent_energy",
+            actual: percent_energy.len(),
+            expected,
+        });
+    }
+
     match filter {
         ReconstructionFilter::All => Ok((0..expected).collect()),
         ReconstructionFilter::Constituents(requested) => {
@@ -6668,10 +6936,7 @@ fn reconstruction_indices(
             let signal_to_noise = match minimum_signal_to_noise {
                 Some(minimum) => {
                     validate_reconstruction_threshold("signal-to-noise", *minimum)?;
-                    let values = solution
-                        .signal_to_noise
-                        .as_deref()
-                        .ok_or(AnalysisError::MissingSignalToNoise)?;
+                    let values = signal_to_noise.ok_or(AnalysisError::MissingSignalToNoise)?;
                     if values.len() != expected {
                         return Err(AnalysisError::InvalidSolutionShape {
                             field: "signal_to_noise",
@@ -6685,7 +6950,7 @@ fn reconstruction_indices(
             };
             Ok((0..expected)
                 .filter(|index| {
-                    solution.percent_energy[*index] >= *minimum_percent_energy
+                    percent_energy[*index] >= *minimum_percent_energy
                         && signal_to_noise.is_none_or(|(minimum, values)| values[*index] >= minimum)
                 })
                 .collect())
@@ -7036,8 +7301,8 @@ fn usize_to_f64(value: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        GreenwichNodalBatch, GreenwichNodalOls, NodalCorrections, PhaseReference, SolverOptions,
-        shared_lomb_plan_groups, usize_to_f64,
+        GreenwichNodalBatch, GreenwichNodalOls, NodalCorrections, NonHarmonicTerms, PhaseReference,
+        ReconstructionFilter, SolverOptions, shared_lomb_plan_groups, usize_to_f64,
     };
     use crate::{
         AnalysisError, ConstituentDiagnosticsOptions, FitOptions, LinearConfidence,
@@ -7068,6 +7333,122 @@ mod tests {
         .expect("valid corrected model");
         assert!((model.constituents()[0].frequency_cph - 0.080_511_400_671_577_2).abs() < 1e-15);
         assert!((model.constituents()[1].frequency_cph - 1.0 / 12.0).abs() < 1e-15);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture covers Cartesian parity, query layout, bounds, and affine policies"
+    )]
+    fn cartesian_vector_reconstruction_matches_ellipse_path_and_controls_affine_terms() {
+        let time = times();
+        let latitude = 60.5;
+        let batch = GreenwichNodalBatch::prepare_modified_julian_days(
+            &time,
+            &[TidalConstituent::M2, TidalConstituent::K1],
+        )
+        .expect("valid batch");
+        let eastward = (0..time.len())
+            .map(|index| {
+                let position = usize_to_f64(index);
+                0.3 + 0.000_2 * position + 0.7 * (position * 0.51).cos()
+            })
+            .collect::<Vec<_>>();
+        let northward = (0..time.len())
+            .map(|index| {
+                let position = usize_to_f64(index);
+                -0.2 - 0.000_1 * position + 0.4 * (position * 0.51).sin()
+            })
+            .collect::<Vec<_>>();
+        let solution = batch
+            .solve_vector_time_major_with_missing(&eastward, &northward, &[latitude])
+            .expect("valid vector fit")
+            .pop()
+            .expect("one solution");
+        let target = [time[100] + 0.125, time[500] + 3.5];
+        let reconstructor = batch
+            .reconstructor_modified_julian_days(&target)
+            .expect("valid target times");
+        let expected = reconstructor
+            .reconstruct_vector_at_latitude(&solution, latitude, &ReconstructionFilter::All)
+            .expect("ellipse reconstruction");
+        let cartesian = solution.cartesian().expect("consistent ellipse solution");
+        let actual = reconstructor
+            .reconstruct_cartesian_vector_at_latitude(
+                &cartesian,
+                latitude,
+                &ReconstructionFilter::All,
+                NonHarmonicTerms::MeanAndTrend,
+            )
+            .expect("Cartesian reconstruction");
+        assert_eq!(actual, expected);
+        for index in 0..target.len() {
+            let current = reconstructor
+                .reconstruct_cartesian_vectors_at_time_index(
+                    index,
+                    std::slice::from_ref(&cartesian),
+                    &[latitude],
+                    &ReconstructionFilter::All,
+                    NonHarmonicTerms::MeanAndTrend,
+                )
+                .expect("query-oriented reconstruction");
+            assert!((current[0].eastward - actual.eastward[index]).abs() < f64::EPSILON);
+            assert!((current[0].northward - actual.northward[index]).abs() < f64::EPSILON);
+        }
+        assert!(matches!(
+            reconstructor.reconstruct_cartesian_vectors_at_time_index(
+                target.len(),
+                std::slice::from_ref(&cartesian),
+                &[latitude],
+                &ReconstructionFilter::All,
+                NonHarmonicTerms::MeanAndTrend,
+            ),
+            Err(AnalysisError::ReconstructionTimeIndexOutOfBounds {
+                index: 2,
+                time_count: 2,
+            })
+        ));
+
+        let tides = reconstructor
+            .reconstruct_cartesian_vector_at_latitude(
+                &cartesian,
+                latitude,
+                &ReconstructionFilter::All,
+                NonHarmonicTerms::TidesOnly,
+            )
+            .expect("tide-only reconstruction");
+        let mean = reconstructor
+            .reconstruct_cartesian_vector_at_latitude(
+                &cartesian,
+                latitude,
+                &ReconstructionFilter::All,
+                NonHarmonicTerms::Mean,
+            )
+            .expect("mean reconstruction");
+        for (index, target) in target.iter().copied().enumerate() {
+            assert!(
+                (mean.eastward[index] - tides.eastward[index] - solution.eastward_mean).abs()
+                    < 1e-14
+            );
+            assert!(
+                (mean.northward[index] - tides.northward[index] - solution.northward_mean).abs()
+                    < 1e-14
+            );
+            assert!(
+                (actual.eastward[index]
+                    - mean.eastward[index]
+                    - solution.eastward_slope_per_day * (target - solution.reference_time_days))
+                    .abs()
+                    < 1e-14
+            );
+            assert!(
+                (actual.northward[index]
+                    - mean.northward[index]
+                    - solution.northward_slope_per_day * (target - solution.reference_time_days))
+                    .abs()
+                    < 1e-14
+            );
+        }
     }
 
     #[test]

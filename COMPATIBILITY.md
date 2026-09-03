@@ -25,10 +25,11 @@ The workspace and Python distribution share one Cargo-sourced version.
 The compiled schema constants are public as
 `rutide_cli::SCALAR_OUTPUT_SCHEMA_VERSION` and
 `rutide_cli::VECTOR_OUTPUT_SCHEMA_VERSION`. They currently identify scalar v17
-and vector v15. These versions add opt-in constituent-identifiability
-configuration and complete per-series/per-constituent diagnostic fields. When
-disabled, the canonical digest retains the preceding profile's content and the
-application avoids diagnostic calculation.
+and vector v16. Scalar v17 and vector v15 added opt-in constituent-identifiability
+configuration and complete per-series/per-constituent diagnostic fields. Vector
+v16 additionally stores the four Cartesian eastward/northward cosine/sine
+coefficient fields required for phase-wrap-safe spatial products. When extended
+diagnostics are disabled, the application avoids their calculation.
 
 A schema version covers dimension names and order, required variables, variable
 meaning and units, enumerated flag values, required global attributes, and JSON
@@ -77,6 +78,12 @@ The machine-readable status is
 validated against
 [`compatibility/feature-matrix.schema.json`](compatibility/feature-matrix.schema.json)
 and checked against compiled constants in the Rust test suite.
+
+Rows marked `planned` are intentionally outside the current supported contract.
+They currently comprise MATLAB's optional known-pre-filter response correction
+and the Rust-specific spatial current-atlas layer. The former is not required
+for raw FVCOM fields; its implementation contract is recorded in
+[`PREFILTER_TRANSFER.md`](PREFILTER_TRANSFER.md).
 
 The `rutide` Python distribution supports CPython 3.9 and newer through a
 PyO3 `abi3-py39` extension. Its `solve` and `reconstruct` endpoints are shaped

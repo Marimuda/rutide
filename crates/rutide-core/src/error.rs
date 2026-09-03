@@ -21,6 +21,13 @@ pub enum AnalysisError {
     },
     /// A reconstruction fit-reference epoch is NaN or infinite.
     NonFiniteReferenceTime,
+    /// A requested prepared reconstruction timestamp does not exist.
+    ReconstructionTimeIndexOutOfBounds {
+        /// Requested target-time position.
+        index: usize,
+        /// Number of timestamps retained by the reconstructor.
+        time_count: usize,
+    },
     /// Timestamps are not strictly increasing.
     NonIncreasingTime {
         /// Position of the latter timestamp in the invalid pair.
@@ -232,6 +239,10 @@ impl fmt::Display for AnalysisError {
             Self::NonFiniteReferenceTime => {
                 formatter.write_str("reconstruction reference time must be finite")
             }
+            Self::ReconstructionTimeIndexOutOfBounds { index, time_count } => write!(
+                formatter,
+                "reconstruction time index {index} is outside the {time_count} prepared timestamps"
+            ),
             Self::NonIncreasingTime { index } => write!(
                 formatter,
                 "timestamps must be strictly increasing; violation at index {index}"

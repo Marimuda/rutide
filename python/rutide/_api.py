@@ -144,6 +144,10 @@ class CoefficientBatch(Bunch):
                 "semi_minor_ci",
                 "inclination_ci_degrees",
                 "phase_ci_degrees",
+                "eastward_cosine_coefficient",
+                "eastward_sine_coefficient",
+                "northward_cosine_coefficient",
+                "northward_sine_coefficient",
                 "percent_energy",
                 "signal_to_noise",
             )

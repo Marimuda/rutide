@@ -1,9 +1,10 @@
 # RUTide roadmap
 
-This roadmap tracks the remaining work required to move from the validated FVCOM
-application profile toward broad Python UTide compatibility. It is deliberately
-ordered by scientific dependency: each increment must pass a pinned-Python oracle
-gate before it becomes part of the performance comparison or public interface.
+This roadmap tracks the remaining work required to move from the validated,
+broadly Python-UTide-compatible analysis engine toward a domain-ready FVCOM and
+ADCP product. It is deliberately ordered by scientific dependency: each
+compatible increment must pass a pinned-Python oracle gate, while extensions
+require independent equation or synthetic validation.
 
 Status values are **complete**, **next**, and **planned**. A feature is complete
 only when its scalar and vector scope is stated explicitly, invalid inputs have
@@ -368,10 +369,67 @@ The equation-level conventions are maintained in `DIAGNOSTICS.md`; the retained
 whole-field cost and demonstrated next optimization target are in
 `benchmarks/results/constituent-diagnostics-2026-09-03.md`.
 
+## 8. Harmonic-current forcing foundation — in progress
+
+- **Complete:** expose reconstruction-ready eastward/northward cosine/sine
+  coefficients without phase or inclination wrap discontinuities.
+- **Complete:** jointly evaluate both current components from cached Cartesian
+  solutions, avoiding the compatibility path's temporary scalar solutions and
+  duplicate corrected-basis work.
+- **Complete:** evaluate many cached spatial solutions at one prepared timestep
+  as compact currents, with explicit tide-only, mean, or mean-and-trend policy.
+- **Complete:** serialize the Cartesian fields through Python and FVCOM vector
+  NetCDF/JSON schema 16 while retaining ellipse outputs and backward-readable
+  Python coefficient archives.
+- **Next:** define a common atlas epoch for non-harmonic terms and either
+  canonicalize or explicitly restrict non-exact phase/nodal modes.
+- **Planned:** add the self-contained FVCOM mesh/current-atlas schema, spatial
+  locator/interpolator, vectorized Python particle-query endpoint, and optional
+  OpenDrift reader.
+
+The temporal coefficient and prediction contract is documented in
+`HARMONIC_CURRENT_ATLAS.md`.
+
+## 9. Remaining MATLAB analysis restoration — planned, optional
+
+- **Planned:** implement MATLAB UTide's pre-filter response correction as the
+  typed and provenance-preserving contract in `PREFILTER_TRANSFER.md`.
+- Python UTide does not expose this through its public strict option surface and
+  labels the retained harmonic argument unimplemented. Acceptance therefore
+  requires equation-level MATLAB fixtures plus synthetic recovery tests rather
+  than a pinned-Python oracle.
+- The unity response must retain the current fast path. Selected-frequency gains
+  will be precomputed once, so a valid correction should add no work inside the
+  time/series loops.
+- This is valuable for records with a known preprocessing filter, but it is not
+  a prerequisite for raw FVCOM fields and should not block the current-atlas
+  work.
+
+## Definition of a domain-ready FVCOM tidal-analysis product
+
+The harmonic-analysis engine is scientifically broad when every supported row
+in the machine-readable compatibility matrix remains oracle- or equation-tested.
+Product readiness additionally requires:
+
+- stable pre-1.0 Rust/Python and NetCDF contracts with migration notes;
+- real FVCOM and ADCP acceptance fixtures spanning scalar, depth-averaged,
+  sigma-layer, fixed-depth, missing, irregular, and robust cases;
+- explicit units, epochs, coordinate/vertical metadata, wet/dry semantics, and
+  analysis provenance in every domain output;
+- domain-facing QC guidance for constituent identifiability, residuals,
+  confidence assumptions, and safe extrapolation; and
+- profile-specific correctness, memory, and throughput gates on release
+  artifacts.
+
+Those are hardening and usability gates rather than missing harmonic equations.
+The spatial atlas and OpenDrift reader are a separate downstream product layer.
+
 ## Definition of broad compatibility
 
-RUTide may claim broad Python UTide compatibility only after items 1 through 5
-have explicit supported/unsupported matrices and the supported cases pass the
-pinned oracle. Performance claims remain profile-specific: regular FVCOM OLS,
-irregular Lomb–Scargle confidence, robust fitting, and Monte Carlo intervals must
-be reported separately.
+RUTide has broad Python UTide *analysis* compatibility for the supported cases in
+the machine-readable feature and option matrices: items 1 through 5 have explicit
+behavior and pass their pinned oracles. This does not mean byte-for-byte API or
+archive interchangeability, nor that planned MATLAB restorations and downstream
+spatial products are complete. Performance claims remain profile-specific:
+regular FVCOM OLS, irregular Lomb–Scargle confidence, robust fitting, Monte Carlo
+intervals, and temporal current queries are reported separately.

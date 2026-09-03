@@ -4,6 +4,40 @@ use std::f64::consts::PI;
 
 use crate::{AnalysisError, RobustDiagnostics, ScalarSolution};
 
+/// Reconstruction-ready Cartesian coefficients for a two-component current.
+///
+/// Unlike ellipse phase and inclination, these coefficients are continuous
+/// across angular wrap boundaries and can therefore form the numerical payload
+/// of a spatial harmonic-current atlas.  Each harmonic component follows the
+/// same convention as [`ScalarSolution`]:
+///
+/// `component = cosine_coefficient * cos(basis) + sine_coefficient * sin(basis)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CartesianVectorSolution {
+    /// Eastward cosine coefficient for each constituent.
+    pub eastward_cosine_coefficient: Vec<f64>,
+    /// Eastward sine coefficient for each constituent.
+    pub eastward_sine_coefficient: Vec<f64>,
+    /// Northward cosine coefficient for each constituent.
+    pub northward_cosine_coefficient: Vec<f64>,
+    /// Northward sine coefficient for each constituent.
+    pub northward_sine_coefficient: Vec<f64>,
+    /// Percent of total resolved ellipse energy for each constituent.
+    pub percent_energy: Vec<f64>,
+    /// Ellipse-energy signal-to-noise ratio, when confidence was requested.
+    pub signal_to_noise: Option<Vec<f64>>,
+    /// Fitted eastward constant offset.
+    pub eastward_mean: f64,
+    /// Fitted northward constant offset.
+    pub northward_mean: f64,
+    /// Fitted eastward trend per day.
+    pub eastward_slope_per_day: f64,
+    /// Fitted northward trend per day.
+    pub northward_slope_per_day: f64,
+    /// Epoch at which both means are defined, in fit-day coordinates.
+    pub reference_time_days: f64,
+}
+
 /// Harmonic current ellipses derived from joint eastward/northward OLS fits.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VectorSolution {
@@ -50,6 +84,18 @@ pub struct VectorReconstruction {
     pub northward: Vec<f64>,
 }
 
+/// One instantaneous two-component current.
+///
+/// Batches of this compact type preserve caller order and avoid allocating two
+/// one-value vectors per spatial query location.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VectorCurrent {
+    /// Reconstructed eastward velocity.
+    pub eastward: f64,
+    /// Reconstructed northward velocity.
+    pub northward: f64,
+}
+
 impl VectorSolution {
     /// Return constituent indices ranked by descending percent energy.
     #[must_use]
@@ -63,7 +109,41 @@ impl VectorSolution {
         self.signal_to_noise.as_deref().map(descending_indices)
     }
 
-    pub(crate) fn component_solutions(&self) -> (ScalarSolution, ScalarSolution) {
+    /// Convert ellipse parameters into reconstruction-ready Cartesian coefficients.
+    ///
+    /// This representation should be preferred for spatial interpolation because
+    /// it has no phase or inclination wrap discontinuity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] if an ellipse or diagnostic array does not have
+    /// the same constituent count as `semi_major`.
+    pub fn cartesian(&self) -> Result<CartesianVectorSolution, AnalysisError> {
+        let constituent_count = self.semi_major.len();
+        for (field, actual) in [
+            ("semi_minor", self.semi_minor.len()),
+            ("inclination_degrees", self.inclination_degrees.len()),
+            ("phase_degrees", self.phase_degrees.len()),
+            ("percent_energy", self.percent_energy.len()),
+        ] {
+            if actual != constituent_count {
+                return Err(AnalysisError::InvalidSolutionShape {
+                    field,
+                    actual,
+                    expected: constituent_count,
+                });
+            }
+        }
+        if let Some(signal_to_noise) = &self.signal_to_noise
+            && signal_to_noise.len() != constituent_count
+        {
+            return Err(AnalysisError::InvalidSolutionShape {
+                field: "signal_to_noise",
+                actual: signal_to_noise.len(),
+                expected: constituent_count,
+            });
+        }
+
         let mut eastward_cosine = Vec::with_capacity(self.semi_major.len());
         let mut eastward_sine = Vec::with_capacity(self.semi_major.len());
         let mut northward_cosine = Vec::with_capacity(self.semi_major.len());
@@ -84,25 +164,44 @@ impl VectorSolution {
             northward_cosine.push(positive_imaginary + negative_imaginary);
             northward_sine.push(positive_real - negative_real);
         }
+        Ok(CartesianVectorSolution {
+            eastward_cosine_coefficient: eastward_cosine,
+            eastward_sine_coefficient: eastward_sine,
+            northward_cosine_coefficient: northward_cosine,
+            northward_sine_coefficient: northward_sine,
+            percent_energy: self.percent_energy.clone(),
+            signal_to_noise: self.signal_to_noise.clone(),
+            eastward_mean: self.eastward_mean,
+            northward_mean: self.northward_mean,
+            eastward_slope_per_day: self.eastward_slope_per_day,
+            northward_slope_per_day: self.northward_slope_per_day,
+            reference_time_days: self.reference_time_days,
+        })
+    }
+
+    pub(crate) fn component_solutions(&self) -> (ScalarSolution, ScalarSolution) {
+        let cartesian = self
+            .cartesian()
+            .expect("internally produced vector solutions have consistent shapes");
         (
             component_solution(
-                eastward_cosine,
-                eastward_sine,
-                &self.percent_energy,
-                self.signal_to_noise.as_deref(),
-                self.eastward_mean,
-                self.eastward_slope_per_day,
-                self.reference_time_days,
+                cartesian.eastward_cosine_coefficient,
+                cartesian.eastward_sine_coefficient,
+                &cartesian.percent_energy,
+                cartesian.signal_to_noise.as_deref(),
+                cartesian.eastward_mean,
+                cartesian.eastward_slope_per_day,
+                cartesian.reference_time_days,
                 self.robust.clone(),
             ),
             component_solution(
-                northward_cosine,
-                northward_sine,
-                &self.percent_energy,
-                self.signal_to_noise.as_deref(),
-                self.northward_mean,
-                self.northward_slope_per_day,
-                self.reference_time_days,
+                cartesian.northward_cosine_coefficient,
+                cartesian.northward_sine_coefficient,
+                &cartesian.percent_energy,
+                cartesian.signal_to_noise.as_deref(),
+                cartesian.northward_mean,
+                cartesian.northward_slope_per_day,
+                cartesian.reference_time_days,
                 self.robust.clone(),
             ),
         )
@@ -459,4 +558,91 @@ fn descending_indices(values: &[f64]) -> Vec<usize> {
             .then_with(|| left.cmp(right))
     });
     indices
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VectorSolution, ellipse_parameters};
+    use crate::AnalysisError;
+
+    fn solution(phase_degrees: f64) -> VectorSolution {
+        VectorSolution {
+            semi_major: vec![1.2],
+            semi_minor: vec![-0.3],
+            inclination_degrees: vec![42.0],
+            phase_degrees: vec![phase_degrees],
+            percent_energy: vec![100.0],
+            semi_major_ci: None,
+            semi_minor_ci: None,
+            inclination_ci_degrees: None,
+            phase_ci_degrees: None,
+            signal_to_noise: Some(vec![25.0]),
+            eastward_mean: 0.2,
+            northward_mean: -0.1,
+            eastward_slope_per_day: 0.01,
+            northward_slope_per_day: -0.02,
+            reference_time_days: 60_000.0,
+            robust: None,
+        }
+    }
+
+    #[test]
+    fn cartesian_coefficients_round_trip_through_the_ellipse_representation() {
+        let expected = solution(359.0);
+        let cartesian = expected.cartesian().expect("consistent ellipse solution");
+        let actual = ellipse_parameters(
+            cartesian.eastward_cosine_coefficient[0],
+            cartesian.eastward_sine_coefficient[0],
+            cartesian.northward_cosine_coefficient[0],
+            cartesian.northward_sine_coefficient[0],
+        );
+        for (actual, expected) in [
+            (actual.0, expected.semi_major[0]),
+            (actual.1, expected.semi_minor[0]),
+            (actual.2, expected.inclination_degrees[0]),
+            (actual.3, expected.phase_degrees[0]),
+        ] {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn cartesian_coefficients_remain_continuous_across_phase_wrap() {
+        let below = solution(359.0).cartesian().expect("valid ellipse");
+        let above = solution(1.0).cartesian().expect("valid ellipse");
+        for (below, above) in [
+            (
+                below.eastward_cosine_coefficient[0],
+                above.eastward_cosine_coefficient[0],
+            ),
+            (
+                below.eastward_sine_coefficient[0],
+                above.eastward_sine_coefficient[0],
+            ),
+            (
+                below.northward_cosine_coefficient[0],
+                above.northward_cosine_coefficient[0],
+            ),
+            (
+                below.northward_sine_coefficient[0],
+                above.northward_sine_coefficient[0],
+            ),
+        ] {
+            assert!((below - above).abs() < 0.04);
+        }
+    }
+
+    #[test]
+    fn cartesian_conversion_rejects_mismatched_ellipse_arrays() {
+        let mut invalid = solution(30.0);
+        invalid.phase_degrees.clear();
+        assert!(matches!(
+            invalid.cartesian(),
+            Err(AnalysisError::InvalidSolutionShape {
+                field: "phase_degrees",
+                actual: 0,
+                expected: 1,
+            })
+        ));
+    }
 }

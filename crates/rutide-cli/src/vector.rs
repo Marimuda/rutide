@@ -45,7 +45,7 @@ use super::{
 };
 
 /// `NetCDF` and JSON report schema emitted by vector-current analyses.
-pub const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 15;
+pub const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 16;
 const FIXED_DEPTH_ZETA_SPAN_AMPLIFICATION: usize = 6;
 
 /// Configuration for one FVCOM current analysis.
@@ -117,6 +117,14 @@ pub struct VectorSampleResult {
     pub inclination_degrees: Vec<f64>,
     /// Phases in degrees using the report's configured reference convention.
     pub phase_degrees: Vec<f64>,
+    /// Eastward cosine coefficients in constituent order.
+    pub eastward_cosine_coefficient: Vec<f64>,
+    /// Eastward sine coefficients in constituent order.
+    pub eastward_sine_coefficient: Vec<f64>,
+    /// Northward cosine coefficients in constituent order.
+    pub northward_cosine_coefficient: Vec<f64>,
+    /// Northward sine coefficients in constituent order.
+    pub northward_sine_coefficient: Vec<f64>,
     /// Percent ellipse energy in constituent order.
     pub percent_energy: Vec<f64>,
     /// Stable constituent indices in requested presentation-rank order.
@@ -3396,6 +3404,7 @@ fn vector_result_digest(
     digest.update([0]);
     digest.update(nodal_corrections.name().as_bytes());
     digest.update([0]);
+    digest.update(b"cartesian-vector-v1\0");
     update_constituent_order_digest(&mut digest, constituent_order, constituent_index_by_rank);
     if input.is_fixed_depth() {
         for solution in solutions {
@@ -3451,12 +3460,26 @@ fn vector_result_digest(
         );
         digest.update(latitude.to_bits().to_le_bytes());
         digest.update(solution.reference_time_days.to_bits().to_le_bytes());
+        let cartesian = solution
+            .cartesian()
+            .map_err(|error| AppError::Invalid(error.to_string()))?;
+        if cartesian.eastward_cosine_coefficient.len() != constituents.len() {
+            return Err(AppError::Invalid(format!(
+                "vector Cartesian result contains {} constituents; expected {}",
+                cartesian.eastward_cosine_coefficient.len(),
+                constituents.len()
+            )));
+        }
         for values in [
             frequency_cph.as_slice(),
             &solution.semi_major,
             &solution.semi_minor,
             &solution.inclination_degrees,
             &solution.phase_degrees,
+            &cartesian.eastward_cosine_coefficient,
+            &cartesian.eastward_sine_coefficient,
+            &cartesian.northward_cosine_coefficient,
+            &cartesian.northward_sine_coefficient,
             &solution.percent_energy,
         ] {
             for value in values {
@@ -3642,6 +3665,7 @@ fn vector_result_digest_from_incremental_output(
     digest.update([0]);
     digest.update(nodal_corrections.name().as_bytes());
     digest.update([0]);
+    digest.update(b"cartesian-vector-v1\0");
     digest.update(constituent_order.name().as_bytes());
     digest.update([0]);
     if let Some(names) = constituent_order.explicit_names() {
@@ -3903,6 +3927,10 @@ fn vector_result_digest_from_incremental_output(
     let semi_minor = required_output_variable(&output, "semi_minor")?;
     let inclination = required_output_variable(&output, "inclination")?;
     let phase = required_output_variable(&output, "phase")?;
+    let eastward_cosine = required_output_variable(&output, "eastward_cosine_coefficient")?;
+    let eastward_sine = required_output_variable(&output, "eastward_sine_coefficient")?;
+    let northward_cosine = required_output_variable(&output, "northward_cosine_coefficient")?;
+    let northward_sine = required_output_variable(&output, "northward_sine_coefficient")?;
     let percent_energy = required_output_variable(&output, "percent_energy")?;
     let confidence_variables = if confidence_interval == ConfidenceInterval::None {
         None
@@ -3974,6 +4002,34 @@ fn vector_result_digest_from_incremental_output(
             )?,
             read_layered_series_values::<f64>(
                 &phase,
+                element_count,
+                first_series,
+                rows,
+                constituent_count,
+            )?,
+            read_layered_series_values::<f64>(
+                &eastward_cosine,
+                element_count,
+                first_series,
+                rows,
+                constituent_count,
+            )?,
+            read_layered_series_values::<f64>(
+                &eastward_sine,
+                element_count,
+                first_series,
+                rows,
+                constituent_count,
+            )?,
+            read_layered_series_values::<f64>(
+                &northward_cosine,
+                element_count,
+                first_series,
+                rows,
+                constituent_count,
+            )?,
+            read_layered_series_values::<f64>(
+                &northward_sine,
                 element_count,
                 first_series,
                 rows,
@@ -4233,6 +4289,9 @@ fn retained_vector_samples(
         .map(|(series, (observation_count, solution))| {
             let (layer_index, depth_meters_below_surface, element_index, latitude_degrees_north) =
                 input.series_coordinates(series);
+            let cartesian = solution
+                .cartesian()
+                .expect("fitted vector solution shapes were validated by the solver");
             VectorSampleResult {
                 element_index,
                 layer_index,
@@ -4247,6 +4306,10 @@ fn retained_vector_samples(
                 semi_minor: solution.semi_minor.clone(),
                 inclination_degrees: solution.inclination_degrees.clone(),
                 phase_degrees: solution.phase_degrees.clone(),
+                eastward_cosine_coefficient: cartesian.eastward_cosine_coefficient,
+                eastward_sine_coefficient: cartesian.eastward_sine_coefficient,
+                northward_cosine_coefficient: cartesian.northward_cosine_coefficient,
+                northward_sine_coefficient: cartesian.northward_sine_coefficient,
                 percent_energy: solution.percent_energy.clone(),
                 constituent_index_by_rank: constituent_index_by_rank
                     .row(series)
@@ -4288,6 +4351,9 @@ fn extend_retained_vector_samples(
         let solution = &solutions[local_series];
         let (layer_index, depth_meters_below_surface, element_index, latitude_degrees_north) =
             input.series_coordinates(series);
+        let cartesian = solution
+            .cartesian()
+            .expect("fitted vector solution shapes were validated by the solver");
         retained.push((
             series,
             VectorSampleResult {
@@ -4304,6 +4370,10 @@ fn extend_retained_vector_samples(
                 semi_minor: solution.semi_minor.clone(),
                 inclination_degrees: solution.inclination_degrees.clone(),
                 phase_degrees: solution.phase_degrees.clone(),
+                eastward_cosine_coefficient: cartesian.eastward_cosine_coefficient,
+                eastward_sine_coefficient: cartesian.eastward_sine_coefficient,
+                northward_cosine_coefficient: cartesian.northward_cosine_coefficient,
+                northward_sine_coefficient: cartesian.northward_sine_coefficient,
                 percent_energy: solution.percent_energy.clone(),
                 constituent_index_by_rank: constituent_index_by_rank
                     .row(local_series)
@@ -4463,6 +4533,10 @@ fn create_vector_output_base(
     output.add_attribute("trend_enabled", i64::from(data.fit_options.trend))?;
     output.add_attribute("phase_reference", data.phase_reference.name())?;
     output.add_attribute("nodal_corrections", data.nodal_corrections.name())?;
+    output.add_attribute(
+        "cartesian_coefficient_convention",
+        "component = cosine_coefficient * real(corrected_astronomical_basis) + sine_coefficient * imaginary(corrected_astronomical_basis)",
+    )?;
     output.add_attribute("constituent_order", data.constituent_order.name())?;
     if let Some(names) = data.constituent_order.explicit_names() {
         output.add_attribute("explicit_constituent_order", names.join(","))?;
@@ -4806,6 +4880,10 @@ fn define_incremental_vector_variables(
         ("semi_minor", "source velocity units"),
         ("inclination", "degrees"),
         ("phase", "degrees"),
+        ("eastward_cosine_coefficient", "source velocity units"),
+        ("eastward_sine_coefficient", "source velocity units"),
+        ("northward_cosine_coefficient", "source velocity units"),
+        ("northward_sine_coefficient", "source velocity units"),
         ("percent_energy", "percent"),
     ] {
         add_variable_with_units::<f64>(output, name, &solution_dimensions, units)?;
@@ -5016,6 +5094,34 @@ where
         values.extend_from_slice(row);
     }
     Ok(values)
+}
+
+fn collect_cartesian_vector_solution_fields(
+    solutions: &[VectorSolution],
+    constituent_count: usize,
+) -> Result<[Vec<f64>; 4], AppError> {
+    let capacity = solutions.len().saturating_mul(constituent_count);
+    let mut fields = std::array::from_fn(|_| Vec::with_capacity(capacity));
+    for solution in solutions {
+        let cartesian = solution
+            .cartesian()
+            .map_err(|error| AppError::Invalid(error.to_string()))?;
+        if cartesian.eastward_cosine_coefficient.len() != constituent_count {
+            return Err(AppError::Invalid(format!(
+                "vector Cartesian result contains {} constituents; expected {constituent_count}",
+                cartesian.eastward_cosine_coefficient.len()
+            )));
+        }
+        for (destination, source) in fields.iter_mut().zip([
+            cartesian.eastward_cosine_coefficient,
+            cartesian.eastward_sine_coefficient,
+            cartesian.northward_cosine_coefficient,
+            cartesian.northward_sine_coefficient,
+        ]) {
+            destination.extend(source);
+        }
+    }
+    Ok(fields)
 }
 
 fn write_vector_solution_field<F>(
@@ -5368,6 +5474,22 @@ fn write_incremental_vector_chunk(
         solutions,
         |solution| &solution.phase_degrees,
     )?;
+    let cartesian = collect_cartesian_vector_solution_fields(solutions, constituent_count)?;
+    for (name, values) in [
+        ("eastward_cosine_coefficient", &cartesian[0]),
+        ("eastward_sine_coefficient", &cartesian[1]),
+        ("northward_cosine_coefficient", &cartesian[2]),
+        ("northward_sine_coefficient", &cartesian[3]),
+    ] {
+        put_layered_series_values(
+            output,
+            name,
+            element_count,
+            first_series,
+            constituent_count,
+            values,
+        )?;
+    }
     write_vector_solution_field(
         output,
         "percent_energy",
@@ -5690,6 +5812,10 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the buffered vector schema keeps ellipse, Cartesian, confidence, and affine fields together"
+)]
 fn write_vector_solution_variables(
     output: &mut FileMut,
     constituent_count: usize,
@@ -5748,6 +5874,21 @@ fn write_vector_solution_variables(
             &mut output.add_variable::<f64>(name, &dimensions)?,
             values,
             units,
+        )?;
+    }
+    let cartesian = collect_cartesian_vector_solution_fields(solutions, constituent_count)?;
+    for (name, values) in [
+        ("eastward_cosine_coefficient", &cartesian[0]),
+        ("eastward_sine_coefficient", &cartesian[1]),
+        ("northward_cosine_coefficient", &cartesian[2]),
+        ("northward_sine_coefficient", &cartesian[3]),
+    ] {
+        let mut dimensions = series_dimensions.to_vec();
+        dimensions.push("constituent");
+        write_variable(
+            &mut output.add_variable::<f64>(name, &dimensions)?,
+            values,
+            "source velocity units",
         )?;
     }
     if confidence_interval != ConfidenceInterval::None {
@@ -6690,6 +6831,10 @@ mod tests {
             "semi_minor",
             "inclination",
             "phase",
+            "eastward_cosine_coefficient",
+            "eastward_sine_coefficient",
+            "northward_cosine_coefficient",
+            "northward_sine_coefficient",
             "diagnostic_basis_condition_number",
             "diagnostic_higher_maximum_correlation",
             "robust_weight",
@@ -6859,7 +7004,7 @@ mod tests {
             analyze_vector(&layered_config).expect("analyze native sigma-layer currents");
         assert_eq!(
             layered_report.result_sha256,
-            "0d480957ea28a127f32d81520a625a025fa160fb607a0958cd7d8b88d283fbf2"
+            "91ff9146504d208e83b8bc51cd0908d3db8d03e459233af33994fc9137734b5e"
         );
         let mut layered_chunked_config = layered_config.clone();
         layered_chunked_config.output = layered_chunked_output_path.clone();

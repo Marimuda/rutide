@@ -207,6 +207,22 @@ irregular Lomb–Scargle confidence, robust fitting, exact/approximate inference
 Monte Carlo confidence, and filtered reconstruction all use the same Rust core
 validated by the CLI.
 
+Vector results additionally expose phase-wrap-safe Cartesian
+`eastward_cosine_coefficient`, `eastward_sine_coefficient`,
+`northward_cosine_coefficient`, and `northward_sine_coefficient` arrays. The
+Rust core can cache that representation and evaluate many spatial solutions at
+one prepared timestep with an explicit tide-only, mean, or mean-and-trend
+policy. The temporal contract and restrictions for future spatial atlases are
+defined in [`HARMONIC_CURRENT_ATLAS.md`](HARMONIC_CURRENT_ATLAS.md). The
+[temporal-query benchmark](benchmarks/results/temporal-current-query-2026-09-03.md)
+records isolated direct-current throughput and its batch-size-dependent worker
+scaling; it does not include spatial interpolation or OpenDrift.
+
+The remaining optional MATLAB analysis restoration is the known
+[pre-filter transfer-function correction](PREFILTER_TRANSFER.md). It is useful
+for records passed through a documented filter and is not required for raw
+FVCOM fields.
+
 `diagnostics=True` adds the full Codiga constituent-identifiability suite as
 structured `coef.diagn` arrays: adjacent RR/RNM/Corrmax, whole-basis `K` and
 `SNRallc`, and full/SNR-subset tidal variance. Single and batch coefficient

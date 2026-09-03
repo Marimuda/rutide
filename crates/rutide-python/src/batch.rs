@@ -11,10 +11,10 @@ use numpy::{
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyDict};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use rutide_core::{
-    ConstituentDiagnosticsOptions, ConstituentSelectionDiagnostics, GreenwichNodalBatch,
-    GreenwichNodalReconstructor, InferenceMode, ReconstructionFilter, RobustOptions,
-    RobustTermination, ScalarInferenceBatch, ScalarSolution, SolverOptions, TidalConstituent,
-    VectorInferenceBatch, VectorSolution, select_constituents_by_rayleigh,
+    CartesianVectorSolution, ConstituentDiagnosticsOptions, ConstituentSelectionDiagnostics,
+    GreenwichNodalBatch, GreenwichNodalReconstructor, InferenceMode, ReconstructionFilter,
+    RobustOptions, RobustTermination, ScalarInferenceBatch, ScalarSolution, SolverOptions,
+    TidalConstituent, VectorInferenceBatch, VectorSolution, select_constituents_by_rayleigh,
 };
 
 use super::{
@@ -1309,6 +1309,11 @@ fn add_vector_summary(
     solutions: &[VectorSolution],
     constituent_count: usize,
 ) -> PyResult<()> {
+    let cartesian = solutions
+        .iter()
+        .map(VectorSolution::cartesian)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
     let semi_major = matrix_from_vector(solutions, constituent_count, |solution| {
         &solution.semi_major
     })?
@@ -1338,6 +1343,34 @@ fn add_vector_summary(
     ] {
         output.set_item(short, values)?;
         output.set_item(descriptive, values)?;
+    }
+    for (name, values) in [
+        (
+            "eastward_cosine_coefficient",
+            matrix_from_cartesian(&cartesian, constituent_count, |solution| {
+                &solution.eastward_cosine_coefficient
+            })?,
+        ),
+        (
+            "eastward_sine_coefficient",
+            matrix_from_cartesian(&cartesian, constituent_count, |solution| {
+                &solution.eastward_sine_coefficient
+            })?,
+        ),
+        (
+            "northward_cosine_coefficient",
+            matrix_from_cartesian(&cartesian, constituent_count, |solution| {
+                &solution.northward_cosine_coefficient
+            })?,
+        ),
+        (
+            "northward_sine_coefficient",
+            matrix_from_cartesian(&cartesian, constituent_count, |solution| {
+                &solution.northward_sine_coefficient
+            })?,
+        ),
+    ] {
+        output.set_item(name, values.into_pyarray(py))?;
     }
     set_optional_vector_matrix(
         py,
@@ -1621,6 +1654,21 @@ fn matrix_from_vector<F>(
 ) -> PyResult<Array2<f64>>
 where
     F: Fn(&VectorSolution) -> &[f64],
+{
+    array2(
+        solutions.len(),
+        constituent_count,
+        solutions.iter().flat_map(field).copied().collect(),
+    )
+}
+
+fn matrix_from_cartesian<F>(
+    solutions: &[CartesianVectorSolution],
+    constituent_count: usize,
+    field: F,
+) -> PyResult<Array2<f64>>
+where
+    F: Fn(&CartesianVectorSolution) -> &[f64],
 {
     array2(
         solutions.len(),

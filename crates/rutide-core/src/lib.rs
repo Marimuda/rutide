@@ -23,7 +23,7 @@ pub use catalog::{
 };
 pub use corrected::{
     GreenwichNodalBatch, GreenwichNodalOls, GreenwichNodalReconstructor, InferenceMode,
-    NodalCorrections, PhaseReference, ReconstructionFilter, ScalarInferenceBatch,
+    NodalCorrections, NonHarmonicTerms, PhaseReference, ReconstructionFilter, ScalarInferenceBatch,
     ScalarInferenceOls, ScalarInferenceRelation, SolverOptions, VectorInferenceBatch,
     VectorInferenceOls, VectorInferenceRelation,
 };
@@ -46,7 +46,7 @@ pub use time::{
     GregorianDateTime, NormalizedTimeAxis, TimeEpoch, normalize_numeric_time,
     system_time_to_modified_julian_day,
 };
-pub use vector::{VectorReconstruction, VectorSolution};
+pub use vector::{CartesianVectorSolution, VectorCurrent, VectorReconstruction, VectorSolution};
 
 /// The `RUTide` core crate version used to produce a result.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

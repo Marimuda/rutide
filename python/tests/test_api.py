@@ -315,6 +315,37 @@ class VectorApiTests(unittest.TestCase):
         self.assertIn("Lsmaj", coefficients)
         self.assertIn("theta", coefficients)
         self.assertTrue(np.isfinite(coefficients.Lsmaj_ci[0]))
+        for name in (
+            "eastward_cosine_coefficient",
+            "eastward_sine_coefficient",
+            "northward_cosine_coefficient",
+            "northward_sine_coefficient",
+        ):
+            self.assertEqual(coefficients[name].shape, (1,))
+            self.assertFalse(coefficients[name].flags.writeable)
+        angle = (
+            2
+            * np.pi
+            * coefficients.frequency_cph[0]
+            * 24
+            * (time - coefficients.reference_time_mjd)
+        )
+        np.testing.assert_allclose(
+            coefficients.umean
+            + coefficients.eastward_cosine_coefficient[0] * np.cos(angle)
+            + coefficients.eastward_sine_coefficient[0] * np.sin(angle),
+            eastward,
+            rtol=2e-11,
+            atol=5e-5,
+        )
+        np.testing.assert_allclose(
+            coefficients.vmean
+            + coefficients.northward_cosine_coefficient[0] * np.cos(angle)
+            + coefficients.northward_sine_coefficient[0] * np.sin(angle),
+            northward,
+            rtol=2e-11,
+            atol=5e-5,
+        )
         reconstructed = rutide.reconstruct(time, coefficients, min_SNR=None, verbose=False)
         self.assertLess(float(np.max(np.abs(reconstructed.u - eastward))), 5e-5)
         self.assertLess(float(np.max(np.abs(reconstructed.v - northward))), 5e-5)
@@ -530,6 +561,14 @@ class BatchApiTests(unittest.TestCase):
 
         np.testing.assert_array_equal(batch.nobs, [count - 2, count, count - 1])
         self.assertEqual(batch.Lsmaj.shape, (series_count, 2))
+        for name in (
+            "eastward_cosine_coefficient",
+            "eastward_sine_coefficient",
+            "northward_cosine_coefficient",
+            "northward_sine_coefficient",
+        ):
+            self.assertEqual(batch[name].shape, (series_count, 2))
+            self.assertFalse(batch[name].flags.writeable)
         currents = rutide.reconstruct_many(time, batch, min_SNR=None, verbose=False)
         self.assertEqual(currents.u.shape, eastward.shape)
         self.assertEqual(currents.v.shape, northward.shape)
@@ -796,6 +835,10 @@ class PersistenceTests(unittest.TestCase):
             "Lsmin_ci",
             "theta_ci",
             "g_ci",
+            "eastward_cosine_coefficient",
+            "eastward_sine_coefficient",
+            "northward_cosine_coefficient",
+            "northward_sine_coefficient",
             "PE",
             "SNR",
             "weights",

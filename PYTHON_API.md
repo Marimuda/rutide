@@ -76,6 +76,15 @@ The ellipse fields also have `semi_major`, `semi_minor`,
 `inclination_degrees`, and `phase_degrees` aliases. Confidence fields follow the
 same convention with `_ci` suffixes.
 
+Vector results also expose `eastward_cosine_coefficient`,
+`eastward_sine_coefficient`, `northward_cosine_coefficient`, and
+`northward_sine_coefficient`. These are algebraically equivalent to the ellipse
+fields but remain continuous across phase and inclination wrap boundaries, so
+they are the preferred representation for spatial interpolation. Batch values
+have shape `(series, constituent)` and are included by `to_xarray()`. They are
+derived from the authoritative stored ellipse solution when a saved coefficient
+object is loaded, preserving compatibility with existing archives.
+
 ## Batched arrays
 
 `solve_many` fits a time-major `(time, series)` matrix without a Python loop.

@@ -20,7 +20,7 @@
     },
     "netcdf": {
       "scalar_schema_version": 17,
-      "vector_schema_version": 15
+      "vector_schema_version": 16
     },
     "json_report": {
       "version_source": "matching-netcdf-schema"
@@ -189,6 +189,32 @@
       "scopes": ["core", "fvcom-scalar", "fvcom-vector", "output"],
       "parity": "python-oracle",
       "evidence": ["crates/rutide-core/tests/python_oracle_greenwich_nodal.rs"]
+    },
+    {
+      "id": "cartesian-vector-reconstruction",
+      "title": "Phase-wrap-safe Cartesian current coefficients and per-timestep queries",
+      "support": "supported",
+      "scopes": ["core", "python-api", "fvcom-vector", "output"],
+      "parity": "rust-extension",
+      "evidence": ["HARMONIC_CURRENT_ATLAS.md", "crates/rutide-core/src/vector.rs", "crates/rutide-core/src/corrected.rs", "crates/rutide-cli/src/vector.rs", "python/tests/test_api.py", "benchmarks/results/temporal-current-query-2026-09-03.md"]
+    },
+    {
+      "id": "prefilter-transfer-correction",
+      "title": "Known preprocessing-filter response correction",
+      "support": "planned",
+      "scopes": ["core", "python-api", "fvcom-scalar", "fvcom-vector", "output"],
+      "parity": "matlab-restoration",
+      "evidence": ["PREFILTER_TRANSFER.md", "ROADMAP.md"],
+      "limitations": ["Not needed for unfiltered source fields; near-zero or unknown filter response cannot be corrected safely"]
+    },
+    {
+      "id": "spatial-current-atlas",
+      "title": "Self-contained FVCOM mesh and harmonic-current query atlas",
+      "support": "planned",
+      "scopes": ["core", "python-api", "fvcom-vector", "output"],
+      "parity": "rust-extension",
+      "evidence": ["HARMONIC_CURRENT_ATLAS.md", "ROADMAP.md"],
+      "limitations": ["Temporal current evaluation is complete; mesh lookup, interpolation, and OpenDrift integration remain planned"]
     },
     {
       "id": "time-epochs",

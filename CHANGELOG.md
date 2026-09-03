@@ -9,6 +9,14 @@ published API and file-schema contracts.
 
 ### Added
 
+- Public reconstruction-ready `CartesianVectorSolution`, compact
+  `VectorCurrent`, and query-oriented per-timestep batch reconstruction with an
+  explicit tide-only / mean / mean-and-trend policy.
+- Phase-wrap-safe eastward/northward cosine/sine coefficient arrays in Python
+  single/batch results and FVCOM vector NetCDF/JSON schema 16.
+- A reproducible temporal current-query benchmark covering correctness,
+  throughput, and the serial/parallel crossover at 10,000 and 100,000 spatial
+  solutions.
 - Public Codiga equation-81 adjacent-frequency Rayleigh and equations-99–102
   scalar/vector tidal-variance kernels as the first RUTide 0.3.0 constituent-
   identifiability increment, with explicit inferred-constituent and zero-variance
