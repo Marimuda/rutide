@@ -6,6 +6,8 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 readme = "../../README.md"
+homepage.workspace = true
+repository.workspace = true
 description = "Native Python extension for high-performance tidal harmonic analysis with RUTide"
 publish = false
 

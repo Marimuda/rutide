@@ -25,6 +25,13 @@ classifiers = [
   "Topic :: Scientific/Engineering",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Marimuda/rutide"
+Documentation = "https://github.com/Marimuda/rutide/blob/main/PYTHON_API.md"
+Repository = "https://github.com/Marimuda/rutide"
+Issues = "https://github.com/Marimuda/rutide/issues"
+Changelog = "https://github.com/Marimuda/rutide/blob/main/CHANGELOG.md"
+
 [dependency-groups]
 dev = [
   "ruff==0.16.5",

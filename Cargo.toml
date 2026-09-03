@@ -18,6 +18,8 @@ rust-version = "1.98"
 authors = ["Jakup Svodstein <jakupsv@setur.fo>"]
 license = "MIT"
 readme = "README.md"
+homepage = "https://github.com/Marimuda/rutide"
+repository = "https://github.com/Marimuda/rutide"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
