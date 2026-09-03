@@ -22,13 +22,14 @@ use rutide_core::{
     AnalysisError, COLORED_NOISE_FREQUENCY_BANDS_CPH, Constituent, ConstituentDiagnosticsOptions,
     ConstituentSelectionDiagnostics, FitOptions, GreenwichNodalBatch, GreenwichNodalReconstructor,
     InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections, NormalizedTimeAxis,
-    PhaseReference, RayleighSelection, ReconstructionFilter, ResidualSpectrumMethod, RobustOptions,
-    RobustTermination, RobustWeightFunction, SamplingDiagnostics as CoreSamplingDiagnostics,
-    SamplingDiagnosticsPlan, ScalarInferenceBatch, ScalarInferenceRelation, ScalarSolution,
-    SolverOptions, TidalConstituent, TimeEpoch, VectorInferenceRelation, VectorSolution,
-    normalize_numeric_time, select_constituents_by_rayleigh,
+    PhaseReference, PreFilterCorrection, PreFilterFallback, RayleighSelection,
+    ReconstructionFilter, ResidualSpectrumMethod, RobustOptions, RobustTermination,
+    RobustWeightFunction, SamplingDiagnostics as CoreSamplingDiagnostics, SamplingDiagnosticsPlan,
+    ScalarInferenceBatch, ScalarInferenceRelation, ScalarSolution, SolverOptions, TidalConstituent,
+    TimeEpoch, VectorInferenceRelation, VectorSolution, normalize_numeric_time,
+    select_constituents_by_rayleigh,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod vector;
@@ -40,7 +41,7 @@ pub use vector::{
 
 const MILLISECONDS_PER_DAY: f64 = 86_400_000.0;
 /// `NetCDF` and JSON report schema emitted by scalar analyses.
-pub const SCALAR_OUTPUT_SCHEMA_VERSION: u32 = 17;
+pub const SCALAR_OUTPUT_SCHEMA_VERSION: u32 = 18;
 /// Schema version of the embedded machine-readable compatibility matrix.
 pub const FEATURE_MATRIX_SCHEMA_VERSION: u32 = 1;
 /// Machine-readable feature and Python-oracle compatibility status.
@@ -65,6 +66,94 @@ pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::K1,
     TidalConstituent::O1,
 ];
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum PreFilterFallbackFile {
+    #[default]
+    Error,
+    Unity,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreFilterResponseFile {
+    #[serde(alias = "frq")]
+    frequency_cph: Vec<f64>,
+    #[serde(alias = "P")]
+    gain: Vec<f64>,
+    #[serde(alias = "rng")]
+    acceptable_gain_range: [f64; 2],
+    #[serde(default)]
+    fallback: PreFilterFallbackFile,
+}
+
+/// Serializable preprocessing-filter response retained with every result.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PreFilterReport {
+    /// Strictly increasing response frequencies in cycles per hour.
+    pub frequency_cph: Vec<f64>,
+    /// Real transfer-function gain applied to the observations.
+    pub gain: Vec<f64>,
+    /// Inclusive accepted magnitude range for interpolated gains.
+    pub acceptable_gain_range: [f64; 2],
+    /// Invalid-response behavior: `error` or MATLAB-compatible `unity`.
+    pub fallback: &'static str,
+}
+
+impl From<&PreFilterCorrection> for PreFilterReport {
+    fn from(correction: &PreFilterCorrection) -> Self {
+        Self {
+            frequency_cph: correction.frequency_cph().to_vec(),
+            gain: correction.gain().to_vec(),
+            acceptable_gain_range: [
+                correction.minimum_acceptable_gain(),
+                correction.maximum_acceptable_gain(),
+            ],
+            fallback: prefilter_fallback_name(correction.fallback()),
+        }
+    }
+}
+
+const fn prefilter_fallback_name(fallback: PreFilterFallback) -> &'static str {
+    match fallback {
+        PreFilterFallback::Error => "error",
+        PreFilterFallback::Unity => "unity",
+    }
+}
+
+/// Read and validate a real preprocessing-filter response from JSON.
+///
+/// Both the descriptive keys `frequency_cph`, `gain`, and
+/// `acceptable_gain_range` and MATLAB `UTide`'s `frq`, `P`, and `rng` aliases are
+/// accepted. Unknown fields are rejected so misspelled scientific settings do
+/// not silently disappear.
+///
+/// # Errors
+///
+/// Returns [`AppError`] when the file cannot be read, its JSON contract is
+/// invalid, or the response fails the core physical/numerical validation.
+pub fn read_prefilter_response(path: &Path) -> Result<PreFilterCorrection, AppError> {
+    let file = File::open(path)?;
+    let parsed: PreFilterResponseFile = serde_json::from_reader(file).map_err(|error| {
+        AppError::Invalid(format!(
+            "invalid pre-filter response {}: {error}",
+            path.display()
+        ))
+    })?;
+    let fallback = match parsed.fallback {
+        PreFilterFallbackFile::Error => PreFilterFallback::Error,
+        PreFilterFallbackFile::Unity => PreFilterFallback::Unity,
+    };
+    PreFilterCorrection::new(
+        parsed.frequency_cph,
+        parsed.gain,
+        parsed.acceptable_gain_range[0],
+        parsed.acceptable_gain_range[1],
+    )
+    .map(|correction| correction.with_fallback(fallback))
+    .map_err(AppError::from)
+}
 
 /// Node subset to read from an FVCOM scalar field.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -484,6 +573,8 @@ pub struct AnalyzeConfig {
     pub phase_reference: PhaseReference,
     /// Exact, midpoint-linearized, or disabled nodal/satellite corrections.
     pub nodal_corrections: NodalCorrections,
+    /// Optional real preprocessing-filter transfer-function correction.
+    pub prefilter_correction: Option<PreFilterCorrection>,
     /// Optional linearized or Monte Carlo confidence and its noise model.
     pub confidence_interval: ConfidenceInterval,
     /// Ordinary or configured robust least squares.
@@ -808,6 +899,9 @@ pub struct RunReport {
     pub phase_reference: &'static str,
     /// Nodal/satellite corrections: `exact`, `linear-time`, or `disabled`.
     pub nodal_corrections: &'static str,
+    /// Preprocessing-filter response used by the fit and reconstruction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefilter: Option<PreFilterReport>,
     /// Robust options when robust fitting is enabled.
     pub robust_options: Option<RobustOptionsReport>,
     /// Auditable constituent-selection method and threshold.
@@ -1194,9 +1288,13 @@ impl ScalarAnalysisBatch {
         fit_options: FitOptions,
         phase_reference: PhaseReference,
         nodal_corrections: NodalCorrections,
+        prefilter_correction: Option<&PreFilterCorrection>,
     ) -> Result<Self, AnalysisError> {
-        let solver_options = SolverOptions::new(fit_options, phase_reference)
+        let mut solver_options = SolverOptions::new(fit_options, phase_reference)
             .with_nodal_corrections(nodal_corrections);
+        if let Some(correction) = prefilter_correction {
+            solver_options = solver_options.with_prefilter_correction(correction.clone());
+        }
         match inference {
             Some(inference) => {
                 ScalarInferenceBatch::prepare_modified_julian_days_with_solver_options(
@@ -1286,6 +1384,10 @@ struct ResolvedConstituentSelection {
 }
 
 impl ResolvedConstituentSelection {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the profile name encodes each independent public analysis option"
+    )]
     fn profile(
         &self,
         analysis_method: AnalysisMethod,
@@ -1293,6 +1395,7 @@ impl ResolvedConstituentSelection {
         fit_options: FitOptions,
         phase_reference: PhaseReference,
         nodal_corrections: NodalCorrections,
+        prefilter: bool,
         constituent_order: &ConstituentOrder,
     ) -> String {
         let selection = match self.report.method {
@@ -1302,9 +1405,10 @@ impl ResolvedConstituentSelection {
         };
         let inference = if inferred { "inference-" } else { "" };
         let ordering = order_profile_suffix(constituent_order);
+        let prefilter = if prefilter { "-prefilter" } else { "" };
         let trend = if fit_options.trend { "" } else { "-no-trend" };
         format!(
-            "{selection}-{}-{}-{inference}{}{ordering}{trend}",
+            "{selection}-{}-{}-{inference}{}{ordering}{prefilter}{trend}",
             phase_reference.name(),
             nodal_profile_component(nodal_corrections),
             analysis_method.name(),
@@ -1366,6 +1470,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         config.fit_options,
         config.phase_reference,
         config.nodal_corrections,
+        config.prefilter_correction.as_ref(),
     )?;
     shared_constituent_order_indices(&config.constituent_order, batch.constituents())?;
     if let Some(filter) = &config.reconstruction {
@@ -1552,6 +1657,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         config.fit_options,
         config.phase_reference,
         config.nodal_corrections,
+        config.prefilter_correction.as_ref(),
         &config.constituent_order,
         &constituent_index_by_rank,
         &sampling_diagnostics,
@@ -1602,6 +1708,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             fit_options: config.fit_options,
             phase_reference: config.phase_reference,
             nodal_corrections: config.nodal_corrections,
+            prefilter_correction: config.prefilter_correction.as_ref(),
             analysis_method: config.analysis_method,
             confidence_interval: config.confidence_interval,
             chunk_plan,
@@ -1632,6 +1739,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             config.fit_options,
             config.phase_reference,
             config.nodal_corrections,
+            config.prefilter_correction.is_some(),
             &config.constituent_order,
         ),
         input_path: config.input.to_string_lossy().into_owned(),
@@ -1662,6 +1770,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         trend_enabled: config.fit_options.trend,
         phase_reference: config.phase_reference.name(),
         nodal_corrections: config.nodal_corrections.name(),
+        prefilter: config.prefilter_correction.as_ref().map(Into::into),
         robust_options: match config.analysis_method {
             AnalysisMethod::Ols => None,
             AnalysisMethod::Robust(options) => Some(options.into()),
@@ -2679,6 +2788,25 @@ fn update_robust_options_digest(
     Ok(())
 }
 
+fn update_prefilter_digest(digest: &mut Sha256, correction: Option<&PreFilterCorrection>) {
+    let Some(correction) = correction else {
+        digest.update([0]);
+        return;
+    };
+    digest.update([1]);
+    for frequency in correction.frequency_cph() {
+        digest.update(frequency.to_bits().to_le_bytes());
+    }
+    digest.update([0]);
+    for gain in correction.gain() {
+        digest.update(gain.to_bits().to_le_bytes());
+    }
+    digest.update(correction.minimum_acceptable_gain().to_bits().to_le_bytes());
+    digest.update(correction.maximum_acceptable_gain().to_bits().to_le_bytes());
+    digest.update(prefilter_fallback_name(correction.fallback()).as_bytes());
+    digest.update([0]);
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -2693,6 +2821,7 @@ fn result_digest(
     fit_options: FitOptions,
     phase_reference: PhaseReference,
     nodal_corrections: NodalCorrections,
+    prefilter_correction: Option<&PreFilterCorrection>,
     constituent_order: &ConstituentOrder,
     constituent_index_by_rank: &ConstituentOrderMap,
     sampling_diagnostics: &[CoreSamplingDiagnostics],
@@ -2703,12 +2832,13 @@ fn result_digest(
     reconstruction: Option<(&ReconstructionFilter, &[Vec<f64>])>,
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
-    digest.update(b"rutide-scalar-sampling-v14\0");
+    digest.update(b"rutide-scalar-sampling-v15\0");
     digest.update([u8::from(fit_options.trend)]);
     digest.update(phase_reference.name().as_bytes());
     digest.update([0]);
     digest.update(nodal_corrections.name().as_bytes());
     digest.update([0]);
+    update_prefilter_digest(&mut digest, prefilter_correction);
     update_constituent_order_digest(&mut digest, constituent_order, constituent_index_by_rank);
     update_sampling_digest(&mut digest, sampling_diagnostics)?;
     digest.update(analysis_method.name().as_bytes());
@@ -3090,6 +3220,7 @@ struct OutputData<'data> {
     fit_options: FitOptions,
     phase_reference: PhaseReference,
     nodal_corrections: NodalCorrections,
+    prefilter_correction: Option<&'data PreFilterCorrection>,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     chunk_plan: SpatialChunkPlan,
@@ -3139,6 +3270,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         fit_options,
         phase_reference,
         nodal_corrections,
+        prefilter_correction,
         analysis_method,
         confidence_interval,
         chunk_plan,
@@ -3200,6 +3332,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         fit_options,
         phase_reference,
         nodal_corrections,
+        prefilter_correction.is_some(),
         constituent_order,
     );
     output.add_attribute("profile", profile.as_str())?;
@@ -3207,6 +3340,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
     output.add_attribute("trend_enabled", i64::from(fit_options.trend))?;
     output.add_attribute("phase_reference", phase_reference.name())?;
     output.add_attribute("nodal_corrections", nodal_corrections.name())?;
+    write_prefilter_metadata(&mut output, prefilter_correction)?;
     output.add_attribute("constituent_order", constituent_order.name())?;
     if let Some(names) = constituent_order.explicit_names() {
         output.add_attribute("explicit_constituent_order", names.join(","))?;
@@ -4035,6 +4169,48 @@ fn write_robust_schema_metadata(
     Ok(())
 }
 
+fn write_prefilter_metadata(
+    output: &mut FileMut,
+    correction: Option<&PreFilterCorrection>,
+) -> Result<(), AppError> {
+    output.add_attribute(
+        "prefilter_correction_enabled",
+        i64::from(correction.is_some()),
+    )?;
+    let Some(correction) = correction else {
+        return Ok(());
+    };
+    output.add_dimension("prefilter_sample", correction.frequency_cph().len())?;
+    output.add_attribute("prefilter_interpolation", "linear")?;
+    output.add_attribute(
+        "prefilter_response_convention",
+        "observed harmonic = gain * physical harmonic",
+    )?;
+    output.add_attribute(
+        "prefilter_fallback",
+        prefilter_fallback_name(correction.fallback()),
+    )?;
+    output.add_attribute(
+        "prefilter_minimum_acceptable_gain",
+        correction.minimum_acceptable_gain(),
+    )?;
+    output.add_attribute(
+        "prefilter_maximum_acceptable_gain",
+        correction.maximum_acceptable_gain(),
+    )?;
+    write_variable(
+        &mut output.add_variable::<f64>("prefilter_frequency", &["prefilter_sample"])?,
+        correction.frequency_cph(),
+        "cycles per hour",
+    )?;
+    write_variable(
+        &mut output.add_variable::<f64>("prefilter_gain", &["prefilter_sample"])?,
+        correction.gain(),
+        "1",
+    )?;
+    Ok(())
+}
+
 fn write_variable<T>(
     variable: &mut VariableMut<'_>,
     values: &[T],
@@ -4099,17 +4275,18 @@ mod tests {
         SOLVER_OPTION_MATRIX_JSON, SOLVER_OPTION_MATRIX_SCHEMA_JSON,
         SOLVER_OPTION_MATRIX_SCHEMA_VERSION, ScalarInferenceConfig, VECTOR_OUTPUT_SCHEMA_VERSION,
         constituent_order_indices, encode_hex, normalize_source_observation, read_fvcom_scalar,
-        resolve_node_selection, scalar_chunk_plan, spatial_chunk_plan, summarize_sampling,
-        temporary_sibling, update_robust_options_digest, write_constituent_diagnostics,
-        write_constituent_diagnostics_attributes, write_inference_metadata,
-        write_reconstruction_variables, write_sampling_diagnostics,
+        read_prefilter_response, resolve_node_selection, scalar_chunk_plan, spatial_chunk_plan,
+        summarize_sampling, temporary_sibling, update_robust_options_digest,
+        write_constituent_diagnostics, write_constituent_diagnostics_attributes,
+        write_inference_metadata, write_prefilter_metadata, write_reconstruction_variables,
+        write_sampling_diagnostics,
     };
     use rutide_core::{
         CATALOG_ORACLE_REVISION, Constituent, ConstituentDiagnosticsOptions,
         ConstituentIndependenceDiagnostics, ConstituentSelectionDiagnostics, GreenwichNodalOls,
-        InferenceMode, LinearConfidence, NeighboringConstituentDiagnostics, ReconstructionFilter,
-        RobustOptions, RobustWeightFunction, SamplingDiagnosticsPlan, ScalarInferenceRelation,
-        ScalarSolution, TidalConstituent, TidalVarianceDiagnostics,
+        InferenceMode, LinearConfidence, NeighboringConstituentDiagnostics, PreFilterFallback,
+        ReconstructionFilter, RobustOptions, RobustWeightFunction, SamplingDiagnosticsPlan,
+        ScalarInferenceRelation, ScalarSolution, TidalConstituent, TidalVarianceDiagnostics,
         WholeModelIndependenceDiagnostics,
     };
     use serde_json::Value;
@@ -4142,6 +4319,53 @@ mod tests {
         )
         .expect("hash Welsch options");
         assert_ne!(cauchy.finalize(), welsch.finalize());
+    }
+
+    #[test]
+    fn prefilter_json_is_strict_and_netcdf_metadata_is_self_contained() {
+        let destination = std::env::temp_dir().join("rutide-prefilter-response-test.json");
+        let response_path = temporary_sibling(&destination).expect("valid response path");
+        fs::write(
+            &response_path,
+            r#"{"frq":[0.0,0.1,0.2],"P":[1.0,0.6,0.4],"rng":[0.05,2.0],"fallback":"unity"}"#,
+        )
+        .expect("write response");
+        let correction = read_prefilter_response(&response_path).expect("valid response");
+        assert_eq!(correction.frequency_cph(), [0.0, 0.1, 0.2]);
+        assert_eq!(correction.gain(), [1.0, 0.6, 0.4]);
+        assert_eq!(correction.fallback(), PreFilterFallback::Unity);
+
+        let output_destination = std::env::temp_dir().join("rutide-prefilter-metadata-test.nc");
+        let output_path = temporary_sibling(&output_destination).expect("valid output path");
+        let mut output = netcdf::create(&output_path).expect("create output");
+        write_prefilter_metadata(&mut output, Some(&correction)).expect("write metadata");
+        output.close().expect("close output");
+        let output = netcdf::open(&output_path).expect("open output");
+        assert_eq!(
+            output
+                .variable("prefilter_frequency")
+                .expect("frequency variable")
+                .get_values::<f64, _>(..)
+                .expect("read frequencies"),
+            [0.0, 0.1, 0.2]
+        );
+        assert_eq!(
+            output
+                .variable("prefilter_gain")
+                .expect("gain variable")
+                .get_values::<f64, _>(..)
+                .expect("read gains"),
+            [1.0, 0.6, 0.4]
+        );
+
+        fs::write(
+            &response_path,
+            r#"{"frequency_cph":[0.0,0.2],"gain":[1.0,0.5],"acceptable_gain_range":[0.01,2.0],"typo":true}"#,
+        )
+        .expect("write invalid response");
+        assert!(read_prefilter_response(&response_path).is_err());
+        fs::remove_file(response_path).expect("remove response");
+        fs::remove_file(output_path).expect("remove output");
     }
 
     #[test]

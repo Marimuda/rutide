@@ -10,7 +10,7 @@ use std::{
 use rutide_cli::{
     AnalysisMethod, AnalyzeConfig, ConfidenceInterval, ConstituentOrder, ConstituentSelection,
     DEFAULT_CONSTITUENTS, NodeSelection, ScalarInferenceConfig, VectorAnalyzeConfig,
-    VectorInferenceConfig, analyze_scalar, analyze_vector,
+    VectorInferenceConfig, analyze_scalar, analyze_vector, read_prefilter_response,
 };
 use rutide_core::{
     ConstituentDiagnosticsOptions, FitOptions, InferenceMode, LinearConfidence, MonteCarloOptions,
@@ -49,6 +49,8 @@ Options:
   --no-trend         Fit a mean without a linear trend (default: mean and trend)
   --phase MODE        Phase reference: greenwich, linear-time, or raw (default: greenwich)
   --nodal MODE        Nodal corrections: exact, linear-time, or disabled (default: exact)
+  --prefilter-response PATH
+                      JSON real filter response applied before analysis
   --method MODE       Least squares: ols or robust (default: ols)
   --robust-weight W   IRLS weight: andrews, bisquare, cauchy, fair, huber,
                       logistic, ols, talwar, or welsch (default: cauchy)
@@ -170,6 +172,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     let mut trend_disabled = false;
     let mut phase_reference = None;
     let mut nodal_corrections = None;
+    let mut prefilter_response = None;
     let mut robust_requested = None;
     let mut robust_weight_function = None;
     let mut robust_tuning = None;
@@ -346,6 +349,12 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
                     option,
                 )?)?);
             }
+            "--prefilter-response" => {
+                if prefilter_response.is_some() {
+                    return Err("--prefilter-response may only be supplied once".to_owned());
+                }
+                prefilter_response = Some(PathBuf::from(required_value(&mut arguments, option)?));
+            }
             "--method" => {
                 if robust_requested.is_some() {
                     return Err("--method may only be supplied once".to_owned());
@@ -508,6 +517,11 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
     };
     let phase_reference = phase_reference.unwrap_or_default();
     let nodal_corrections = nodal_corrections.unwrap_or_default();
+    let prefilter_correction = prefilter_response
+        .as_deref()
+        .map(read_prefilter_response)
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let diagnostic_rayleigh_minimum = match &constituent_selection {
         ConstituentSelection::Rayleigh { minimum } => *minimum,
         ConstituentSelection::Explicit(_) => 1.0,
@@ -552,6 +566,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             fit_options,
             phase_reference,
             nodal_corrections,
+            prefilter_correction,
             confidence_interval,
             analysis_method,
             constituent_diagnostics,
@@ -577,6 +592,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = OsString>) -> Result<Comm
             fit_options,
             phase_reference,
             nodal_corrections,
+            prefilter_correction,
             confidence_interval,
             analysis_method,
             constituent_diagnostics,
@@ -1032,7 +1048,7 @@ fn parse_explicit_constituents(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::{ffi::OsString, fs};
 
     use super::{Command, parse_arguments};
     use rutide_cli::{
@@ -1077,9 +1093,38 @@ mod tests {
         assert_eq!(config.analysis_method, AnalysisMethod::Ols);
         assert_eq!(config.reconstruction, None);
         assert_eq!(config.nodal_corrections, NodalCorrections::Exact);
+        assert_eq!(config.prefilter_correction, None);
         assert_eq!(config.constituent_order, ConstituentOrder::Selection);
         assert_eq!(config.workers, 8);
         assert_eq!(config.chunk_series, Some(1024));
+    }
+
+    #[test]
+    fn parses_and_validates_prefilter_response_file() {
+        let path =
+            std::env::temp_dir().join(format!("rutide-main-prefilter-{}.json", std::process::id()));
+        fs::write(
+            &path,
+            r#"{"frequency_cph":[0.0,0.2],"gain":[1.0,0.4],"acceptable_gain_range":[0.01,2.0]}"#,
+        )
+        .expect("write response");
+        let command = parse_arguments(vec![
+            OsString::from("analyze-scalar"),
+            OsString::from("--input"),
+            OsString::from("input.nc"),
+            OsString::from("--output"),
+            OsString::from("output.nc"),
+            OsString::from("--prefilter-response"),
+            path.clone().into_os_string(),
+        ])
+        .expect("valid prefilter arguments");
+        let Command::AnalyzeScalar(config) = command else {
+            panic!("expected scalar command");
+        };
+        let correction = config.prefilter_correction.expect("prefilter correction");
+        assert_eq!(correction.frequency_cph(), [0.0, 0.2]);
+        assert_eq!(correction.gain(), [1.0, 0.4]);
+        fs::remove_file(path).expect("remove response");
     }
 
     #[test]

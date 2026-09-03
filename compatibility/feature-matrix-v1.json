@@ -19,8 +19,8 @@
       "coefficient_schema": 1
     },
     "netcdf": {
-      "scalar_schema_version": 17,
-      "vector_schema_version": 16
+      "scalar_schema_version": 18,
+      "vector_schema_version": 17
     },
     "json_report": {
       "version_source": "matching-netcdf-schema"

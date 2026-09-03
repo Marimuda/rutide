@@ -16,9 +16,9 @@ use rayon::{ThreadPoolBuilder, prelude::*};
 use rutide_core::{
     AnalysisError, COLORED_NOISE_FREQUENCY_BANDS_CPH, Constituent, ConstituentDiagnosticsOptions,
     ConstituentSelectionDiagnostics, FitOptions, GreenwichNodalBatch, GreenwichNodalReconstructor,
-    NodalCorrections, PhaseReference, ReconstructionFilter, ResidualSpectrumMethod,
-    RobustDiagnostics, RobustTermination, SolverOptions, TidalConstituent, VectorInferenceBatch,
-    VectorReconstruction, VectorSolution,
+    NodalCorrections, PhaseReference, PreFilterCorrection, ReconstructionFilter,
+    ResidualSpectrumMethod, RobustDiagnostics, RobustTermination, SolverOptions, TidalConstituent,
+    VectorInferenceBatch, VectorReconstruction, VectorSolution,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -27,25 +27,26 @@ use super::{
     AnalysisMethod, AnalyzeConfig, AppError, BoundedInputPipeline, ConfidenceInterval,
     ConstituentDiagnosticsReport, ConstituentOrder, ConstituentOrderMap, ConstituentSelection,
     ConstituentSelectionReport, CoreSamplingDiagnostics, InferenceReport, NodeSelection,
-    ReconstructionReport, ResolvedConstituentSelection, RobustOptionsReport, SamplingSummary,
-    SeriesSamplingDiagnostics, SpectralBandSummary, StageTimings, VectorInferenceConfig,
-    constituent_order_indices, define_constituent_diagnostic_variables, diagnose_sampling,
-    diagnostic_neighbor_value, diagnostic_scalar_value, encode_hex, nodal_profile_component,
-    normalize_source_observation, order_profile_suffix, read_fvcom_time_axis, read_selected_1d,
-    read_selected_time_major, reconstruction_report, required_dimension_length, required_variable,
-    resolve_constituent_selection, retain_time_major_rows, robust_termination_code,
-    spatial_chunk_plan, summarize_sampling, temporary_sibling,
-    update_constituent_diagnostics_digest, update_constituent_order_digest,
-    update_inference_digest, update_reconstruction_filter_digest, update_robust_options_digest,
-    update_sampling_digest, validate_config, validate_constituent_diagnostics_shape,
-    validate_dimensions, validate_reconstruction_filter, validate_source_value,
-    write_constituent_diagnostics, write_constituent_diagnostics_attributes,
+    PreFilterReport, ReconstructionReport, ResolvedConstituentSelection, RobustOptionsReport,
+    SamplingSummary, SeriesSamplingDiagnostics, SpectralBandSummary, StageTimings,
+    VectorInferenceConfig, constituent_order_indices, define_constituent_diagnostic_variables,
+    diagnose_sampling, diagnostic_neighbor_value, diagnostic_scalar_value, encode_hex,
+    nodal_profile_component, normalize_source_observation, order_profile_suffix,
+    read_fvcom_time_axis, read_selected_1d, read_selected_time_major, reconstruction_report,
+    required_dimension_length, required_variable, resolve_constituent_selection,
+    retain_time_major_rows, robust_termination_code, spatial_chunk_plan, summarize_sampling,
+    temporary_sibling, update_constituent_diagnostics_digest, update_constituent_order_digest,
+    update_inference_digest, update_prefilter_digest, update_reconstruction_filter_digest,
+    update_robust_options_digest, update_sampling_digest, validate_config,
+    validate_constituent_diagnostics_shape, validate_dimensions, validate_reconstruction_filter,
+    validate_source_value, write_constituent_diagnostics, write_constituent_diagnostics_attributes,
     write_constituent_order_indices, write_inference_metadata, write_json_report,
-    write_robust_schema_metadata, write_sampling_diagnostics, write_variable,
+    write_prefilter_metadata, write_robust_schema_metadata, write_sampling_diagnostics,
+    write_variable,
 };
 
 /// `NetCDF` and JSON report schema emitted by vector-current analyses.
-pub const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 16;
+pub const VECTOR_OUTPUT_SCHEMA_VERSION: u32 = 17;
 const FIXED_DEPTH_ZETA_SPAN_AMPLIFICATION: usize = 6;
 
 /// Configuration for one FVCOM current analysis.
@@ -78,6 +79,8 @@ pub struct VectorAnalyzeConfig {
     pub phase_reference: PhaseReference,
     /// Exact, midpoint-linearized, or disabled nodal/satellite corrections.
     pub nodal_corrections: NodalCorrections,
+    /// Optional real preprocessing-filter transfer-function correction.
+    pub prefilter_correction: Option<PreFilterCorrection>,
     /// Optional linearized or Monte Carlo ellipse intervals and noise model.
     pub confidence_interval: ConfidenceInterval,
     /// Ordinary or configured robust least squares.
@@ -228,6 +231,9 @@ pub struct VectorRunReport {
     pub phase_reference: &'static str,
     /// Nodal/satellite corrections: `exact`, `linear-time`, or `disabled`.
     pub nodal_corrections: &'static str,
+    /// Preprocessing-filter response used by the fit and reconstruction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefilter: Option<PreFilterReport>,
     /// Robust options when robust fitting is enabled.
     pub robust_options: Option<RobustOptionsReport>,
     /// Auditable constituent-selection method and threshold.
@@ -706,9 +712,13 @@ impl VectorAnalysisBatch {
         fit_options: FitOptions,
         phase_reference: PhaseReference,
         nodal_corrections: NodalCorrections,
+        prefilter_correction: Option<&PreFilterCorrection>,
     ) -> Result<Self, AnalysisError> {
-        let solver_options = SolverOptions::new(fit_options, phase_reference)
+        let mut solver_options = SolverOptions::new(fit_options, phase_reference)
             .with_nodal_corrections(nodal_corrections);
+        if let Some(correction) = prefilter_correction {
+            solver_options = solver_options.with_prefilter_correction(correction.clone());
+        }
         match inference {
             Some(inference) => {
                 VectorInferenceBatch::prepare_modified_julian_days_with_solver_options(
@@ -834,6 +844,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         config.fit_options,
         config.phase_reference,
         config.nodal_corrections,
+        config.prefilter_correction.as_ref(),
     )?;
     let fitted_reference_count = batch.constituents().len().saturating_sub(
         config
@@ -1042,6 +1053,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                 fit_options: config.fit_options,
                 phase_reference: config.phase_reference,
                 nodal_corrections: config.nodal_corrections,
+                prefilter_correction: config.prefilter_correction.as_ref(),
                 analysis_method: config.analysis_method,
                 confidence_interval: config.confidence_interval,
                 constituent_diagnostics: config.constituent_diagnostics,
@@ -1357,6 +1369,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             config.fit_options,
             config.phase_reference,
             config.nodal_corrections,
+            config.prefilter_correction.as_ref(),
             &config.constituent_order,
             config.analysis_method,
             config.confidence_interval,
@@ -1399,6 +1412,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             config.fit_options,
             config.phase_reference,
             config.nodal_corrections,
+            config.prefilter_correction.as_ref(),
             &config.constituent_order,
             &constituent_index_by_rank,
             &sampling_diagnostics,
@@ -1443,6 +1457,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                 fit_options: config.fit_options,
                 phase_reference: config.phase_reference,
                 nodal_corrections: config.nodal_corrections,
+                prefilter_correction: config.prefilter_correction.as_ref(),
                 analysis_method: config.analysis_method,
                 confidence_interval: config.confidence_interval,
                 chunk_plan,
@@ -1481,6 +1496,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             config.fit_options,
             config.phase_reference,
             config.nodal_corrections,
+            config.prefilter_correction.is_some(),
             &config.constituent_order,
         ),
         input_path: config.input.to_string_lossy().into_owned(),
@@ -1530,6 +1546,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         trend_enabled: config.fit_options.trend,
         phase_reference: config.phase_reference.name(),
         nodal_corrections: config.nodal_corrections.name(),
+        prefilter: config.prefilter_correction.as_ref().map(Into::into),
         robust_options: match config.analysis_method {
             AnalysisMethod::Ols => None,
             AnalysisMethod::Robust(options) => Some(options.into()),
@@ -2039,6 +2056,7 @@ fn validate_vector_config(config: &VectorAnalyzeConfig) -> Result<(), AppError> 
         fit_options: config.fit_options,
         phase_reference: config.phase_reference,
         nodal_corrections: config.nodal_corrections,
+        prefilter_correction: config.prefilter_correction.clone(),
         confidence_interval: config.confidence_interval,
         analysis_method: config.analysis_method,
         constituent_diagnostics: config.constituent_diagnostics,
@@ -2096,6 +2114,7 @@ fn vector_profile(
     fit_options: FitOptions,
     phase_reference: PhaseReference,
     nodal_corrections: NodalCorrections,
+    prefilter: bool,
     constituent_order: &ConstituentOrder,
 ) -> String {
     let selection = match selection.report.method {
@@ -2105,6 +2124,7 @@ fn vector_profile(
     };
     let inference = if inferred { "inference-" } else { "" };
     let ordering = order_profile_suffix(constituent_order);
+    let prefilter = if prefilter { "-prefilter" } else { "" };
     let trend = if fit_options.trend { "" } else { "-no-trend" };
     let vertical = match vertical_mode {
         "depth-averaged" => "vector",
@@ -2113,7 +2133,7 @@ fn vector_profile(
         _ => unreachable!("vertical modes are constructed internally"),
     };
     format!(
-        "{selection}-{}-{}-{vertical}-{inference}{}{ordering}{trend}",
+        "{selection}-{}-{}-{vertical}-{inference}{}{ordering}{prefilter}{trend}",
         phase_reference.name(),
         nodal_profile_component(nodal_corrections),
         analysis_method.name(),
@@ -3382,6 +3402,7 @@ fn vector_result_digest(
     fit_options: FitOptions,
     phase_reference: PhaseReference,
     nodal_corrections: NodalCorrections,
+    prefilter_correction: Option<&PreFilterCorrection>,
     constituent_order: &ConstituentOrder,
     constituent_index_by_rank: &ConstituentOrderMap,
     sampling_diagnostics: &[CoreSamplingDiagnostics],
@@ -3393,17 +3414,18 @@ fn vector_result_digest(
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
     if input.is_fixed_depth() {
-        digest.update(b"rutide-vector-fixed-depth-v13\0");
+        digest.update(b"rutide-vector-fixed-depth-v14\0");
     } else if input.is_depth_resolved() {
-        digest.update(b"rutide-vector-sampling-v12\0");
+        digest.update(b"rutide-vector-sampling-v13\0");
     } else {
-        digest.update(b"rutide-vector-sampling-v10\0");
+        digest.update(b"rutide-vector-sampling-v11\0");
     }
     digest.update([u8::from(fit_options.trend)]);
     digest.update(phase_reference.name().as_bytes());
     digest.update([0]);
     digest.update(nodal_corrections.name().as_bytes());
     digest.update([0]);
+    update_prefilter_digest(&mut digest, prefilter_correction);
     digest.update(b"cartesian-vector-v1\0");
     update_constituent_order_digest(&mut digest, constituent_order, constituent_index_by_rank);
     if input.is_fixed_depth() {
@@ -3635,6 +3657,7 @@ fn vector_result_digest_from_incremental_output(
     fit_options: FitOptions,
     phase_reference: PhaseReference,
     nodal_corrections: NodalCorrections,
+    prefilter_correction: Option<&PreFilterCorrection>,
     constituent_order: &ConstituentOrder,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
@@ -3656,15 +3679,16 @@ fn vector_result_digest_from_incremental_output(
     let constituent_count = constituents.len();
     let mut digest = Sha256::new();
     if input.is_fixed_depth() {
-        digest.update(b"rutide-vector-fixed-depth-v13\0");
+        digest.update(b"rutide-vector-fixed-depth-v14\0");
     } else {
-        digest.update(b"rutide-vector-sampling-v12\0");
+        digest.update(b"rutide-vector-sampling-v13\0");
     }
     digest.update([u8::from(fit_options.trend)]);
     digest.update(phase_reference.name().as_bytes());
     digest.update([0]);
     digest.update(nodal_corrections.name().as_bytes());
     digest.update([0]);
+    update_prefilter_digest(&mut digest, prefilter_correction);
     digest.update(b"cartesian-vector-v1\0");
     digest.update(constituent_order.name().as_bytes());
     digest.update([0]);
@@ -4414,6 +4438,7 @@ struct VectorOutputData<'data> {
     fit_options: FitOptions,
     phase_reference: PhaseReference,
     nodal_corrections: NodalCorrections,
+    prefilter_correction: Option<&'data PreFilterCorrection>,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     chunk_plan: super::SpatialChunkPlan,
@@ -4431,6 +4456,7 @@ struct VectorOutputDefinition<'data> {
     fit_options: FitOptions,
     phase_reference: PhaseReference,
     nodal_corrections: NodalCorrections,
+    prefilter_correction: Option<&'data PreFilterCorrection>,
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     constituent_diagnostics: Option<ConstituentDiagnosticsOptions>,
@@ -4526,6 +4552,7 @@ fn create_vector_output_base(
         data.fit_options,
         data.phase_reference,
         data.nodal_corrections,
+        data.prefilter_correction.is_some(),
         data.constituent_order,
     );
     output.add_attribute("profile", profile.as_str())?;
@@ -4533,6 +4560,7 @@ fn create_vector_output_base(
     output.add_attribute("trend_enabled", i64::from(data.fit_options.trend))?;
     output.add_attribute("phase_reference", data.phase_reference.name())?;
     output.add_attribute("nodal_corrections", data.nodal_corrections.name())?;
+    write_prefilter_metadata(&mut output, data.prefilter_correction)?;
     output.add_attribute(
         "cartesian_coefficient_convention",
         "component = cosine_coefficient * real(corrected_astronomical_basis) + sine_coefficient * imaginary(corrected_astronomical_basis)",
@@ -5711,6 +5739,7 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
             fit_options: data.fit_options,
             phase_reference: data.phase_reference,
             nodal_corrections: data.nodal_corrections,
+            prefilter_correction: data.prefilter_correction,
             analysis_method: data.analysis_method,
             confidence_interval: data.confidence_interval,
             constituent_diagnostics: data.constituent_diagnostics_options,
@@ -6128,8 +6157,9 @@ mod tests {
     use rayon::ThreadPoolBuilder;
     use rutide_core::{
         ConstituentDiagnosticsOptions, FitOptions, InferenceMode, LinearConfidence,
-        MonteCarloOptions, NodalCorrections, PhaseReference, ReconstructionFilter, RobustOptions,
-        RobustWeightFunction, TidalConstituent, VectorInferenceRelation,
+        MonteCarloOptions, NodalCorrections, PhaseReference, PreFilterCorrection,
+        ReconstructionFilter, RobustOptions, RobustWeightFunction, TidalConstituent,
+        VectorInferenceRelation,
     };
 
     use super::{
@@ -6387,6 +6417,10 @@ mod tests {
             fit_options: FitOptions { trend: false },
             phase_reference: PhaseReference::Raw,
             nodal_corrections: NodalCorrections::Disabled,
+            prefilter_correction: Some(
+                PreFilterCorrection::new(vec![0.0, 0.2], vec![1.0, 1.0], 0.01, 2.0)
+                    .expect("valid unity response"),
+            ),
             confidence_interval: ConfidenceInterval::MonteCarlo {
                 options: MonteCarloOptions {
                     realizations: 32,
@@ -6415,6 +6449,11 @@ mod tests {
         assert_eq!(report.fixed_depths_meters, Some(vec![8.0, 12.0]));
         assert_eq!(report.series_count, 4);
         assert_eq!(report.result_output, "incremental");
+        assert!(report.profile.contains("prefilter"));
+        assert_eq!(
+            report.prefilter.as_ref().expect("prefilter report").gain,
+            [1.0, 1.0]
+        );
         assert_eq!(report.result_sha256, chunked_report.result_sha256);
         assert_eq!(chunked_report.chunk_series, 2);
         assert_eq!(chunked_report.chunk_count, 2);
@@ -6424,6 +6463,14 @@ mod tests {
         );
 
         let output = netcdf::open(&output_path).expect("open fixed-depth output");
+        assert_eq!(
+            output
+                .variable("prefilter_gain")
+                .expect("prefilter gain")
+                .get_values::<f64, _>(..)
+                .expect("read prefilter gain"),
+            [1.0, 1.0]
+        );
         assert_eq!(
             output
                 .variable("depth")
@@ -6797,6 +6844,7 @@ mod tests {
             fit_options: FitOptions::default(),
             phase_reference: PhaseReference::Greenwich,
             nodal_corrections: NodalCorrections::Exact,
+            prefilter_correction: None,
             confidence_interval: ConfidenceInterval::MonteCarlo {
                 options: MonteCarloOptions {
                     realizations: 64,
@@ -7004,7 +7052,7 @@ mod tests {
             analyze_vector(&layered_config).expect("analyze native sigma-layer currents");
         assert_eq!(
             layered_report.result_sha256,
-            "91ff9146504d208e83b8bc51cd0908d3db8d03e459233af33994fc9137734b5e"
+            "f1bb727d48a36a3b81e9855aa8094f4c294d78ce6845c5bfdc393325f0d39894"
         );
         let mut layered_chunked_config = layered_config.clone();
         layered_chunked_config.output = layered_chunked_output_path.clone();
@@ -7159,6 +7207,7 @@ mod tests {
             fit_options: FitOptions { trend: false },
             phase_reference: PhaseReference::Raw,
             nodal_corrections: NodalCorrections::LinearTime,
+            prefilter_correction: None,
             confidence_interval: ConfidenceInterval::MonteCarlo {
                 options: MonteCarloOptions {
                     realizations: 64,
