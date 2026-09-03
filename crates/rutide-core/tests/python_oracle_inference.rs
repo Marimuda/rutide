@@ -654,6 +654,179 @@ fn scalar_inference_diagnostics_exclude_constrained_outputs() {
 }
 
 #[test]
+fn vector_inference_diagnostics_use_full_cartesian_pair_covariance() {
+    let time = oracle_times(745);
+    let (eastward, northward) = synthetic_vector_observations(&time);
+    let model = VectorInferenceOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE,
+        &requested(),
+        &VECTOR_RELATIONSHIPS,
+        InferenceMode::Exact,
+    )
+    .expect("valid inferred vector model");
+    let solution = model
+        .solve_vector_with_linear_confidence(&eastward, &northward, LinearConfidence::White)
+        .expect("valid inferred vector confidence solution");
+    let diagnostics = model
+        .diagnose_vector_solution(
+            &time,
+            &eastward,
+            &northward,
+            &solution,
+            ConstituentDiagnosticsOptions::default(),
+        )
+        .expect("valid inferred vector diagnostics");
+
+    assert_eq!(diagnostics.constituents.len(), 5);
+    for inferred in [3, 4] {
+        assert!(diagnostics.constituents[inferred].lower.is_none());
+        assert!(diagnostics.constituents[inferred].higher.is_none());
+    }
+    let correlations = diagnostics.constituents[..3]
+        .iter()
+        .flat_map(|independence| [&independence.lower, &independence.higher])
+        .flatten()
+        .map(|neighbor| {
+            neighbor
+                .maximum_correlation
+                .expect("direct neighbor has Corrmax")
+        })
+        .collect::<Vec<_>>();
+    assert!(!correlations.is_empty());
+    assert!(
+        correlations
+            .iter()
+            .all(|correlation| correlation.is_finite() && *correlation >= 0.0)
+    );
+    assert!(diagnostics.tidal_variance.raw_tidal_variance > 0.0);
+    assert!(diagnostics.tidal_variance.all_constituent_tidal_variance > 0.0);
+    assert!(
+        diagnostics
+            .tidal_variance
+            .significant_constituent_tidal_variance
+            .is_some()
+    );
+    assert!(diagnostics.whole_model.basis_condition_number >= 1.0);
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "covers scalar and coupled-vector batches with distinct retained time axes"
+)]
+fn inference_batch_diagnostics_use_each_gappy_record_time_axis() {
+    let mut time = oracle_times(745);
+    time[20] += 0.001;
+    let observations = oracle_observations(745);
+    let (eastward, northward) = synthetic_vector_observations(&time);
+    let mut scalar_time_major = Vec::with_capacity(time.len() * 2);
+    let mut eastward_time_major = Vec::with_capacity(time.len() * 2);
+    let mut northward_time_major = Vec::with_capacity(time.len() * 2);
+    for index in 0..time.len() {
+        let scalar_missing = index == 0 || index + 1 == time.len() || index % 29 == 7;
+        let vector_missing = index == 0 || index + 1 == time.len() || index % 31 == 11;
+        scalar_time_major.extend([
+            observations[index],
+            if scalar_missing {
+                f64::NAN
+            } else {
+                observations[index]
+            },
+        ]);
+        eastward_time_major.extend([
+            eastward[index],
+            if vector_missing {
+                f64::NAN
+            } else {
+                eastward[index]
+            },
+        ]);
+        northward_time_major.extend([
+            northward[index],
+            if vector_missing {
+                f64::NAN
+            } else {
+                northward[index]
+            },
+        ]);
+    }
+    let latitudes = [LATITUDE, LATITUDE];
+    let scalar_batch = ScalarInferenceBatch::prepare_modified_julian_days(
+        &time,
+        &requested(),
+        &RELATIONSHIPS,
+        InferenceMode::Exact,
+    )
+    .expect("valid scalar inference batch");
+    let scalar_solutions = scalar_batch
+        .solve_time_major_with_missing_and_linear_confidence(
+            &scalar_time_major,
+            &latitudes,
+            LinearConfidence::White,
+        )
+        .expect("valid scalar confidence solutions");
+    let scalar_diagnostics = scalar_batch
+        .diagnose_time_major(
+            &scalar_time_major,
+            &latitudes,
+            &scalar_solutions,
+            ConstituentDiagnosticsOptions::default(),
+        )
+        .expect("valid scalar batch diagnostics");
+
+    let vector_batch = VectorInferenceBatch::prepare_modified_julian_days(
+        &time,
+        &requested(),
+        &VECTOR_RELATIONSHIPS,
+        InferenceMode::Exact,
+    )
+    .expect("valid vector inference batch");
+    let vector_solutions = vector_batch
+        .solve_vector_time_major_with_missing_and_linear_confidence(
+            &eastward_time_major,
+            &northward_time_major,
+            &latitudes,
+            LinearConfidence::White,
+        )
+        .expect("valid vector confidence solutions");
+    let vector_diagnostics = vector_batch
+        .diagnose_vector_time_major(
+            &eastward_time_major,
+            &northward_time_major,
+            &latitudes,
+            &vector_solutions,
+            ConstituentDiagnosticsOptions::default(),
+        )
+        .expect("valid vector batch diagnostics");
+
+    for diagnostics in scalar_diagnostics.iter().chain(vector_diagnostics.iter()) {
+        assert_eq!(diagnostics.constituents.len(), 5);
+        assert!(diagnostics.whole_model.basis_condition_number >= 1.0);
+        assert!(diagnostics.tidal_variance.raw_tidal_variance > 0.0);
+        assert!(diagnostics.tidal_variance.all_constituent_tidal_variance > 0.0);
+        for inferred in [3, 4] {
+            assert!(diagnostics.constituents[inferred].lower.is_none());
+            assert!(diagnostics.constituents[inferred].higher.is_none());
+        }
+    }
+    let complete_rayleigh = scalar_diagnostics[0].constituents[1]
+        .higher
+        .as_ref()
+        .expect("M2 has a higher neighbor")
+        .rayleigh_criterion;
+    let gappy_rayleigh = scalar_diagnostics[1].constituents[1]
+        .higher
+        .as_ref()
+        .expect("M2 has a higher neighbor")
+        .rayleigh_criterion;
+    assert!(
+        (complete_rayleigh - gappy_rayleigh).abs() > 1e-6,
+        "endpoint gaps must change the retained-record Rayleigh value"
+    );
+}
+
+#[test]
 fn matches_resolved_and_unresolved_exact_and_approximate_oracles() {
     check_oracle(169, InferenceMode::Exact, &UNRESOLVED_EXACT);
     check_oracle(169, InferenceMode::Approximate, &UNRESOLVED_APPROXIMATE);

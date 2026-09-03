@@ -51,10 +51,19 @@ The high-level Rust calculation is opt-in through
 `ConstituentDiagnosticsOptions`. Its defaults reproduce MATLAB UTide's
 `Rmin = 1` and inclusive `SNR >= 2` significant-subset threshold. Prepared raw
 and Greenwich/nodal models expose scalar diagnostics, while Greenwich/nodal
-models also expose vector diagnostics. Scalar inference is supported: ordinary
-and reference constituents participate in the neighbor graph, constrained
-inferred outputs remain aligned with the solution but have no independent
-neighbors.
+models also expose vector diagnostics. Scalar and coupled-vector inference are
+supported: ordinary and reference constituents participate in the neighbor
+graph, while constrained inferred outputs remain aligned with the solution but
+have no independent neighbors. The coupled-vector path evaluates Corrmax from
+the complete four-by-four Cartesian parameter block rather than treating the
+eastward and northward fits as independent.
+
+Prepared batch models provide matching post-fit diagnostic calls for complete
+and `NaN`-gappy scalar or jointly masked vector series. Records sharing a mask
+reuse retained-position metadata and independent series run in parallel. Each
+diagnostic model still uses its own retained timestamps, midpoint, astronomical
+terms, and covariance; an exact time-axis fingerprint guards the coupled-vector
+interface against a solution/model mismatch.
 
 `K` does not refactor or copy the tall basis. RUTide applies the complex-basis
 normalization to the prepared pivoted QR's small triangular factor and caches
@@ -62,8 +71,11 @@ its singular-value ratio. Unweighted coefficient normal inverses are likewise
 formed from and cached behind that QR factor. The reconstructed variance and
 whole-model energy calculations stream over the observations without retaining
 reconstruction arrays; vector inputs are not interleaved into a temporary copy.
-These choices keep the default solve path unchanged and bound opt-in diagnostic
-memory by the small coefficient matrices.
+Coupled inference necessarily materializes the complex covariance matrices used
+by Corrmax and performs one filtered reconstruction for the independently
+thresholded inferred subset. These choices keep the default solve path unchanged
+and bound opt-in diagnostic memory by the fitted output and small coefficient
+matrices.
 
 ## Irregular records
 
@@ -81,9 +93,8 @@ record.
 1. Public equation-81 neighbor and equation-99–102 tidal-variance kernels — done.
 2. Cached `K`, `SNRallc`, RNM, and Corrmax from the fitted design/covariance —
    done for the real scalar/vector basis.
-3. Scalar/vector ordinary and scalar-inference OLS/robust integration — done for
-   complete prepared records; vector inference and batch/missing orchestration
-   remain.
+3. Scalar/vector ordinary and scalar/coupled-vector inference OLS/robust
+   integration, including batch and missing-value orchestration — done.
 4. Structured Rust and Python results plus compact human-readable presentation.
 5. Scalar NetCDF schema 17, vector schema 15, and backward-readable Python
    coefficient snapshot schema 2.

@@ -4,6 +4,7 @@ use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet},
     f64::consts::{PI, TAU},
+    sync::OnceLock,
 };
 
 use faer::{
@@ -14,11 +15,15 @@ use rayon::prelude::*;
 
 use crate::{
     AnalysisError, Constituent, ConstituentDiagnosticsOptions, ConstituentIndependenceDiagnostics,
-    ConstituentSelectionDiagnostics, FitOptions, FixedRawOls, LinearConfidence, MonteCarloOptions,
-    RobustDiagnostics, RobustOptions, ScalarSolution, TidalConstituent, VectorReconstruction,
-    VectorSolution,
+    ConstituentSelectionDiagnostics, DiagnosticConstituentRole, FitOptions, FixedRawOls,
+    LinearConfidence, MonteCarloOptions, RobustDiagnostics, RobustOptions, ScalarSolution,
+    TidalConstituent, VectorReconstruction, VectorSolution,
     astronomy::at_modified_julian_day,
     catalog::{CONSTITUENT_COUNT, Metadata},
+    diagnostics::{
+        adjacent_constituent_diagnostics, populate_noise_modified_rayleigh,
+        tidal_variance_diagnostics, whole_model_independence_diagnostics,
+    },
     monte_carlo::{scalar_transformed_intervals, vector_transformed_intervals},
     robust::fit_complex_with_initial as robust_complex_fit_with_initial,
     sampling::equidistant_sample_interval_hours,
@@ -442,6 +447,8 @@ pub struct VectorInferenceOls {
     confidence_sampling: ConfidenceSampling,
     design: Mat<c64>,
     decomposition: ColPivQr<c64>,
+    diagnostic_basis_condition_number: OnceLock<Result<f64, AnalysisError>>,
+    diagnostic_time_digest: u64,
 }
 
 /// Shared astronomy for scalar inference across varying-latitude series.
@@ -1696,6 +1703,124 @@ fn transform_scalar_covariance(
     })
 }
 
+fn vector_inference_rotary_indices(
+    source: usize,
+    non_reference_count: usize,
+    fit_count: usize,
+) -> (usize, usize) {
+    if source < non_reference_count {
+        (source, non_reference_count + source)
+    } else {
+        let reference = source - non_reference_count;
+        let reference_count = fit_count - non_reference_count;
+        (
+            non_reference_count * 2 + reference,
+            non_reference_count * 2 + reference_count + reference,
+        )
+    }
+}
+
+fn vector_cartesian_cross_covariance(
+    gall: &Mat<c64>,
+    hall: &Mat<c64>,
+    left: (usize, usize),
+    right: (usize, usize),
+) -> [[f64; 4]; 4] {
+    let [g00, g01, g10, g11] = [
+        gall[(left.0, right.0)],
+        gall[(left.0, right.1)],
+        gall[(left.1, right.0)],
+        gall[(left.1, right.1)],
+    ];
+    let [h00, h01, h10, h11] = [
+        hall[(left.0, right.0)],
+        hall[(left.0, right.1)],
+        hall[(left.1, right.0)],
+        hall[(left.1, right.1)],
+    ];
+    [
+        [
+            (g00 + g01 + g10 + g11).re / 2.0,
+            (h00 - h01 + h10 - h11).im / 2.0,
+            (-h00 - h01 - h10 - h11).im / 2.0,
+            (g00 - g01 + g10 - g11).re / 2.0,
+        ],
+        [
+            (-g00 - g01 + g10 + g11).im / 2.0,
+            (h00 - h01 - h10 + h11).re / 2.0,
+            (-h00 + h01 - h10 + h11).re / 2.0,
+            (-g00 + g01 + g10 - g11).im / 2.0,
+        ],
+        [
+            (g00 + g01 + g10 + g11).im / 2.0,
+            (-h00 + h01 - h10 + h11).re / 2.0,
+            (h00 + h01 + h10 + h11).re / 2.0,
+            (g00 - g01 + g10 - g11).im / 2.0,
+        ],
+        [
+            (-g00 - g01 + g10 + g11).re / 2.0,
+            (h00 - h01 - h10 + h11).im / 2.0,
+            (-h00 - h01 + h10 + h11).im / 2.0,
+            (g00 - g01 - g10 + g11).re / 2.0,
+        ],
+    ]
+}
+
+fn populate_vector_inference_maximum_correlation(
+    diagnostics: &mut [ConstituentIndependenceDiagnostics],
+    gall: &Mat<c64>,
+    hall: &Mat<c64>,
+    non_reference_count: usize,
+) -> Result<(), AnalysisError> {
+    let fit_count = diagnostics.len();
+    let variances = (0..fit_count)
+        .map(|source| {
+            let indices = vector_inference_rotary_indices(source, non_reference_count, fit_count);
+            let covariance = vector_cartesian_cross_covariance(gall, hall, indices, indices);
+            std::array::from_fn::<_, 4, _>(|parameter| covariance[parameter][parameter])
+        })
+        .collect::<Vec<_>>();
+    for (source, variance) in variances.iter().enumerate() {
+        for (parameter, value) in variance.iter().copied().enumerate() {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(AnalysisError::InvalidDiagnosticCoefficientVariance {
+                    parameter: source * 4 + parameter,
+                });
+            }
+        }
+    }
+
+    for (source, independence) in diagnostics.iter_mut().enumerate() {
+        for neighbor in [&mut independence.lower, &mut independence.higher]
+            .into_iter()
+            .flatten()
+        {
+            let cross = vector_cartesian_cross_covariance(
+                gall,
+                hall,
+                vector_inference_rotary_indices(source, non_reference_count, fit_count),
+                vector_inference_rotary_indices(neighbor.index, non_reference_count, fit_count),
+            );
+            let mut maximum: f64 = 0.0;
+            for (left, row) in cross.iter().enumerate() {
+                for (right, covariance) in row.iter().copied().enumerate() {
+                    let correlation = covariance
+                        / (variances[source][left] * variances[neighbor.index][right]).sqrt();
+                    if !correlation.is_finite() {
+                        return Err(AnalysisError::InvalidDiagnosticCoefficientCorrelation {
+                            left: source * 4 + left,
+                            right: neighbor.index * 4 + right,
+                        });
+                    }
+                    maximum = maximum.max(correlation.abs());
+                }
+            }
+            neighbor.maximum_correlation = Some(maximum);
+        }
+    }
+    Ok(())
+}
+
 impl VectorInferenceOls {
     /// Build and factorize a coupled vector inference model.
     ///
@@ -1811,6 +1936,8 @@ impl VectorInferenceOls {
             confidence_sampling: record.confidence_sampling.clone(),
             design,
             decomposition,
+            diagnostic_basis_condition_number: OnceLock::new(),
+            diagnostic_time_digest: record.time_digest,
         })
     }
 
@@ -1872,6 +1999,34 @@ impl VectorInferenceOls {
     #[must_use]
     pub const fn nodal_corrections(&self) -> NodalCorrections {
         self.nodal_corrections
+    }
+
+    /// Return the two-norm condition number of the fitted complex inference basis.
+    ///
+    /// The small triangular factor retained by the pivoted QR is decomposed and
+    /// cached; the tall time-by-parameter matrix is neither copied nor refactored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError::DiagnosticDecompositionFailed`] if the small
+    /// singular-value decomposition does not converge.
+    pub fn diagnostic_basis_condition_number(&self) -> Result<f64, AnalysisError> {
+        self.diagnostic_basis_condition_number
+            .get_or_init(|| {
+                let singular_values = self
+                    .decomposition
+                    .thin_R()
+                    .singular_values()
+                    .map_err(|_| AnalysisError::DiagnosticDecompositionFailed)?;
+                let largest = singular_values[0];
+                let smallest = singular_values[singular_values.len() - 1];
+                Ok(if smallest == 0.0 {
+                    f64::INFINITY
+                } else {
+                    largest / smallest
+                })
+            })
+            .clone()
     }
 
     /// Fit one eastward/northward current series.
@@ -2021,6 +2176,230 @@ impl VectorInferenceOls {
             Some(robust_options),
             stream,
         )
+    }
+
+    /// Evaluate Codiga's extended diagnostics for an inferred current solution.
+    ///
+    /// `modified_julian_days` must be the timestamps used to prepare this model.
+    /// The fitted complex basis supplies `K`, `SNRallc`, complete-fit variance,
+    /// and the full four-by-four adjacent-parameter correlations. A filtered
+    /// reconstruction supplies the SNR-subset variance so independently
+    /// thresholded inferred outputs retain their intended meaning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for mismatched timestamps/observations, an
+    /// incompatible solution, absent SNR, invalid options or robust weights, or
+    /// diagnostic matrix failures.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps complex coefficient recovery and one audited diagnostic energy pass together"
+    )]
+    pub fn diagnose_vector_solution(
+        &self,
+        modified_julian_days: &[f64],
+        eastward: &[f64],
+        northward: &[f64],
+        solution: &VectorSolution,
+        options: ConstituentDiagnosticsOptions,
+    ) -> Result<ConstituentSelectionDiagnostics, AnalysisError> {
+        options.validate()?;
+        let fit_count = self
+            .output_mappings
+            .iter()
+            .filter(|mapping| !mapping.inferred)
+            .count();
+        validate_time_with_options(modified_julian_days, fit_count, self.fit_options)?;
+        if modified_julian_days.len() != self.time_count
+            || diagnostic_time_digest(modified_julian_days) != self.diagnostic_time_digest
+        {
+            return Err(AnalysisError::DiagnosticSolutionModelMismatch);
+        }
+        validate_vector_diagnostic_observations(eastward, northward, self.time_count)?;
+
+        let output_count = self.output_mappings.len();
+        for (field, values) in [
+            ("semi_major", &solution.semi_major),
+            ("semi_minor", &solution.semi_minor),
+            ("inclination_degrees", &solution.inclination_degrees),
+            ("phase_degrees", &solution.phase_degrees),
+        ] {
+            validate_corrected_diagnostic_values(field, values, output_count)?;
+        }
+        let expanded_signal_to_noise = solution
+            .signal_to_noise
+            .as_deref()
+            .ok_or(AnalysisError::MissingSignalToNoise)?;
+        if expanded_signal_to_noise.len() != output_count {
+            return Err(AnalysisError::InvalidSolutionShape {
+                field: "signal_to_noise",
+                actual: expanded_signal_to_noise.len(),
+                expected: output_count,
+            });
+        }
+        if let Some((index, _)) = expanded_signal_to_noise
+            .iter()
+            .enumerate()
+            .find(|(_, value)| value.is_nan() || **value < 0.0)
+        {
+            return Err(AnalysisError::InvalidDiagnosticSignalToNoise { index });
+        }
+        if solution.reference_time_days.to_bits()
+            != self.reference_time_modified_julian_day.to_bits()
+        {
+            return Err(AnalysisError::DiagnosticSolutionModelMismatch);
+        }
+        for (field, value) in [
+            ("eastward_mean", solution.eastward_mean),
+            ("northward_mean", solution.northward_mean),
+            ("eastward_slope_per_day", solution.eastward_slope_per_day),
+            ("northward_slope_per_day", solution.northward_slope_per_day),
+        ] {
+            if !value.is_finite() {
+                return Err(AnalysisError::NonFiniteDiagnosticValue { field, index: 0 });
+            }
+        }
+        let weights = corrected_diagnostic_weights(solution.robust.as_ref(), self.time_count)?;
+
+        let mut direct_outputs = vec![usize::MAX; fit_count];
+        for (output, mapping) in self.output_mappings.iter().copied().enumerate() {
+            if !mapping.inferred {
+                direct_outputs[mapping.source_fit_index] = output;
+            }
+        }
+        debug_assert!(direct_outputs.iter().all(|output| *output != usize::MAX));
+        let direct_signal_to_noise = direct_outputs
+            .iter()
+            .map(|output| expanded_signal_to_noise[*output])
+            .collect::<Vec<_>>();
+        let direct_constituents = direct_outputs
+            .iter()
+            .map(|output| self.constituents[*output].clone())
+            .collect::<Vec<_>>();
+        let roles = vec![DiagnosticConstituentRole::Direct; fit_count];
+        let mut direct_independence = adjacent_constituent_diagnostics(
+            &direct_constituents,
+            &roles,
+            self.confidence_sampling.effective_record_length_days,
+            options.rayleigh_minimum(),
+        )?;
+        populate_noise_modified_rayleigh(&mut direct_independence, &direct_signal_to_noise)?;
+
+        let (eastward_components, northward_components) = solution.component_solutions();
+        let mut coefficients = Mat::zeros(self.design.ncols(), 1);
+        for (source, output) in direct_outputs.iter().copied().enumerate() {
+            let positive = c64::new(
+                eastward_components.cosine_coefficient[output]
+                    + northward_components.sine_coefficient[output],
+                northward_components.cosine_coefficient[output]
+                    - eastward_components.sine_coefficient[output],
+            ) / 2.0;
+            let negative = c64::new(
+                eastward_components.cosine_coefficient[output]
+                    - northward_components.sine_coefficient[output],
+                northward_components.cosine_coefficient[output]
+                    + eastward_components.sine_coefficient[output],
+            ) / 2.0;
+            let (positive_index, negative_index) =
+                vector_inference_rotary_indices(source, self.non_reference_count, fit_count);
+            coefficients[(positive_index, 0)] = positive;
+            coefficients[(negative_index, 0)] = negative;
+        }
+        let harmonic_columns = fit_count * 2;
+        coefficients[(harmonic_columns, 0)] =
+            c64::new(solution.eastward_mean, solution.northward_mean);
+        if self.fit_options.trend {
+            coefficients[(harmonic_columns + 1, 0)] = c64::new(
+                solution.eastward_slope_per_day * self.time_span_days,
+                solution.northward_slope_per_day * self.time_span_days,
+            );
+        }
+        let observations = Mat::from_fn(self.time_count, 1, |time, _| {
+            c64::new(eastward[time], northward[time])
+        });
+        let covariance = self.vector_inference_covariance_basis(
+            observations.as_ref(),
+            coefficients.as_ref(),
+            weights,
+        );
+        populate_vector_inference_maximum_correlation(
+            &mut direct_independence,
+            &covariance.gall,
+            &covariance.hall,
+            self.non_reference_count,
+        )?;
+
+        let significant = self.reconstruct_vector_modified_julian_days(
+            modified_julian_days,
+            solution,
+            &ReconstructionFilter::Diagnostics {
+                minimum_percent_energy: 0.0,
+                minimum_signal_to_noise: Some(options.minimum_signal_to_noise()),
+            },
+        )?;
+        let mut raw_tidal_energy = 0.0;
+        let mut all_constituent_tidal_energy = 0.0;
+        let mut significant_constituent_tidal_energy = 0.0;
+        let mut model_energy = 0.0;
+        let mut residual_mean_square_numerator = 0.0;
+        for time in 0..self.time_count {
+            let offset_days = modified_julian_days[time] - self.reference_time_modified_julian_day;
+            let non_harmonic = c64::new(
+                solution.eastward_mean + solution.eastward_slope_per_day * offset_days,
+                solution.northward_mean + solution.northward_slope_per_day * offset_days,
+            );
+            let raw_tidal = observations[(time, 0)] - non_harmonic;
+            let all_tidal = covariance.fitted[(time, 0)] - non_harmonic;
+            let significant_tidal =
+                c64::new(significant.eastward[time], significant.northward[time]) - non_harmonic;
+            let residual = observations[(time, 0)] - covariance.fitted[(time, 0)];
+            let weight = weights.map_or(1.0, |weights| weights[time]);
+            raw_tidal_energy += raw_tidal.norm_sqr();
+            all_constituent_tidal_energy += all_tidal.norm_sqr();
+            significant_constituent_tidal_energy += significant_tidal.norm_sqr();
+            model_energy += weight * covariance.fitted[(time, 0)].norm_sqr();
+            residual_mean_square_numerator += weight * residual.norm_sqr();
+        }
+        let time_count = usize_to_f64(self.time_count);
+        let tidal_variance = tidal_variance_diagnostics(
+            raw_tidal_energy / time_count,
+            all_constituent_tidal_energy / time_count,
+            Some(significant_constituent_tidal_energy / time_count),
+        );
+        let residual_mean_square =
+            residual_mean_square_numerator / usize_to_f64(self.time_count - self.design.ncols());
+        let whole_model = whole_model_independence_diagnostics(
+            self.diagnostic_basis_condition_number()?,
+            model_energy,
+            residual_mean_square,
+        )?;
+
+        let mut constituents = vec![
+            ConstituentIndependenceDiagnostics {
+                lower: None,
+                higher: None,
+            };
+            output_count
+        ];
+        for (source, mut independence) in direct_independence.into_iter().enumerate() {
+            for neighbor in [&mut independence.lower, &mut independence.higher]
+                .into_iter()
+                .flatten()
+            {
+                let output = direct_outputs[neighbor.index];
+                neighbor.index = output;
+                neighbor.name.clone_from(&self.constituents[output].name);
+                neighbor.frequency_cph = self.constituents[output].frequency_cph;
+            }
+            constituents[direct_outputs[source]] = independence;
+        }
+        Ok(ConstituentSelectionDiagnostics {
+            constituents,
+            whole_model,
+            tidal_variance,
+            rayleigh_minimum: options.rayleigh_minimum(),
+            minimum_signal_to_noise: options.minimum_signal_to_noise(),
+        })
     }
 
     /// Reconstruct one inferred vector solution with the fitted astronomical options.
@@ -3289,6 +3668,62 @@ impl ScalarInferenceBatch {
         )
     }
 
+    /// Evaluate inferred-scalar diagnostics for complete or `NaN`-gappy series.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid shapes, infinities, latitudes, incompatible
+    /// solutions, absent SNR, or diagnostic matrix failures.
+    pub fn diagnose_time_major(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        solutions: &[ScalarSolution],
+        options: ConstituentDiagnosticsOptions,
+    ) -> Result<Vec<ConstituentSelectionDiagnostics>, AnalysisError> {
+        options.validate()?;
+        validate_batch_shape_and_latitudes(self.time_count(), observations, latitudes)?;
+        if solutions.len() != latitudes.len() {
+            return Err(AnalysisError::ObservationShape {
+                actual: solutions.len(),
+                expected: latitudes.len(),
+            });
+        }
+        let series_count = latitudes.len();
+        for (index, value) in observations.iter().copied().enumerate() {
+            if value.is_infinite() {
+                return Err(AnalysisError::NonFiniteObservation {
+                    series: index % series_count,
+                    time: index / series_count,
+                });
+            }
+        }
+        let (records, record_for_series) =
+            diagnostic_record_plan(&self.basis, series_count, |time, series| {
+                observations[time * series_count + series].is_finite()
+            })?;
+        (0..series_count)
+            .into_par_iter()
+            .map(|series| {
+                let record = &records[record_for_series[series]];
+                let model = ScalarInferenceOls::from_basis_record(
+                    &self.basis,
+                    record,
+                    latitudes[series],
+                    &self.layout,
+                    &self.relationships,
+                    self.mode,
+                )?;
+                let values = record
+                    .positions
+                    .iter()
+                    .map(|time| observations[*time * series_count + series])
+                    .collect::<Vec<_>>();
+                model.diagnose_solution(&values, &solutions[series], options)
+            })
+            .collect()
+    }
+
     /// Fit complete time-major scalar series at varying latitudes.
     ///
     /// # Errors
@@ -3837,6 +4272,86 @@ impl VectorInferenceBatch {
             self.basis.phase_reference,
             self.basis.nodal_corrections,
         )
+    }
+
+    /// Evaluate inferred-current diagnostics for complete or jointly gappy series.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid shapes, infinities, latitudes, incompatible
+    /// solutions, absent SNR, or diagnostic matrix failures.
+    pub fn diagnose_vector_time_major(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        solutions: &[VectorSolution],
+        options: ConstituentDiagnosticsOptions,
+    ) -> Result<Vec<ConstituentSelectionDiagnostics>, AnalysisError> {
+        options.validate()?;
+        validate_batch_shape_and_latitudes(self.time_count(), eastward, latitudes)?;
+        if northward.len() != eastward.len() {
+            return Err(AnalysisError::ObservationShape {
+                actual: northward.len(),
+                expected: eastward.len(),
+            });
+        }
+        if solutions.len() != latitudes.len() {
+            return Err(AnalysisError::ObservationShape {
+                actual: solutions.len(),
+                expected: latitudes.len(),
+            });
+        }
+        let series_count = latitudes.len();
+        for (index, value) in eastward.iter().chain(northward).copied().enumerate() {
+            if value.is_infinite() {
+                return Err(AnalysisError::NonFiniteObservation {
+                    series: index % series_count,
+                    time: (index % eastward.len()) / series_count,
+                });
+            }
+        }
+        let (records, record_for_series) =
+            diagnostic_record_plan(&self.basis, series_count, |time, series| {
+                eastward[time * series_count + series].is_finite()
+                    && northward[time * series_count + series].is_finite()
+            })?;
+        (0..series_count)
+            .into_par_iter()
+            .map(|series| {
+                let record = &records[record_for_series[series]];
+                let model = VectorInferenceOls::from_basis_record(
+                    &self.basis,
+                    record,
+                    latitudes[series],
+                    &self.layout,
+                    &self.relationships,
+                    self.mode,
+                )?;
+                let times = record
+                    .positions
+                    .iter()
+                    .map(|position| self.basis.time_terms[*position].modified_julian_day)
+                    .collect::<Vec<_>>();
+                let eastward_values = record
+                    .positions
+                    .iter()
+                    .map(|time| eastward[*time * series_count + series])
+                    .collect::<Vec<_>>();
+                let northward_values = record
+                    .positions
+                    .iter()
+                    .map(|time| northward[*time * series_count + series])
+                    .collect::<Vec<_>>();
+                model.diagnose_vector_solution(
+                    &times,
+                    &eastward_values,
+                    &northward_values,
+                    &solutions[series],
+                    options,
+                )
+            })
+            .collect()
     }
 
     /// Fit complete time-major current series at varying latitudes.
@@ -4419,6 +4934,132 @@ impl GreenwichNodalBatch {
             self.basis.phase_reference,
             self.basis.nodal_corrections,
         )
+    }
+
+    /// Evaluate extended scalar diagnostics for complete or `NaN`-gappy series.
+    ///
+    /// `solutions` must be the corresponding confidence-enabled fits in stable
+    /// series order. Records sharing a missing-value mask reuse their prepared
+    /// sampling metadata; diagnostic model work remains parallel by series.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid shapes, infinities, latitudes,
+    /// incompatible solutions, absent SNR, or diagnostic matrix failures.
+    pub fn diagnose_time_major(
+        &self,
+        observations: &[f64],
+        latitudes: &[f64],
+        solutions: &[ScalarSolution],
+        options: ConstituentDiagnosticsOptions,
+    ) -> Result<Vec<ConstituentSelectionDiagnostics>, AnalysisError> {
+        options.validate()?;
+        validate_batch_shape_and_latitudes(self.time_count(), observations, latitudes)?;
+        if solutions.len() != latitudes.len() {
+            return Err(AnalysisError::ObservationShape {
+                actual: solutions.len(),
+                expected: latitudes.len(),
+            });
+        }
+        let series_count = latitudes.len();
+        for (index, value) in observations.iter().copied().enumerate() {
+            if value.is_infinite() {
+                return Err(AnalysisError::NonFiniteObservation {
+                    series: index % series_count,
+                    time: index / series_count,
+                });
+            }
+        }
+        let (records, record_for_series) =
+            diagnostic_record_plan(&self.basis, series_count, |time, series| {
+                observations[time * series_count + series].is_finite()
+            })?;
+        (0..series_count)
+            .into_par_iter()
+            .map(|series| {
+                let record = &records[record_for_series[series]];
+                let model = self
+                    .basis
+                    .model_at_latitude_for_record(latitudes[series], record)?;
+                let values = record
+                    .positions
+                    .iter()
+                    .map(|time| observations[*time * series_count + series])
+                    .collect::<Vec<_>>();
+                model.diagnose_scalar_solution(&values, &solutions[series], options)
+            })
+            .collect()
+    }
+
+    /// Evaluate extended current diagnostics for joint complete or gappy series.
+    ///
+    /// A time row is omitted from both components when either value is `NaN`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid shapes, infinities, latitudes,
+    /// incompatible solutions, absent SNR, or diagnostic matrix failures.
+    pub fn diagnose_vector_time_major(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        latitudes: &[f64],
+        solutions: &[VectorSolution],
+        options: ConstituentDiagnosticsOptions,
+    ) -> Result<Vec<ConstituentSelectionDiagnostics>, AnalysisError> {
+        options.validate()?;
+        validate_batch_shape_and_latitudes(self.time_count(), eastward, latitudes)?;
+        if northward.len() != eastward.len() {
+            return Err(AnalysisError::ObservationShape {
+                actual: northward.len(),
+                expected: eastward.len(),
+            });
+        }
+        if solutions.len() != latitudes.len() {
+            return Err(AnalysisError::ObservationShape {
+                actual: solutions.len(),
+                expected: latitudes.len(),
+            });
+        }
+        let series_count = latitudes.len();
+        for (index, value) in eastward.iter().chain(northward).copied().enumerate() {
+            if value.is_infinite() {
+                return Err(AnalysisError::NonFiniteObservation {
+                    series: index % series_count,
+                    time: (index % eastward.len()) / series_count,
+                });
+            }
+        }
+        let (records, record_for_series) =
+            diagnostic_record_plan(&self.basis, series_count, |time, series| {
+                eastward[time * series_count + series].is_finite()
+                    && northward[time * series_count + series].is_finite()
+            })?;
+        (0..series_count)
+            .into_par_iter()
+            .map(|series| {
+                let record = &records[record_for_series[series]];
+                let model = self
+                    .basis
+                    .model_at_latitude_for_record(latitudes[series], record)?;
+                let eastward_values = record
+                    .positions
+                    .iter()
+                    .map(|time| eastward[*time * series_count + series])
+                    .collect::<Vec<_>>();
+                let northward_values = record
+                    .positions
+                    .iter()
+                    .map(|time| northward[*time * series_count + series])
+                    .collect::<Vec<_>>();
+                model.diagnose_vector_solution(
+                    &eastward_values,
+                    &northward_values,
+                    &solutions[series],
+                    options,
+                )
+            })
+            .collect()
     }
 
     /// Fit varying-latitude scalar series stored in time-major order.
@@ -5714,6 +6355,7 @@ impl CorrectionBasis {
             reference_time,
             time_span_days,
             confidence_sampling,
+            time_digest: diagnostic_time_digest(&modified_julian_days),
             astronomical_basis,
         })
     }
@@ -5814,6 +6456,7 @@ struct RecordSubset {
     reference_time: f64,
     time_span_days: f64,
     confidence_sampling: ConfidenceSampling,
+    time_digest: u64,
     // Time-major, constituent-minor and present only for a bounded shared mask.
     astronomical_basis: Option<Vec<c64>>,
 }
@@ -6128,6 +6771,35 @@ fn validate_latitude(latitude: f64) -> Result<(), AnalysisError> {
     Ok(())
 }
 
+fn diagnostic_record_plan(
+    basis: &CorrectionBasis,
+    series_count: usize,
+    retained: impl Fn(usize, usize) -> bool,
+) -> Result<(Vec<RecordSubset>, Vec<usize>), AnalysisError> {
+    let mut unique_positions = Vec::<Vec<usize>>::new();
+    let mut record_by_positions = HashMap::<Vec<usize>, usize>::new();
+    let mut record_for_series = Vec::with_capacity(series_count);
+    for series in 0..series_count {
+        let positions = (0..basis.time_terms.len())
+            .filter(|time| retained(*time, series))
+            .collect::<Vec<_>>();
+        let record_index = if let Some(index) = record_by_positions.get(&positions) {
+            *index
+        } else {
+            let index = unique_positions.len();
+            record_by_positions.insert(positions.clone(), index);
+            unique_positions.push(positions);
+            index
+        };
+        record_for_series.push(record_index);
+    }
+    let records = unique_positions
+        .into_iter()
+        .map(|positions| basis.record_subset(positions, false))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((records, record_for_series))
+}
+
 fn validate_batch_shape_and_latitudes(
     time_count: usize,
     observations: &[f64],
@@ -6269,6 +6941,88 @@ fn dot6(left: [i8; 6], right: [f64; 6]) -> f64 {
         + f64::from(left[3]) * right[3]
         + f64::from(left[4]) * right[4]
         + f64::from(left[5]) * right[5]
+}
+
+fn validate_corrected_diagnostic_values(
+    field: &'static str,
+    values: &[f64],
+    expected: usize,
+) -> Result<(), AnalysisError> {
+    if values.len() != expected {
+        return Err(AnalysisError::InvalidSolutionShape {
+            field,
+            actual: values.len(),
+            expected,
+        });
+    }
+    if let Some((index, _)) = values
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(AnalysisError::NonFiniteDiagnosticValue { field, index });
+    }
+    Ok(())
+}
+
+fn diagnostic_time_digest(modified_julian_days: &[f64]) -> u64 {
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in modified_julian_days
+        .iter()
+        .flat_map(|value| value.to_bits().to_le_bytes())
+    {
+        digest ^= u64::from(byte);
+        digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    digest
+}
+
+fn validate_vector_diagnostic_observations(
+    eastward: &[f64],
+    northward: &[f64],
+    expected: usize,
+) -> Result<(), AnalysisError> {
+    for (series, values) in [eastward, northward].into_iter().enumerate() {
+        if values.len() != expected {
+            return Err(AnalysisError::ObservationShape {
+                actual: values.len(),
+                expected,
+            });
+        }
+        if let Some((time, _)) = values
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(AnalysisError::NonFiniteObservation { series, time });
+        }
+    }
+    Ok(())
+}
+
+fn corrected_diagnostic_weights(
+    robust: Option<&RobustDiagnostics>,
+    expected: usize,
+) -> Result<Option<&[f64]>, AnalysisError> {
+    let Some(robust) = robust else {
+        return Ok(None);
+    };
+    if robust.weights.len() != expected {
+        return Err(AnalysisError::InvalidSolutionShape {
+            field: "diagnostic_robust_weights",
+            actual: robust.weights.len(),
+            expected,
+        });
+    }
+    if let Some((time, _)) = robust
+        .weights
+        .iter()
+        .enumerate()
+        .find(|(_, weight)| !weight.is_finite() || **weight < 0.0)
+    {
+        return Err(AnalysisError::InvalidDiagnosticWeight { time });
+    }
+    Ok(Some(&robust.weights))
 }
 
 #[allow(
@@ -6454,6 +7208,15 @@ mod tests {
                 .iter()
                 .all(|value| value.is_finite())
         );
+        let scalar_diagnostics = batch
+            .diagnose_time_major(
+                &observations,
+                &[60.0],
+                &white,
+                ConstituentDiagnosticsOptions::default(),
+            )
+            .expect("scalar diagnostics use the retained irregular record");
+        assert!(scalar_diagnostics[0].whole_model.basis_condition_number >= 1.0);
 
         let mut northward = observations
             .iter()
@@ -6461,16 +7224,24 @@ mod tests {
             .map(|(index, value)| value + (usize_to_f64(index) / 17.0).cos())
             .collect::<Vec<_>>();
         northward[2] = f64::NAN;
-        assert!(
-            batch
-                .solve_vector_time_major_with_missing_and_linear_confidence(
-                    &observations,
-                    &northward,
-                    &[60.0],
-                    LinearConfidence::White,
-                )
-                .is_ok()
-        );
+        let vector_white = batch
+            .solve_vector_time_major_with_missing_and_linear_confidence(
+                &observations,
+                &northward,
+                &[60.0],
+                LinearConfidence::White,
+            )
+            .expect("white vector confidence supports irregular gappy data");
+        let vector_diagnostics = batch
+            .diagnose_vector_time_major(
+                &observations,
+                &northward,
+                &[60.0],
+                &vector_white,
+                ConstituentDiagnosticsOptions::default(),
+            )
+            .expect("vector diagnostics use the retained joint-mask record");
+        assert!(vector_diagnostics[0].whole_model.basis_condition_number >= 1.0);
         assert!(
             batch
                 .solve_vector_time_major_with_missing_and_linear_confidence(

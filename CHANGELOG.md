@@ -18,6 +18,9 @@ published API and file-schema contracts.
   full/SNR-filtered tidal variance for raw, Greenwich/nodal, robust, and scalar-
   inference fits. Condition numbers and unweighted normal inverses reuse the
   prepared pivoted QR's small triangular factor.
+- Coupled-vector inference diagnostics using the full four-by-four Cartesian
+  cross-covariance, plus parallel post-fit diagnostic orchestration for complete
+  and missing-value scalar/vector batches with retained-record timing.
 - An installed-wheel acceptance harness for a public NOAA/NDBC ADCP profile and
   a domain-spanning selection from the 25.78 GB FVCOM fixture, including
   reconstruction and coefficient-persistence validation.
