@@ -65,6 +65,11 @@ class Coefficient(Bunch):
 
         return save(self, path, compressed=compressed)
 
+    def diagnostic_table(self) -> str:
+        """Format the opt-in constituent-identifiability diagnostics."""
+
+        return _format_diagnostic_table(self)
+
 
 class CoefficientBatch(Bunch):
     """Time-major multi-series coefficients returned by :func:`solve_many`."""
@@ -82,6 +87,7 @@ class CoefficientBatch(Bunch):
             ranking=("series", "presentation_rank"),
             series=("series",),
             robust_weights=("retained_time", "series"),
+            diagnostics=("series", "constituent"),
         )
         super().__init__(values)
         object.__setattr__(self, "_fit", fit)
@@ -96,6 +102,14 @@ class CoefficientBatch(Bunch):
         """Persist this batch in RUTide's versioned, pickle-free NPZ format."""
 
         return save(self, path, compressed=compressed)
+
+    def diagnostic_table(self, series: int) -> str:
+        """Format constituent-identifiability diagnostics for one series."""
+
+        index = int(series)
+        if index < 0 or index >= self._fit.series_count:
+            raise IndexError(f"series must be between 0 and {self._fit.series_count - 1}")
+        return _format_diagnostic_table(self, index)
 
     def to_xarray(self) -> Any:
         """Return an ``xarray.Dataset`` when the optional xarray package is installed."""
@@ -177,6 +191,79 @@ class Tide(Bunch):
     """Scalar heights or vector currents returned by :func:`reconstruct`."""
 
 
+def _format_diagnostic_table(
+    coefficients: Coefficient | CoefficientBatch, series: int | None = None
+) -> str:
+    diagnostics = coefficients.diagn
+    if diagnostics is None:
+        raise ValueError("diagnostics were not requested; call solve(..., diagnostics=True)")
+    batch = series is not None
+    names = [str(name) for name in coefficients.name]
+
+    def value(field: Any, constituent: int | None = None) -> Any:
+        array = np.asarray(field)
+        if batch:
+            if constituent is None:
+                return array[series]
+            return array[series, constituent]
+        if constituent is None:
+            return field
+        return array[constituent]
+
+    def number(item: Any) -> str:
+        if item is None:
+            return "-"
+        number_value = float(item)
+        return "-" if not np.isfinite(number_value) else f"{number_value:.5g}"
+
+    def neighbor_name(side: Bunch, constituent: int) -> str:
+        neighbor_index = int(value(side.index, constituent))
+        if not batch:
+            name = str(np.asarray(side.name)[constituent])
+            return name or "-"
+        return "-" if neighbor_index < 0 else names[neighbor_index]
+
+    rows = [
+        "constituent  lower       RR(lo)    RNM(lo)   Corr(lo)  "
+        "higher      RR(hi)    RNM(hi)   Corr(hi)",
+        "-----------  ----------  --------  --------  --------  "
+        "----------  --------  --------  --------",
+    ]
+    for constituent, name in enumerate(names):
+        rows.append(
+            f"{name:<11}  {neighbor_name(diagnostics.lo, constituent):<10}  "
+            f"{number(value(diagnostics.lo.RR, constituent)):>8}  "
+            f"{number(value(diagnostics.lo.RNM, constituent)):>8}  "
+            f"{number(value(diagnostics.lo.CorMx, constituent)):>8}  "
+            f"{neighbor_name(diagnostics.hi, constituent):<10}  "
+            f"{number(value(diagnostics.hi.RR, constituent)):>8}  "
+            f"{number(value(diagnostics.hi.RNM, constituent)):>8}  "
+            f"{number(value(diagnostics.hi.CorMx, constituent)):>8}"
+        )
+    rows.extend(
+        [
+            "",
+            "  ".join(
+                [
+                    f"K={number(value(diagnostics.K))}",
+                    f"SNRallc={number(value(diagnostics.SNRallc))}",
+                    f"SNRallc/K={number(value(diagnostics.SNRallc_over_K))}",
+                ]
+            ),
+            "  ".join(
+                [
+                    f"TVraw={number(value(diagnostics.TVraw))}",
+                    f"TVallc={number(value(diagnostics.TVallc))}",
+                    f"TVsnrc={number(value(diagnostics.TVsnrc))}",
+                    f"PTVallc={number(value(diagnostics.PTVallc))}%",
+                    f"PTVsnrc={number(value(diagnostics.PTVsnrc))}%",
+                ]
+            ),
+        ]
+    )
+    return "\n".join(rows)
+
+
 def solve(
     t: ArrayLike,
     u: ArrayLike,
@@ -195,6 +282,8 @@ def solve(
     MC_seed: int = 0,
     robust_kw: Mapping[str, Any] | None = None,
     Rayleigh_min: float = 1.0,
+    diagnostics: bool = False,
+    diagnostic_min_SNR: float = 2.0,
     white: bool = False,
     epoch: Epoch | None = None,
     verbose: bool = True,
@@ -204,7 +293,10 @@ def solve(
     The endpoint intentionally follows :func:`utide.solve`. Numeric times are
     interpreted as Modified Julian Days when ``epoch`` is omitted. NaN
     observations and timestamps are removed jointly; infinite observations are
-    rejected. ``verbose`` is accepted for source compatibility and is silent.
+    rejected. Set ``diagnostics=True`` to add Codiga's RR, RNM, Corrmax,
+    condition-number, and tidal-variance suite as ``coef.diagn``. This requires
+    confidence intervals because RNM and the significant subset use SNR.
+    ``verbose`` is accepted for source compatibility and is silent.
     """
 
     del verbose
@@ -236,6 +328,8 @@ def solve(
             MC_seed,
             robust_kw,
             Rayleigh_min,
+            diagnostics,
+            diagnostic_min_SNR,
             white,
             northward is not None,
         ),
@@ -261,6 +355,8 @@ def solve_many(
     MC_seed: int = 0,
     robust_kw: Mapping[str, Any] | None = None,
     Rayleigh_min: float = 1.0,
+    diagnostics: bool = False,
+    diagnostic_min_SNR: float = 2.0,
     white: bool = False,
     epoch: Epoch | None = None,
     workers: int | None = None,
@@ -273,6 +369,8 @@ def solve_many(
     are shared inside Rust. ``memory_limit_mb`` bounds the temporary native
     component buffer used by each solve chunk; it does not include the caller's
     arrays, the one owned native input copy, or retained coefficient results.
+    ``diagnostics=True`` evaluates the same opt-in suite independently for every
+    retained record and returns dense ``(series, constituent)`` fields.
     """
 
     del verbose
@@ -313,6 +411,8 @@ def solve_many(
             MC_seed,
             robust_kw,
             Rayleigh_min,
+            diagnostics,
+            diagnostic_min_SNR,
             white,
             northward is not None,
         ),
@@ -538,6 +638,8 @@ def _solver_arguments(
     MC_seed: int,
     robust_kw: Mapping[str, Any] | None,
     Rayleigh_min: float,
+    diagnostics: bool,
+    diagnostic_min_SNR: float,
     white: bool,
     vector: bool,
 ) -> tuple[Any, ...]:
@@ -556,6 +658,8 @@ def _solver_arguments(
     return (
         constituents,
         float(Rayleigh_min),
+        bool(diagnostics),
+        float(diagnostic_min_SNR),
         method,
         "none" if conf_int is None else conf_int,
         bool(white),

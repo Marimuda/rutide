@@ -207,6 +207,11 @@ irregular Lomb–Scargle confidence, robust fitting, exact/approximate inference
 Monte Carlo confidence, and filtered reconstruction all use the same Rust core
 validated by the CLI.
 
+`diagnostics=True` adds the full Codiga constituent-identifiability suite as
+structured `coef.diagn` arrays: adjacent RR/RNM/Corrmax, whole-basis `K` and
+`SNRallc`, and full/SNR-subset tidal variance. Single and batch coefficient
+objects also format a compact per-record diagnostic table.
+
 The batch endpoint shares astronomy, grouped missing masks, irregular spectral
 plans, and a dedicated worker pool inside Rust. Coefficients use stable
 `(series, constituent)` shapes with per-series presentation rankings and optional
@@ -214,8 +219,9 @@ xarray conversion; a working-memory limit bounds native solve chunks. Single and
 batch coefficient objects can be atomically saved to a versioned, pickle-free
 NPZ archive and restored without refitting or storing source observations.
 Packed typed-array blobs keep large batch archives compact and fast to restore;
-the retained 4,096-series profile improved load time by 72.28x while continuing
-to read original schema-1 archives. The
+the retained 4,096-series profile improved load time by 72.28x. Native snapshot
+schema 2 stores optional diagnostic arrays densely while continuing to read
+original schema-1 snapshots from RUTide 0.2. The
 [real-data acceptance](benchmarks/results/real-data-acceptance-2026-09-03.md) and
 [persistence profile](benchmarks/results/python-batch-persistence-2026-09-03.md)
 record the installed-wheel ADCP/FVCOM evidence.

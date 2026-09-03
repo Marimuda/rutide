@@ -18,10 +18,11 @@ use crate::{
     SolveConfig, normalized_confidence_name, parse_confidence, parse_constituents,
     parse_method_and_robust, parse_nodal_corrections, parse_phase_reference,
     persistence::{
-        config_from_snapshot, config_snapshot, required, required_dict, required_extract,
-        required_vec_f64, required_vec_usize, scalar_solution_from_snapshot,
-        scalar_solution_snapshot, snapshot_error, snapshot_header, validate_header,
-        validate_presentation_order, vector_solution_from_snapshot, vector_solution_snapshot,
+        batch_diagnostics_from_snapshot, batch_diagnostics_snapshot, config_from_snapshot,
+        config_snapshot, required, required_dict, required_extract, required_vec_f64,
+        required_vec_usize, scalar_solution_from_snapshot, scalar_solution_snapshot,
+        snapshot_error, snapshot_header, validate_header, validate_presentation_order,
+        vector_solution_from_snapshot, vector_solution_snapshot,
     },
     scalar_inference_relations, validate_empty_inference, vector_inference_relations,
 };
@@ -41,6 +42,10 @@ pub(super) fn batch_snapshot<'py>(
     )?;
     snapshot.set_item("worker_count", state.worker_count)?;
     snapshot.set_item("chunk_series", state.chunk_series)?;
+    snapshot.set_item(
+        "diagnostics",
+        batch_diagnostics_snapshot(state.diagnostics.as_deref(), py)?,
+    )?;
 
     let positions = PyList::empty(py);
     for values in &state.valid_positions {
@@ -78,7 +83,7 @@ pub(super) fn restore_batch(
     snapshot: &Bound<'_, PyDict>,
     requested_workers: Option<usize>,
 ) -> PyResult<Py<BatchFit>> {
-    validate_header(snapshot, "batch")?;
+    let schema_version = validate_header(snapshot, "batch")?;
     let axes = restore_axes(snapshot)?;
     let RestoredAxes {
         time_mjd,
@@ -139,6 +144,13 @@ pub(super) fn restore_batch(
         solutions_from_snapshot(snapshot, &solution_kind, constituent_count, series_count)?;
     validate_robust_consistency(&config, &solutions, &valid_positions)?;
     let frequencies = restored_frequencies(&model, &solutions)?;
+    let diagnostics =
+        batch_diagnostics_from_snapshot(snapshot, schema_version, &names, &frequencies)?;
+    if diagnostics.is_some() != config.diagnostics {
+        return Err(snapshot_error(
+            "diagnostic config and persisted diagnostic presence disagree",
+        ));
+    }
     let presentation_order = restored_orders(snapshot, series_count, constituent_count)?;
     let (worker_count, chunk_series, pool) =
         restored_execution(snapshot, requested_workers, series_count)?;
@@ -163,6 +175,7 @@ pub(super) fn restore_batch(
                 phase_reference: phase_reference.name().to_owned(),
                 nodal_corrections: nodal_corrections.name().to_owned(),
                 trend: config.trend,
+                diagnostics,
                 worker_count,
                 chunk_series: chunk_series.min(series_count),
                 pool,

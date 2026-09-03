@@ -21,6 +21,8 @@ published API and file-schema contracts.
 - Coupled-vector inference diagnostics using the full four-by-four Cartesian
   cross-covariance, plus parallel post-fit diagnostic orchestration for complete
   and missing-value scalar/vector batches with retained-record timing.
+- Opt-in `diagnostics=True` Python results with MATLAB-inspired short fields,
+  descriptive aliases, dense batch arrays, and compact single-series tables.
 - An installed-wheel acceptance harness for a public NOAA/NDBC ADCP profile and
   a domain-spanning selection from the 25.78 GB FVCOM fixture, including
   reconstruction and coefficient-persistence validation.
@@ -30,6 +32,8 @@ published API and file-schema contracts.
 
 ### Changed
 
+- Added native coefficient snapshot schema 2 for optional single and dense-batch
+  identifiability diagnostics while retaining schema-1 reads from RUTide 0.2.
 - Coalesced schema-1 coefficient snapshot arrays into bounded typed NPZ blobs.
   Existing schema-1 archives remain readable while large batch archives save
   and load with far fewer ZIP entries.

@@ -12,11 +12,11 @@ use pyo3::{
     types::{PyDict, PyModule},
 };
 use rutide_core::{
-    FitOptions, GreenwichNodalOls, InferenceMode, LinearConfidence, MonteCarloOptions,
-    NodalCorrections, PhaseReference, ReconstructionFilter, RobustOptions, RobustTermination,
-    RobustWeightFunction, ScalarInferenceOls, ScalarInferenceRelation, ScalarSolution,
-    SolverOptions, TidalConstituent, VectorInferenceOls, VectorInferenceRelation, VectorSolution,
-    select_constituents_by_rayleigh,
+    ConstituentDiagnosticsOptions, ConstituentSelectionDiagnostics, FitOptions, GreenwichNodalOls,
+    InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections, PhaseReference,
+    ReconstructionFilter, RobustOptions, RobustTermination, RobustWeightFunction,
+    ScalarInferenceOls, ScalarInferenceRelation, ScalarSolution, SolverOptions, TidalConstituent,
+    VectorInferenceOls, VectorInferenceRelation, VectorSolution, select_constituents_by_rayleigh,
 };
 
 #[derive(Clone, Copy)]
@@ -59,6 +59,7 @@ struct FitState {
     phase_reference: String,
     nodal_corrections: String,
     trend: bool,
+    diagnostics: Option<ConstituentSelectionDiagnostics>,
 }
 
 impl Deref for Fit {
@@ -108,6 +109,12 @@ impl Fit {
                 add_robust_summary(py, &output, solution.robust.as_ref())?;
             }
         }
+        add_diagnostics_summary(
+            py,
+            &output,
+            self.diagnostics.as_ref(),
+            &self.presentation_order,
+        )?;
         output.set_item("aux", auxiliary)?;
         Ok(output)
     }
@@ -117,7 +124,12 @@ impl Fit {
     }
 }
 
-#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
+    reason = "PyO3 exposes the UTide-compatible keyword surface directly"
+)]
 #[pyfunction]
 fn solve(
     py: Python<'_>,
@@ -127,6 +139,8 @@ fn solve(
     latitude: f64,
     constituent_names: Option<Vec<String>>,
     rayleigh_min: f64,
+    diagnostics: bool,
+    diagnostic_min_signal_to_noise: f64,
     method_name: &str,
     confidence_name: &str,
     white: bool,
@@ -157,6 +171,8 @@ fn solve(
         latitude,
         constituent_names,
         rayleigh_min,
+        diagnostics,
+        diagnostic_min_signal_to_noise,
         method_name: method_name.to_owned(),
         confidence_name: confidence_name.to_owned(),
         white,
@@ -241,6 +257,8 @@ struct SolveConfig {
     latitude: f64,
     constituent_names: Option<Vec<String>>,
     rayleigh_min: f64,
+    diagnostics: bool,
+    diagnostic_min_signal_to_noise: f64,
     method_name: String,
     confidence_name: String,
     white: bool,
@@ -295,6 +313,11 @@ fn solve_native(
         config.monte_carlo_realizations,
         config.monte_carlo_seed,
     )?;
+    if config.diagnostics && matches!(confidence, Confidence::None) {
+        return Err(
+            "diagnostics=True requires confidence intervals (conf_int='linear' or 'MC')".to_owned(),
+        );
+    }
     let robust_options = parse_method_and_robust(config)?;
     let inference_mode = if config.approximate_inference {
         InferenceMode::Approximate
@@ -395,6 +418,21 @@ fn solve_native(
         &frequencies,
         &solution,
     )?;
+    let diagnostics = if config.diagnostics {
+        let options = ConstituentDiagnosticsOptions::default()
+            .with_rayleigh_minimum(config.rayleigh_min)
+            .with_minimum_signal_to_noise(config.diagnostic_min_signal_to_noise);
+        Some(fit_diagnostics(
+            &model,
+            &solution,
+            &time,
+            &eastward,
+            northward.as_deref(),
+            options,
+        )?)
+    } else {
+        None
+    };
     let mut stored_config = config.clone();
     stored_config.constituent_names = Some(
         constituents
@@ -419,8 +457,37 @@ fn solve_native(
             phase_reference: phase_reference.name().to_owned(),
             nodal_corrections: nodal_corrections.name().to_owned(),
             trend: config.trend,
+            diagnostics,
         }),
     })
+}
+
+fn fit_diagnostics(
+    model: &PreparedModel,
+    solution: &FittedSolution,
+    time_mjd: &[f64],
+    eastward: &[f64],
+    northward: Option<&[f64]>,
+    options: ConstituentDiagnosticsOptions,
+) -> Result<ConstituentSelectionDiagnostics, String> {
+    match (model, solution, northward) {
+        (PreparedModel::Direct(model), FittedSolution::Scalar(solution), None) => {
+            model.diagnose_scalar_solution(eastward, solution, options)
+        }
+        (PreparedModel::Direct(model), FittedSolution::Vector(solution), Some(northward)) => {
+            model.diagnose_vector_solution(eastward, northward, solution, options)
+        }
+        (PreparedModel::ScalarInference(model), FittedSolution::Scalar(solution), None) => {
+            model.diagnose_solution(eastward, solution, options)
+        }
+        (
+            PreparedModel::VectorInference(model),
+            FittedSolution::Vector(solution),
+            Some(northward),
+        ) => model.diagnose_vector_solution(time_mjd, eastward, northward, solution, options),
+        _ => return Err("internal model, solution, and observation type mismatch".to_owned()),
+    }
+    .map_err(|error| error.to_string())
 }
 
 trait ScalarModel {
@@ -1122,6 +1189,128 @@ fn add_robust_summary(
     output.set_item("weights", weights)?;
     output.set_item("robust", summary)?;
     Ok(())
+}
+
+fn add_diagnostics_summary(
+    py: Python<'_>,
+    output: &Bound<'_, PyDict>,
+    diagnostics: Option<&ConstituentSelectionDiagnostics>,
+    order: &[usize],
+) -> PyResult<()> {
+    let Some(diagnostics) = diagnostics else {
+        output.set_item("diagn", py.None())?;
+        output.set_item("diagnostics", py.None())?;
+        return Ok(());
+    };
+    let summary = diagnostics_summary(py, diagnostics, order)?;
+    output.set_item("diagn", &summary)?;
+    output.set_item("diagnostics", summary)?;
+    Ok(())
+}
+
+fn diagnostics_summary<'py>(
+    py: Python<'py>,
+    diagnostics: &ConstituentSelectionDiagnostics,
+    order: &[usize],
+) -> PyResult<Bound<'py, PyDict>> {
+    let summary = PyDict::new(py);
+    let lower = neighbor_diagnostics_summary(py, diagnostics, order, false)?;
+    let higher = neighbor_diagnostics_summary(py, diagnostics, order, true)?;
+    summary.set_item("lo", &lower)?;
+    summary.set_item("lower", lower)?;
+    summary.set_item("hi", &higher)?;
+    summary.set_item("higher", higher)?;
+    summary.set_item("K", diagnostics.whole_model.basis_condition_number)?;
+    summary.set_item(
+        "SNRallc",
+        diagnostics.whole_model.all_constituent_signal_to_noise,
+    )?;
+    summary.set_item(
+        "SNRallc_over_K",
+        diagnostics.whole_model.condition_adjusted_signal_to_noise,
+    )?;
+    summary.set_item("TVraw", diagnostics.tidal_variance.raw_tidal_variance)?;
+    summary.set_item(
+        "TVallc",
+        diagnostics.tidal_variance.all_constituent_tidal_variance,
+    )?;
+    summary.set_item(
+        "TVsnrc",
+        diagnostics
+            .tidal_variance
+            .significant_constituent_tidal_variance,
+    )?;
+    summary.set_item(
+        "PTVallc",
+        diagnostics
+            .tidal_variance
+            .all_constituent_percent_tidal_variance,
+    )?;
+    summary.set_item(
+        "PTVsnrc",
+        diagnostics
+            .tidal_variance
+            .significant_constituent_percent_tidal_variance,
+    )?;
+    summary.set_item("Rayleigh_min", diagnostics.rayleigh_minimum)?;
+    summary.set_item("min_SNR", diagnostics.minimum_signal_to_noise)?;
+    Ok(summary)
+}
+
+fn neighbor_diagnostics_summary<'py>(
+    py: Python<'py>,
+    diagnostics: &ConstituentSelectionDiagnostics,
+    order: &[usize],
+    higher: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let mut displayed_index = vec![-1_i64; diagnostics.constituents.len()];
+    for (index, source) in order.iter().copied().enumerate() {
+        displayed_index[source] = i64::try_from(index).expect("constituent count fits i64");
+    }
+    let mut indices = Vec::with_capacity(order.len());
+    let mut names = Vec::with_capacity(order.len());
+    let mut frequencies = Vec::with_capacity(order.len());
+    let mut rayleigh = Vec::with_capacity(order.len());
+    let mut noise_modified_rayleigh = Vec::with_capacity(order.len());
+    let mut maximum_correlation = Vec::with_capacity(order.len());
+    for source in order.iter().copied() {
+        let independence = &diagnostics.constituents[source];
+        let neighbor = if higher {
+            independence.higher.as_ref()
+        } else {
+            independence.lower.as_ref()
+        };
+        if let Some(neighbor) = neighbor {
+            indices.push(displayed_index[neighbor.index]);
+            names.push(neighbor.name.clone());
+            frequencies.push(neighbor.frequency_cph);
+            rayleigh.push(neighbor.rayleigh_criterion);
+            noise_modified_rayleigh.push(
+                neighbor
+                    .noise_modified_rayleigh_criterion
+                    .unwrap_or(f64::NAN),
+            );
+            maximum_correlation.push(neighbor.maximum_correlation.unwrap_or(f64::NAN));
+        } else {
+            indices.push(-1);
+            names.push(String::new());
+            frequencies.push(f64::NAN);
+            rayleigh.push(f64::NAN);
+            noise_modified_rayleigh.push(f64::NAN);
+            maximum_correlation.push(f64::NAN);
+        }
+    }
+    let summary = PyDict::new(py);
+    summary.set_item("index", indices)?;
+    summary.set_item("name", names)?;
+    summary.set_item("frequency_cph", frequencies)?;
+    summary.set_item("RR", &rayleigh)?;
+    summary.set_item("rayleigh_criterion", rayleigh)?;
+    summary.set_item("RNM", &noise_modified_rayleigh)?;
+    summary.set_item("noise_modified_rayleigh_criterion", noise_modified_rayleigh)?;
+    summary.set_item("CorMx", &maximum_correlation)?;
+    summary.set_item("maximum_correlation", maximum_correlation)?;
+    Ok(summary)
 }
 
 const fn robust_termination_name(termination: RobustTermination) -> &'static str {

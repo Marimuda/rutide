@@ -11,9 +11,10 @@ use numpy::{
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyDict};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use rutide_core::{
-    GreenwichNodalBatch, GreenwichNodalReconstructor, InferenceMode, ReconstructionFilter,
-    RobustOptions, RobustTermination, ScalarInferenceBatch, ScalarSolution, SolverOptions,
-    TidalConstituent, VectorInferenceBatch, VectorSolution, select_constituents_by_rayleigh,
+    ConstituentDiagnosticsOptions, ConstituentSelectionDiagnostics, GreenwichNodalBatch,
+    GreenwichNodalReconstructor, InferenceMode, ReconstructionFilter, RobustOptions,
+    RobustTermination, ScalarInferenceBatch, ScalarSolution, SolverOptions, TidalConstituent,
+    VectorInferenceBatch, VectorSolution, select_constituents_by_rayleigh,
 };
 
 use super::{
@@ -58,6 +59,7 @@ struct BatchFitState {
     phase_reference: String,
     nodal_corrections: String,
     trend: bool,
+    diagnostics: Option<Vec<ConstituentSelectionDiagnostics>>,
     worker_count: usize,
     chunk_series: usize,
     pool: Arc<ThreadPool>,
@@ -85,7 +87,12 @@ impl BatchFit {
 }
 
 /// Fit time-major scalar or vector series through the shared Rust batch kernels.
-#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
+    reason = "PyO3 exposes the UTide-compatible keyword surface directly"
+)]
 #[pyfunction]
 pub(super) fn solve_many(
     py: Python<'_>,
@@ -95,6 +102,8 @@ pub(super) fn solve_many(
     latitudes: PyReadonlyArray1<'_, f64>,
     constituent_names: Option<Vec<String>>,
     rayleigh_min: f64,
+    diagnostics: bool,
+    diagnostic_min_signal_to_noise: f64,
     method_name: &str,
     confidence_name: &str,
     white: bool,
@@ -133,6 +142,8 @@ pub(super) fn solve_many(
         latitude: 0.0,
         constituent_names,
         rayleigh_min,
+        diagnostics,
+        diagnostic_min_signal_to_noise,
         method_name: method_name.to_owned(),
         confidence_name: confidence_name.to_owned(),
         white,
@@ -306,6 +317,11 @@ fn solve_many_native(
         config.monte_carlo_realizations,
         config.monte_carlo_seed,
     )?;
+    if config.diagnostics && matches!(confidence, Confidence::None) {
+        return Err(
+            "diagnostics=True requires confidence intervals (conf_int='linear' or 'MC')".to_owned(),
+        );
+    }
     let robust = parse_method_and_robust(config)?;
     let inference_mode = if config.approximate_inference {
         InferenceMode::Approximate
@@ -447,6 +463,22 @@ fn solve_many_native(
         .collect::<Result<Vec<_>, _>>()?;
     let valid_positions =
         valid_observation_positions(&eastward, northward.as_deref(), time.len(), series_count);
+    let diagnostics = if config.diagnostics {
+        let options = ConstituentDiagnosticsOptions::default()
+            .with_rayleigh_minimum(config.rayleigh_min)
+            .with_minimum_signal_to_noise(config.diagnostic_min_signal_to_noise);
+        Some(pool.install(|| {
+            model.diagnose(
+                &eastward,
+                northward.as_deref(),
+                &latitudes,
+                &solutions,
+                options,
+            )
+        })?)
+    } else {
+        None
+    };
     let mut stored_config = config.clone();
     stored_config.constituent_names = Some(
         constituents
@@ -475,6 +507,7 @@ fn solve_many_native(
             phase_reference: phase_reference.name().to_owned(),
             nodal_corrections: nodal_corrections.name().to_owned(),
             trend: config.trend,
+            diagnostics,
             worker_count,
             chunk_series,
             pool,
@@ -733,6 +766,32 @@ impl PreparedBatchModel {
         }
         .map_err(|error| error.to_string())
     }
+
+    fn diagnose(
+        &self,
+        eastward: &[f64],
+        northward: Option<&[f64]>,
+        latitudes: &[f64],
+        solutions: &BatchSolutions,
+        options: ConstituentDiagnosticsOptions,
+    ) -> Result<Vec<ConstituentSelectionDiagnostics>, String> {
+        match (self, solutions, northward) {
+            (Self::Direct(model), BatchSolutions::Scalar(solutions), None) => {
+                model.diagnose_time_major(eastward, latitudes, solutions, options)
+            }
+            (Self::Direct(model), BatchSolutions::Vector(solutions), Some(northward)) => {
+                model.diagnose_vector_time_major(eastward, northward, latitudes, solutions, options)
+            }
+            (Self::ScalarInference(model), BatchSolutions::Scalar(solutions), None) => {
+                model.diagnose_time_major(eastward, latitudes, solutions, options)
+            }
+            (Self::VectorInference(model), BatchSolutions::Vector(solutions), Some(northward)) => {
+                model.diagnose_vector_time_major(eastward, northward, latitudes, solutions, options)
+            }
+            _ => return Err("internal batch model, solution, and observation mismatch".to_owned()),
+        }
+        .map_err(|error| error.to_string())
+    }
 }
 
 impl BatchSolutions {
@@ -945,8 +1004,220 @@ impl BatchFitState {
             }
         }
         add_robust_summary(py, &output, self)?;
+        add_batch_diagnostics_summary(py, &output, self.diagnostics.as_deref(), constituent_count)?;
         Ok(output)
     }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps the compact MATLAB-compatible diagnostic field mapping together"
+)]
+fn add_batch_diagnostics_summary(
+    py: Python<'_>,
+    output: &Bound<'_, PyDict>,
+    diagnostics: Option<&[ConstituentSelectionDiagnostics]>,
+    constituent_count: usize,
+) -> PyResult<()> {
+    let Some(diagnostics) = diagnostics else {
+        output.set_item("diagn", py.None())?;
+        output.set_item("diagnostics", py.None())?;
+        return Ok(());
+    };
+    let series_count = diagnostics.len();
+    if diagnostics
+        .iter()
+        .any(|value| value.constituents.len() != constituent_count)
+    {
+        return Err(PyValueError::new_err(
+            "internal diagnostic constituent counts are inconsistent",
+        ));
+    }
+    let summary = PyDict::new(py);
+    let lower = batch_neighbor_diagnostics_summary(
+        py,
+        diagnostics,
+        series_count,
+        constituent_count,
+        false,
+    )?;
+    let higher =
+        batch_neighbor_diagnostics_summary(py, diagnostics, series_count, constituent_count, true)?;
+    summary.set_item("lo", &lower)?;
+    summary.set_item("lower", lower)?;
+    summary.set_item("hi", &higher)?;
+    summary.set_item("higher", higher)?;
+    set_diagnostic_vector(
+        py,
+        &summary,
+        "K",
+        diagnostics
+            .iter()
+            .map(|value| value.whole_model.basis_condition_number),
+    )?;
+    set_diagnostic_vector(
+        py,
+        &summary,
+        "SNRallc",
+        diagnostics.iter().map(|value| {
+            value
+                .whole_model
+                .all_constituent_signal_to_noise
+                .unwrap_or(f64::NAN)
+        }),
+    )?;
+    set_diagnostic_vector(
+        py,
+        &summary,
+        "SNRallc_over_K",
+        diagnostics.iter().map(|value| {
+            value
+                .whole_model
+                .condition_adjusted_signal_to_noise
+                .unwrap_or(f64::NAN)
+        }),
+    )?;
+    for (name, values) in [
+        (
+            "TVraw",
+            diagnostics
+                .iter()
+                .map(|value| value.tidal_variance.raw_tidal_variance)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "TVallc",
+            diagnostics
+                .iter()
+                .map(|value| value.tidal_variance.all_constituent_tidal_variance)
+                .collect(),
+        ),
+        (
+            "TVsnrc",
+            diagnostics
+                .iter()
+                .map(|value| {
+                    value
+                        .tidal_variance
+                        .significant_constituent_tidal_variance
+                        .unwrap_or(f64::NAN)
+                })
+                .collect(),
+        ),
+        (
+            "PTVallc",
+            diagnostics
+                .iter()
+                .map(|value| {
+                    value
+                        .tidal_variance
+                        .all_constituent_percent_tidal_variance
+                        .unwrap_or(f64::NAN)
+                })
+                .collect(),
+        ),
+        (
+            "PTVsnrc",
+            diagnostics
+                .iter()
+                .map(|value| {
+                    value
+                        .tidal_variance
+                        .significant_constituent_percent_tidal_variance
+                        .unwrap_or(f64::NAN)
+                })
+                .collect(),
+        ),
+    ] {
+        summary.set_item(name, values.into_pyarray(py))?;
+    }
+    set_diagnostic_vector(
+        py,
+        &summary,
+        "Rayleigh_min",
+        diagnostics.iter().map(|value| value.rayleigh_minimum),
+    )?;
+    set_diagnostic_vector(
+        py,
+        &summary,
+        "min_SNR",
+        diagnostics
+            .iter()
+            .map(|value| value.minimum_signal_to_noise),
+    )?;
+    output.set_item("diagn", &summary)?;
+    output.set_item("diagnostics", summary)?;
+    Ok(())
+}
+
+fn set_diagnostic_vector(
+    py: Python<'_>,
+    output: &Bound<'_, PyDict>,
+    name: &str,
+    values: impl Iterator<Item = f64>,
+) -> PyResult<()> {
+    output.set_item(name, values.collect::<Vec<_>>().into_pyarray(py))
+}
+
+fn batch_neighbor_diagnostics_summary<'py>(
+    py: Python<'py>,
+    diagnostics: &[ConstituentSelectionDiagnostics],
+    series_count: usize,
+    constituent_count: usize,
+    higher: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let mut indices = Vec::with_capacity(series_count * constituent_count);
+    let mut frequencies = Vec::with_capacity(series_count * constituent_count);
+    let mut rayleigh = Vec::with_capacity(series_count * constituent_count);
+    let mut noise_modified_rayleigh = Vec::with_capacity(series_count * constituent_count);
+    let mut maximum_correlation = Vec::with_capacity(series_count * constituent_count);
+    for diagnostic in diagnostics {
+        for independence in &diagnostic.constituents {
+            let neighbor = if higher {
+                independence.higher.as_ref()
+            } else {
+                independence.lower.as_ref()
+            };
+            if let Some(neighbor) = neighbor {
+                indices.push(i64::try_from(neighbor.index).expect("constituent count fits i64"));
+                frequencies.push(neighbor.frequency_cph);
+                rayleigh.push(neighbor.rayleigh_criterion);
+                noise_modified_rayleigh.push(
+                    neighbor
+                        .noise_modified_rayleigh_criterion
+                        .unwrap_or(f64::NAN),
+                );
+                maximum_correlation.push(neighbor.maximum_correlation.unwrap_or(f64::NAN));
+            } else {
+                indices.push(-1);
+                frequencies.push(f64::NAN);
+                rayleigh.push(f64::NAN);
+                noise_modified_rayleigh.push(f64::NAN);
+                maximum_correlation.push(f64::NAN);
+            }
+        }
+    }
+    let summary = PyDict::new(py);
+    summary.set_item(
+        "index",
+        array2(series_count, constituent_count, indices)?.into_pyarray(py),
+    )?;
+    summary.set_item(
+        "frequency_cph",
+        array2(series_count, constituent_count, frequencies)?.into_pyarray(py),
+    )?;
+    let rayleigh = array2(series_count, constituent_count, rayleigh)?.into_pyarray(py);
+    summary.set_item("RR", &rayleigh)?;
+    summary.set_item("rayleigh_criterion", rayleigh)?;
+    let noise_modified_rayleigh =
+        array2(series_count, constituent_count, noise_modified_rayleigh)?.into_pyarray(py);
+    summary.set_item("RNM", &noise_modified_rayleigh)?;
+    summary.set_item("noise_modified_rayleigh_criterion", noise_modified_rayleigh)?;
+    let maximum_correlation =
+        array2(series_count, constituent_count, maximum_correlation)?.into_pyarray(py);
+    summary.set_item("CorMx", &maximum_correlation)?;
+    summary.set_item("maximum_correlation", maximum_correlation)?;
+    Ok(summary)
 }
 
 fn add_scalar_summary(

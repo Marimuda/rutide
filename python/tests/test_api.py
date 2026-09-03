@@ -32,6 +32,64 @@ class BunchTests(unittest.TestCase):
 
 
 class ScalarApiTests(unittest.TestCase):
+    def test_opt_in_identifiability_diagnostics_and_table(self) -> None:
+        time = 60_000.0 + np.arange(24 * 70, dtype=np.float64) / 24.0
+        observations = harmonic(time, M2_CPH, 1.0, 0.2)
+        observations += harmonic(time, S2_CPH, 0.25, -0.1)
+        observations += 0.01 * np.sin(np.arange(time.size) * 0.31)
+        coefficients = rutide.solve(
+            time,
+            observations,
+            lat=60.0,
+            constit=["M2", "S2"],
+            trend=False,
+            phase="raw",
+            nodal=False,
+            diagnostics=True,
+            diagnostic_min_SNR=2.0,
+            white=True,
+            order_constit="frequency",
+            verbose=False,
+        )
+
+        np.testing.assert_array_equal(coefficients.diagn.hi.RR, coefficients.diagnostics.hi.RR)
+        self.assertGreaterEqual(coefficients.diagn.K, 1.0)
+        self.assertEqual(coefficients.diagn.lo.RR.shape, (2,))
+        self.assertEqual(coefficients.diagn.hi.CorMx.shape, (2,))
+        self.assertFalse(coefficients.diagn.hi.CorMx.flags.writeable)
+        self.assertEqual(coefficients.diagn.Rayleigh_min, 1.0)
+        self.assertEqual(coefficients.diagn.min_SNR, 2.0)
+        table = coefficients.diagnostic_table()
+        self.assertIn("SNRallc/K=", table)
+        self.assertIn("PTVsnrc=", table)
+        self.assertIn("M2", table)
+        self.assertIn("S2", table)
+
+        without = rutide.solve(
+            time,
+            observations,
+            lat=60.0,
+            constit=["M2", "S2"],
+            conf_int="none",
+            trend=False,
+            diagnostics=False,
+            verbose=False,
+        )
+        self.assertIsNone(without.diagn)
+        with self.assertRaisesRegex(ValueError, "diagnostics were not requested"):
+            without.diagnostic_table()
+        with self.assertRaisesRegex(ValueError, "requires confidence intervals"):
+            rutide.solve(
+                time,
+                observations,
+                lat=60.0,
+                constit=["M2", "S2"],
+                conf_int="none",
+                trend=False,
+                diagnostics=True,
+                verbose=False,
+            )
+
     def test_scalar_fit_missing_values_aliases_and_reconstruction(self) -> None:
         time = 60_000.0 + np.arange(24 * 70, dtype=np.float64) / 24.0
         observations = 0.35 + harmonic(time, M2_CPH, 1.2, 0.4) + harmonic(time, S2_CPH, 0.3, -0.2)
@@ -293,6 +351,38 @@ class VectorApiTests(unittest.TestCase):
 
 
 class BatchApiTests(unittest.TestCase):
+    def test_opt_in_batch_diagnostics_are_dense_and_gappy(self) -> None:
+        count = 24 * 70
+        time = 60_000.0 + np.arange(count, dtype=np.float64) / 24.0
+        base = harmonic(time, M2_CPH, 1.0, 0.2)
+        base += harmonic(time, S2_CPH, 0.2, -0.1)
+        observations = np.column_stack([base, 0.8 * base])
+        observations[0, 1] = np.nan
+        observations[200:205, 1] = np.nan
+        coefficients = rutide.solve_many(
+            time,
+            observations,
+            lat=[60.0, 61.0],
+            constit=["M2", "S2"],
+            trend=False,
+            phase="raw",
+            nodal=False,
+            diagnostics=True,
+            white=True,
+            workers=2,
+            verbose=False,
+        )
+
+        np.testing.assert_array_equal(coefficients.diagn.hi.RR, coefficients.diagnostics.hi.RR)
+        self.assertEqual(coefficients.diagn.K.shape, (2,))
+        self.assertEqual(coefficients.diagn.lo.RR.shape, (2, 2))
+        self.assertEqual(coefficients.diagn.hi.CorMx.shape, (2, 2))
+        self.assertEqual(coefficients.dims.diagnostics, ("series", "constituent"))
+        self.assertFalse(coefficients.diagn.lo.RR.flags.writeable)
+        self.assertIn("SNRallc/K=", coefficients.diagnostic_table(1))
+        with self.assertRaises(IndexError):
+            coefficients.diagnostic_table(2)
+
     def test_scalar_batch_matches_individual_irregular_colored_fits(self) -> None:
         count = 1_200
         series_count = 4
@@ -520,6 +610,85 @@ class BatchApiTests(unittest.TestCase):
 
 
 class PersistenceTests(unittest.TestCase):
+    def test_schema_two_preserves_single_and_dense_batch_diagnostics(self) -> None:
+        count = 24 * 70
+        time = 60_300.0 + np.arange(count, dtype=np.float64) / 24.0
+        base = harmonic(time, M2_CPH, 1.0, 0.2)
+        base += harmonic(time, S2_CPH, 0.2, -0.1)
+        single = rutide.solve(
+            time,
+            base,
+            lat=60.0,
+            constit=["M2", "S2"],
+            trend=False,
+            diagnostics=True,
+            white=True,
+            verbose=False,
+        )
+        values = np.column_stack([base, 0.8 * base])
+        values[0, 1] = np.nan
+        batch = rutide.solve_many(
+            time,
+            values,
+            lat=[60.0, 61.0],
+            constit=["M2", "S2"],
+            trend=False,
+            diagnostics=True,
+            white=True,
+            workers=2,
+            verbose=False,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            for name, coefficients in [("single", single), ("batch", batch)]:
+                path = coefficients.save(directory / f"{name}.npz")
+                restored = rutide.load(path, workers=1) if name == "batch" else rutide.load(path)
+                for field in ("K", "SNRallc", "TVraw", "TVallc", "PTVallc"):
+                    np.testing.assert_array_equal(
+                        np.asarray(coefficients.diagn[field]),
+                        np.asarray(restored.diagn[field]),
+                    )
+                for side in ("lo", "hi"):
+                    for field in ("index", "RR", "RNM", "CorMx"):
+                        np.testing.assert_array_equal(
+                            np.asarray(coefficients.diagn[side][field]),
+                            np.asarray(restored.diagn[side][field]),
+                        )
+
+    def test_schema_one_archive_remains_readable_without_new_diagnostics(self) -> None:
+        time = 60_300.0 + np.arange(900, dtype=np.float64) / 24.0
+        coefficients = rutide.solve(
+            time,
+            harmonic(time, M2_CPH, 1.0, 0.2),
+            lat=60.0,
+            constit=["M2"],
+            trend=False,
+            diagnostics=False,
+            verbose=False,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = coefficients.save(Path(directory) / "schema-two.npz")
+            with np.load(path, allow_pickle=False) as archive:
+                arrays = {name: archive[name] for name in archive.files}
+            metadata_name = "__rutide_metadata__"
+            document = json.loads(arrays[metadata_name].tobytes().decode("utf-8"))
+            snapshot = document["snapshot"]
+            snapshot["schema_version"] = 1
+            snapshot["rutide_version"] = "0.2.0"
+            snapshot.pop("diagnostics")
+            snapshot["config"].pop("diagnostics")
+            snapshot["config"].pop("diagnostic_min_signal_to_noise")
+            arrays[metadata_name] = np.frombuffer(
+                json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+                dtype=np.uint8,
+            )
+            legacy = Path(directory) / "schema-one.npz"
+            np.savez(legacy, **arrays)
+            restored = rutide.load(legacy)
+            self.assertIsNone(restored.diagn)
+            np.testing.assert_array_equal(coefficients.A, restored.A)
+
     def test_scalar_robust_inference_round_trip_preserves_results(self) -> None:
         count = 1_300
         time = 60_300.0 + np.arange(count) / 24.0

@@ -136,6 +136,8 @@ one native chunk. Both fitting and reconstruction release the GIL.
 | `robust_kw` | Weight function/name plus `tune`, `tol`, and `maxit`, or their descriptive aliases |
 | `infer` | UTide-shaped inferred/reference names, amplitude ratios, phase offsets, and optional `approximate` |
 | `MC_n`, `MC_seed` | Effective realization count and deterministic root seed |
+| `diagnostics` | Opt in to Codiga's extended constituent-identifiability suite; requires confidence/SNR |
+| `diagnostic_min_SNR` | Inclusive SNR threshold for the diagnostic significant-subset reconstruction; default `2.0` |
 
 Automatic constituent selection and confidence estimation use only retained
 rows. NumPy/NetCDF4 masked arrays are normalized to NaN. NaN observations and
@@ -146,6 +148,34 @@ of being silently adjusted.
 
 Irregular colored confidence uses the implemented Lomb–Scargle path. It is not
 silently approximated with an FFT.
+
+### Constituent identifiability
+
+Set `diagnostics=True` on `solve` or `solve_many` to evaluate RR, RNM, Corrmax,
+whole-model `K` and `SNRallc`, and raw/all/significant tidal variance. The result
+is available through both `coef.diagn` and `coef.diagnostics`; the short fields
+follow MATLAB UTide where practical:
+
+```python
+coef = solve(
+    time_mjd,
+    height,
+    lat=62.0,
+    constit=["M2", "S2", "N2", "K1", "O1"],
+    diagnostics=True,
+)
+
+print(coef.diagn.lo.RR, coef.diagn.hi.RNM, coef.diagn.hi.CorMx)
+print(coef.diagn.K, coef.diagn.SNRallc, coef.diagn.SNRallc_over_K)
+print(coef.diagn.TVraw, coef.diagn.PTVallc, coef.diagn.PTVsnrc)
+print(coef.diagnostic_table())
+```
+
+Missing neighbors use index `-1` and NaN metrics. Single-fit diagnostic vectors
+follow the requested presentation order; dense batch fields have shape
+`(series, constituent)` on the stable coefficient axis. Use
+`batch.diagnostic_table(series)` for a readable one-series table. Diagnostics
+are opt-in so ordinary solve performance and memory remain unchanged.
 
 ### Inference
 
@@ -205,19 +235,21 @@ tide = rutide.reconstruct_many(target_time, restored)
 
 `rutide.save(coef, path)` is the equivalent function form. It writes atomically
 and uses compressed NPZ by default; pass `compressed=False` when write speed is
-more important than storage. The archive is pickle-free and stores schema-1
-JSON metadata plus typed NumPy arrays. Arrays are coalesced into bounded typed
+more important than storage. The archive is pickle-free and stores a schema-1
+container with a schema-2 native coefficient snapshot plus typed NumPy arrays.
+Arrays are coalesced into bounded typed
 blobs instead of creating one ZIP entry for every field of every batch member;
 loading exposes validated zero-copy views of those blobs to the native restore
 path. It contains the normalized retained
 timestamps, fitted solution, uncertainty and robust diagnostics, constituent
-selection, inference graph, and every option needed to rebuild the immutable
-native reconstruction model. Original observation values are deliberately not
-stored.
+selection, optional identifiability diagnostics, inference graph, and every
+option needed to rebuild the immutable native reconstruction model. Dense batch
+diagnostics use a fixed set of flattened typed arrays rather than per-series
+metadata. Original observation values are deliberately not stored.
 
-RUTide `0.2.x` loads both the original per-array and packed-blob schema-1
-archives written by another `0.2.x` release and
-rejects incompatible release lines or unknown schemas rather than guessing.
+RUTide `0.3.x` writes native snapshot schema 2 and continues to load the
+per-array and packed-blob schema-1 snapshots written by `0.2.x`; legacy fits
+restore with `diagn=None`. Unknown schemas are rejected rather than guessed.
 Loading a batch recreates its dedicated native worker pool; `workers=` may
 override the saved worker count for the current machine. A loaded object has the
 same read-only arrays and reconstruction behavior as the original object.

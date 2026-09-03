@@ -65,6 +65,13 @@ diagnostic model still uses its own retained timestamps, midpoint, astronomical
 terms, and covariance; an exact time-axis fingerprint guards the coupled-vector
 interface against a solution/model mismatch.
 
+Python callers opt in with `diagnostics=True` on `rutide.solve` or
+`rutide.solve_many`. Results are exposed as `coef.diagn` / `coef.diagnostics`,
+with MATLAB-style `lo.RR`, `hi.RNM`, `hi.CorMx`, `K`, `SNRallc`, `TVraw`, and
+`PTVsnrc` names plus descriptive aliases for neighbor fields. Single and batch
+coefficient objects provide `diagnostic_table()` presentation; batch numeric
+fields remain dense on the stable `(series, constituent)` axis.
+
 `K` does not refactor or copy the tall basis. RUTide applies the complex-basis
 normalization to the prepared pivoted QR's small triangular factor and caches
 its singular-value ratio. Unweighted coefficient normal inverses are likewise
@@ -95,9 +102,10 @@ record.
    done for the real scalar/vector basis.
 3. Scalar/vector ordinary and scalar/coupled-vector inference OLS/robust
    integration, including batch and missing-value orchestration — done.
-4. Structured Rust and Python results plus compact human-readable presentation.
+4. Structured Rust and Python results plus compact human-readable presentation
+   — done.
 5. Scalar NetCDF schema 17, vector schema 15, and backward-readable Python
-   coefficient snapshot schema 2.
+   coefficient snapshot schema 2 — Python snapshot done; NetCDF remains.
 6. MATLAB-derived oracle fixtures and measured whole-field overhead before the
    new diagnostics become a default application profile.
 
