@@ -864,6 +864,8 @@ pub struct RunReport {
     pub input_file_bytes: u64,
     /// Logical payload bytes requested from the four input variables.
     pub logical_input_bytes: u64,
+    /// Physical units declared by the source `zeta` variable, when present.
+    pub source_units: Option<String>,
     /// Output coefficient path.
     pub output_path: String,
     /// Completed output file size.
@@ -1059,6 +1061,7 @@ struct InputData {
     observation_counts: Vec<usize>,
     input_file_bytes: u64,
     logical_input_bytes: u64,
+    source_units: Option<String>,
 }
 
 struct ScalarInputMetadata {
@@ -1071,6 +1074,7 @@ struct ScalarInputMetadata {
     zeta_fill: Option<f32>,
     input_file_bytes: u64,
     logical_input_bytes: u64,
+    source_units: Option<String>,
 }
 
 struct ScalarInputChunk {
@@ -1638,6 +1642,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         observation_counts,
         input_file_bytes: metadata.input_file_bytes,
         logical_input_bytes: metadata.logical_input_bytes,
+        source_units: metadata.source_units,
     };
 
     let result_start = Instant::now();
@@ -1651,6 +1656,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
     let result_sha256 = result_digest(
         &input.node_indices,
         &input.latitudes,
+        input.source_units.as_deref(),
         batch.constituents(),
         &series_frequency_cph,
         &solutions,
@@ -1689,6 +1695,9 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         &config.output,
         config.overwrite,
         &OutputData {
+            source_path: &config.input,
+            source_file_bytes: input.input_file_bytes,
+            source_units: input.source_units.as_deref(),
             node_indices: &input.node_indices,
             source_time_count: input.source_time_count,
             discarded_timestamp_count: input.discarded_timestamp_count,
@@ -1745,6 +1754,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         input_path: config.input.to_string_lossy().into_owned(),
         input_file_bytes: input.input_file_bytes,
         logical_input_bytes: input.logical_input_bytes,
+        source_units: input.source_units.clone(),
         output_path: config.output.to_string_lossy().into_owned(),
         output_file_bytes,
         time_count: input.modified_julian_days.len(),
@@ -2388,6 +2398,7 @@ fn read_fvcom_scalar(path: &Path, selection: &NodeSelection) -> Result<InputData
         observation_counts: chunk.observation_counts,
         input_file_bytes: metadata.input_file_bytes,
         logical_input_bytes: metadata.logical_input_bytes,
+        source_units: metadata.source_units,
     })
 }
 
@@ -2414,6 +2425,7 @@ fn read_fvcom_scalar_metadata(
         &[("time", time_count), ("node", node_count)],
     )?;
     let zeta_fill = zeta_variable.fill_value::<f32>()?;
+    let source_units = optional_units(&zeta_variable)?;
 
     let latitude_values = read_selected_1d(&latitude_variable, &node_indices)?;
 
@@ -2456,6 +2468,7 @@ fn read_fvcom_scalar_metadata(
         zeta_fill,
         input_file_bytes,
         logical_input_bytes,
+        source_units,
     })
 }
 
@@ -2665,6 +2678,30 @@ fn required_variable<'dataset>(
         .ok_or_else(|| AppError::Invalid(format!("source NetCDF is missing variable {name:?}")))
 }
 
+fn optional_units(variable: &Variable<'_>) -> Result<Option<String>, AppError> {
+    let Some(attribute) = variable.attribute("units") else {
+        return Ok(None);
+    };
+    let value = match attribute.value()? {
+        netcdf::AttributeValue::Str(value) => value,
+        netcdf::AttributeValue::Strs(mut values) if values.len() == 1 => values.remove(0),
+        _ => {
+            return Err(AppError::Invalid(format!(
+                "source variable {:?} has a non-text units attribute",
+                variable.name()
+            )));
+        }
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(AppError::Invalid(format!(
+            "source variable {:?} has an empty units attribute",
+            variable.name()
+        )));
+    }
+    Ok(Some(value.to_owned()))
+}
+
 fn validate_dimensions(
     variable: &Variable<'_>,
     expected: &[(&str, usize)],
@@ -2815,6 +2852,7 @@ fn update_prefilter_digest(digest: &mut Sha256, correction: Option<&PreFilterCor
 fn result_digest(
     node_indices: &[usize],
     latitudes: &[f64],
+    source_units: Option<&str>,
     constituents: &[Constituent],
     series_frequency_cph: &[Vec<f64>],
     solutions: &[ScalarSolution],
@@ -2833,6 +2871,11 @@ fn result_digest(
 ) -> Result<String, AppError> {
     let mut digest = Sha256::new();
     digest.update(b"rutide-scalar-sampling-v15\0");
+    digest.update([u8::from(source_units.is_some())]);
+    if let Some(units) = source_units {
+        digest.update(units.as_bytes());
+        digest.update([0]);
+    }
     digest.update([u8::from(fit_options.trend)]);
     digest.update(phase_reference.name().as_bytes());
     digest.update([0]);
@@ -3201,6 +3244,9 @@ fn retained_samples(
 }
 
 struct OutputData<'data> {
+    source_path: &'data Path,
+    source_file_bytes: u64,
+    source_units: Option<&'data str>,
     node_indices: &'data [usize],
     source_time_count: usize,
     discarded_timestamp_count: usize,
@@ -3251,6 +3297,9 @@ fn write_output(path: &Path, overwrite: bool, data: &OutputData<'_>) -> Result<(
 )]
 fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError> {
     let OutputData {
+        source_path,
+        source_file_bytes,
+        source_units,
         node_indices,
         source_time_count,
         discarded_timestamp_count,
@@ -3280,6 +3329,8 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         reconstruction,
     } = *data;
     let mut output = netcdf::create(path)?;
+    let value_units = source_units.unwrap_or("source variable units");
+    let variance_units = format!("{value_units} squared");
     output.add_dimension("series", node_indices.len())?;
     output.add_dimension("constituent", constituents.len())?;
     output.add_dimension("presentation_rank", constituents.len())?;
@@ -3293,6 +3344,12 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         i64::from(SCALAR_OUTPUT_SCHEMA_VERSION),
     )?;
     output.add_attribute("rutide_version", rutide_core::VERSION)?;
+    output.add_attribute("source_path", source_path.to_string_lossy().as_ref())?;
+    output.add_attribute("source_file_bytes", source_file_bytes)?;
+    output.add_attribute("source_scalar_variable", "zeta")?;
+    if let Some(units) = source_units {
+        output.add_attribute("source_variable_units", units)?;
+    }
     output.add_attribute(
         "source_time_count",
         i64::try_from(source_time_count)
@@ -3473,7 +3530,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         constituents.len(),
         constituent_diagnostics,
         &["series"],
-        "source variable units squared",
+        &variance_units,
     )?;
 
     write_solution_variables(
@@ -3482,6 +3539,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         solutions,
         analysis_method,
         confidence_interval,
+        value_units,
     )?;
     if let Some((filter, values)) = reconstruction {
         write_reconstruction_variables(
@@ -3490,6 +3548,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
             node_indices.len(),
             filter,
             values,
+            value_units,
         )?;
     }
     output.close()?;
@@ -3931,6 +3990,7 @@ fn write_reconstruction_variables(
     series_count: usize,
     filter: &ReconstructionFilter,
     values: &[Vec<f64>],
+    value_units: &str,
 ) -> Result<(), AppError> {
     if values.len() != series_count
         || values
@@ -3958,7 +4018,7 @@ fn write_reconstruction_variables(
         "days since 1858-11-17 00:00:00 UTC",
     )?;
     let mut reconstruction = output.add_variable::<f64>("reconstruction", &["time", "series"])?;
-    reconstruction.put_attribute("units", "source variable units")?;
+    reconstruction.put_attribute("units", value_units)?;
     reconstruction.put_attribute("long_name", "reconstructed scalar tidal signal")?;
     for (series, series_values) in values.iter().enumerate() {
         reconstruction.put_values(series_values, (.., series))?;
@@ -3972,6 +4032,7 @@ fn write_solution_variables(
     solutions: &[ScalarSolution],
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
+    value_units: &str,
 ) -> Result<(), AppError> {
     let mut amplitude = Vec::with_capacity(solutions.len() * constituents.len());
     let mut phase = Vec::with_capacity(solutions.len() * constituents.len());
@@ -3998,7 +4059,7 @@ fn write_solution_variables(
     write_variable(
         &mut output.add_variable::<f64>("amplitude", &["series", "constituent"])?,
         &amplitude,
-        "source variable units",
+        value_units,
     )?;
     write_variable(
         &mut output.add_variable::<f64>("phase", &["series", "constituent"])?,
@@ -4014,7 +4075,7 @@ fn write_solution_variables(
         write_variable(
             &mut output.add_variable::<f64>("amplitude_ci", &["series", "constituent"])?,
             &amplitude_ci,
-            "source variable units",
+            value_units,
         )?;
         write_variable(
             &mut output.add_variable::<f64>("phase_ci", &["series", "constituent"])?,
@@ -4030,14 +4091,14 @@ fn write_solution_variables(
     write_variable(
         &mut output.add_variable::<f64>("mean", &["series"])?,
         &mean,
-        "source variable units",
+        value_units,
     )?;
     write_variable(
         &mut output.add_variable::<f64>("slope", &["series"])?,
         &slope,
-        "source variable units per day",
+        &format!("{value_units} per day"),
     )?;
-    write_robust_variables(output, solutions, analysis_method)?;
+    write_robust_variables(output, solutions, analysis_method, value_units)?;
     Ok(())
 }
 
@@ -4045,6 +4106,7 @@ fn write_robust_variables(
     output: &mut FileMut,
     solutions: &[ScalarSolution],
     analysis_method: AnalysisMethod,
+    value_units: &str,
 ) -> Result<(), AppError> {
     if analysis_method == AnalysisMethod::Ols {
         if solutions.iter().any(|solution| solution.robust.is_some()) {
@@ -4110,21 +4172,9 @@ fn write_robust_variables(
     }
     write_robust_schema_metadata(output, &termination, &["series"])?;
     for (name, values, units) in [
-        (
-            "robust_residual_scale",
-            &residual_scale,
-            "source variable units",
-        ),
-        (
-            "robust_ols_rms_residual",
-            &ols_rms_residual,
-            "source variable units",
-        ),
-        (
-            "robust_rms_residual",
-            &rms_residual,
-            "source variable units",
-        ),
+        ("robust_residual_scale", &residual_scale, value_units),
+        ("robust_ols_rms_residual", &ols_rms_residual, value_units),
+        ("robust_rms_residual", &rms_residual, value_units),
     ] {
         write_variable(
             &mut output.add_variable::<f64>(name, &["series"])?,
@@ -4454,6 +4504,7 @@ mod tests {
             "inference",
             "nodal_corrections",
             "phase_reference",
+            "prefilter",
             "reconstruction",
             "robust_weight",
             "sampling",
@@ -4489,6 +4540,10 @@ mod tests {
         assert_eq!(
             axis_values["nodal_corrections"],
             ["disabled", "exact", "linear-time"].into_iter().collect()
+        );
+        assert_eq!(
+            axis_values["prefilter"],
+            ["none", "real"].into_iter().collect()
         );
         let mut robust_weights = [
             RobustWeightFunction::Andrews,
@@ -4808,11 +4863,11 @@ mod tests {
             3.25_f32,
             4.5_f32,
         ];
-        dataset
+        let mut zeta = dataset
             .add_variable::<f32>("zeta", &["time", "node"])
-            .expect("add zeta")
-            .put_values(&observations, ..)
-            .expect("write zeta");
+            .expect("add zeta");
+        zeta.put_attribute("units", "m").expect("write units");
+        zeta.put_values(&observations, ..).expect("write zeta");
         dataset.close().expect("close test NetCDF");
 
         let input = read_fvcom_scalar(&path, &NodeSelection::Indices(vec![1, 0]))
@@ -4838,6 +4893,7 @@ mod tests {
             ]
         );
         assert_eq!(input.logical_input_bytes, 56);
+        assert_eq!(input.source_units.as_deref(), Some("m"));
         assert_eq!(input.observation_counts, [2, 2]);
         fs::remove_file(path).expect("remove test NetCDF");
     }
@@ -5020,6 +5076,7 @@ mod tests {
             2,
             &ReconstructionFilter::Constituents(vec![TidalConstituent::K1, TidalConstituent::M2]),
             &[vec![1.0, 2.0], vec![3.0, 4.0]],
+            "m",
         )
         .expect("write valid reconstruction");
         dataset.close().expect("close test NetCDF");
@@ -5040,6 +5097,16 @@ mod tests {
                 .value()
                 .expect("read constituent metadata"),
             netcdf::AttributeValue::Str("K1,M2".to_owned())
+        );
+        assert_eq!(
+            dataset
+                .variable("reconstruction")
+                .expect("reconstruction variable")
+                .attribute("units")
+                .expect("reconstruction units")
+                .value()
+                .expect("read reconstruction units"),
+            netcdf::AttributeValue::Str("m".to_owned())
         );
         drop(dataset);
         fs::remove_file(path).expect("remove test NetCDF");

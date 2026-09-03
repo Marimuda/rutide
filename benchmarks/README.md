@@ -61,8 +61,12 @@ three-dimensional native-layer currents. Classic-NetCDF current variables are
 read as bounded contiguous time slabs before sparse columns are retained; this
 avoids millions of scalar-shaped reads across record storage. Raw external data
 remain outside Git; the report retains provenance, source identity, separate
-input/solve/reconstruction timings, result digests, and a bitwise persistence/
-reconstruction check.
+input/solve/reconstruction timings, sampling and missing-data summaries,
+constituent-selection diagnostics, result digests, and a bitwise persistence/
+reconstruction check. Eastward/northward source units must be present and equal.
+A representative unity pre-filter correction must also reproduce coefficients
+and diagnostics bit-for-bit, preventing the optional correction path from
+silently changing unfiltered analyses.
 
 Benchmark the native FVCOM read/solve pipeline against the same-width sequential
 vector control with separate complete processes. Automatic mode sizes both live

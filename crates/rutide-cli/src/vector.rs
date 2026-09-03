@@ -31,7 +31,7 @@ use super::{
     SamplingSummary, SeriesSamplingDiagnostics, SpectralBandSummary, StageTimings,
     VectorInferenceConfig, constituent_order_indices, define_constituent_diagnostic_variables,
     diagnose_sampling, diagnostic_neighbor_value, diagnostic_scalar_value, encode_hex,
-    nodal_profile_component, normalize_source_observation, order_profile_suffix,
+    nodal_profile_component, normalize_source_observation, optional_units, order_profile_suffix,
     read_fvcom_time_axis, read_selected_1d, read_selected_time_major, reconstruction_report,
     required_dimension_length, required_variable, resolve_constituent_selection,
     retain_time_major_rows, robust_termination_code, spatial_chunk_plan, summarize_sampling,
@@ -180,6 +180,8 @@ pub struct VectorRunReport {
     pub input_file_bytes: u64,
     /// Logical payload bytes represented by the selected input coordinates.
     pub logical_input_bytes: u64,
+    /// Shared physical units declared by both source velocity components.
+    pub source_velocity_units: Option<String>,
     /// Output coefficient path.
     pub output_path: String,
     /// Completed output file size.
@@ -291,6 +293,7 @@ struct VectorInputData {
     observation_counts: Vec<usize>,
     input_file_bytes: u64,
     logical_input_bytes: u64,
+    source_velocity_units: Option<String>,
 }
 
 struct VectorInputMetadata {
@@ -307,6 +310,7 @@ struct VectorInputMetadata {
     northward_fill: Option<f32>,
     input_file_bytes: u64,
     logical_input_bytes: u64,
+    source_velocity_units: Option<String>,
 }
 
 struct FixedDepthSource {
@@ -998,6 +1002,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         },
         input_file_bytes: metadata.input_file_bytes,
         logical_input_bytes: metadata.logical_input_bytes,
+        source_velocity_units: metadata.source_velocity_units.clone(),
     };
     let incremental_results = input.is_depth_resolved();
     let mut solutions = if incremental_results {
@@ -1045,6 +1050,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         Some(IncrementalVectorOutput::create(
             &config.output,
             &VectorOutputDefinition {
+                source_path: &config.input,
                 input: &input,
                 constituents: batch.constituents(),
                 constituent_order: &config.constituent_order,
@@ -1442,6 +1448,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             &config.output,
             config.overwrite,
             &VectorOutputData {
+                source_path: &config.input,
                 input: &input,
                 constituents: batch.constituents(),
                 series_frequency_cph: &series_frequency_cph,
@@ -1502,6 +1509,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         input_path: config.input.to_string_lossy().into_owned(),
         input_file_bytes: input.input_file_bytes,
         logical_input_bytes: input.logical_input_bytes,
+        source_velocity_units: input.source_velocity_units.clone(),
         output_path: config.output.to_string_lossy().into_owned(),
         output_file_bytes,
         result_output: if incremental_results {
@@ -2160,7 +2168,26 @@ fn read_fvcom_vector(path: &Path, selection: &NodeSelection) -> Result<VectorInp
         observation_counts: chunk.observation_counts,
         input_file_bytes: metadata.input_file_bytes,
         logical_input_bytes: metadata.logical_input_bytes,
+        source_velocity_units: metadata.source_velocity_units,
     })
+}
+
+fn matching_velocity_units(
+    eastward_name: &str,
+    eastward_units: Option<String>,
+    northward_name: &str,
+    northward_units: Option<String>,
+) -> Result<Option<String>, AppError> {
+    match (eastward_units, northward_units) {
+        (None, None) => Ok(None),
+        (Some(eastward), Some(northward)) if eastward == northward => Ok(Some(eastward)),
+        (Some(eastward), Some(northward)) => Err(AppError::Invalid(format!(
+            "source velocity units differ: {eastward_name}={eastward:?}, {northward_name}={northward:?}"
+        ))),
+        _ => Err(AppError::Invalid(format!(
+            "source velocity units must be present on both {eastward_name} and {northward_name}, or on neither"
+        ))),
+    }
 }
 
 #[allow(
@@ -2225,6 +2252,14 @@ fn read_fvcom_vector_metadata(
     )?;
     let eastward_fill = eastward_variable.fill_value::<f32>()?;
     let northward_fill = northward_variable.fill_value::<f32>()?;
+    let eastward_units = optional_units(&eastward_variable)?;
+    let northward_units = optional_units(&northward_variable)?;
+    let source_velocity_units = matching_velocity_units(
+        eastward_name,
+        eastward_units,
+        northward_name,
+        northward_units,
+    )?;
 
     let latitude_values = read_selected_1d(&latitude_variable, &element_indices)?;
 
@@ -2418,6 +2453,7 @@ fn read_fvcom_vector_metadata(
         northward_fill,
         input_file_bytes,
         logical_input_bytes,
+        source_velocity_units,
     })
 }
 
@@ -3420,6 +3456,11 @@ fn vector_result_digest(
     } else {
         digest.update(b"rutide-vector-sampling-v11\0");
     }
+    digest.update([u8::from(input.source_velocity_units.is_some())]);
+    if let Some(units) = &input.source_velocity_units {
+        digest.update(units.as_bytes());
+        digest.update([0]);
+    }
     digest.update([u8::from(fit_options.trend)]);
     digest.update(phase_reference.name().as_bytes());
     digest.update([0]);
@@ -3682,6 +3723,11 @@ fn vector_result_digest_from_incremental_output(
         digest.update(b"rutide-vector-fixed-depth-v14\0");
     } else {
         digest.update(b"rutide-vector-sampling-v13\0");
+    }
+    digest.update([u8::from(input.source_velocity_units.is_some())]);
+    if let Some(units) = &input.source_velocity_units {
+        digest.update(units.as_bytes());
+        digest.update([0]);
     }
     digest.update([u8::from(fit_options.trend)]);
     digest.update(phase_reference.name().as_bytes());
@@ -4423,6 +4469,7 @@ fn extend_retained_vector_samples(
 }
 
 struct VectorOutputData<'data> {
+    source_path: &'data Path,
     input: &'data VectorInputData,
     constituents: &'data [Constituent],
     series_frequency_cph: &'data [Vec<f64>],
@@ -4448,6 +4495,7 @@ struct VectorOutputData<'data> {
 }
 
 struct VectorOutputDefinition<'data> {
+    source_path: &'data Path,
     input: &'data VectorInputData,
     constituents: &'data [Constituent],
     constituent_order: &'data ConstituentOrder,
@@ -4510,6 +4558,11 @@ fn create_vector_output_base(
         i64::from(VECTOR_OUTPUT_SCHEMA_VERSION),
     )?;
     output.add_attribute("rutide_version", rutide_core::VERSION)?;
+    output.add_attribute("source_path", data.source_path.to_string_lossy().as_ref())?;
+    output.add_attribute("source_file_bytes", input.input_file_bytes)?;
+    if let Some(units) = &input.source_velocity_units {
+        output.add_attribute("source_velocity_units", units.as_str())?;
+    }
     output.add_attribute("result_output", data.result_output)?;
     output.add_attribute(
         "source_time_count",
@@ -4837,6 +4890,13 @@ fn define_incremental_vector_variables(
 ) -> Result<(), AppError> {
     let series_dimensions = data.input.series_dimensions();
     let solution_dimensions = data.input.solution_dimensions();
+    let velocity_units = data
+        .input
+        .source_velocity_units
+        .as_deref()
+        .unwrap_or("source velocity units");
+    let velocity_variance_units = format!("{velocity_units} squared");
+    let velocity_slope_units = format!("{velocity_units} per day");
     add_variable_with_units::<i64>(output, "observation_count", series_dimensions, "1")?;
     let mut status = output.add_variable::<i64>("analysis_status", series_dimensions)?;
     status.put_attribute("units", "1")?;
@@ -4899,27 +4959,27 @@ fn define_incremental_vector_variables(
         define_constituent_diagnostic_variables(
             output,
             series_dimensions,
-            "source velocity units squared",
+            &velocity_variance_units,
         )?;
     }
 
     for (name, units) in [
-        ("semi_major", "source velocity units"),
-        ("semi_minor", "source velocity units"),
+        ("semi_major", velocity_units),
+        ("semi_minor", velocity_units),
         ("inclination", "degrees"),
         ("phase", "degrees"),
-        ("eastward_cosine_coefficient", "source velocity units"),
-        ("eastward_sine_coefficient", "source velocity units"),
-        ("northward_cosine_coefficient", "source velocity units"),
-        ("northward_sine_coefficient", "source velocity units"),
+        ("eastward_cosine_coefficient", velocity_units),
+        ("eastward_sine_coefficient", velocity_units),
+        ("northward_cosine_coefficient", velocity_units),
+        ("northward_sine_coefficient", velocity_units),
         ("percent_energy", "percent"),
     ] {
         add_variable_with_units::<f64>(output, name, &solution_dimensions, units)?;
     }
     if data.confidence_interval != ConfidenceInterval::None {
         for (name, units) in [
-            ("semi_major_ci", "source velocity units"),
-            ("semi_minor_ci", "source velocity units"),
+            ("semi_major_ci", velocity_units),
+            ("semi_minor_ci", velocity_units),
             ("inclination_ci", "degrees"),
             ("phase_ci", "degrees"),
             ("signal_to_noise", "1"),
@@ -4928,10 +4988,10 @@ fn define_incremental_vector_variables(
         }
     }
     for (name, units) in [
-        ("eastward_mean", "source velocity units"),
-        ("northward_mean", "source velocity units"),
-        ("eastward_slope", "source velocity units per day"),
-        ("northward_slope", "source velocity units per day"),
+        ("eastward_mean", velocity_units),
+        ("northward_mean", velocity_units),
+        ("eastward_slope", velocity_slope_units.as_str()),
+        ("northward_slope", velocity_slope_units.as_str()),
     ] {
         add_variable_with_units::<f64>(output, name, series_dimensions, units)?;
     }
@@ -4961,12 +5021,7 @@ fn define_incremental_vector_variables(
             "robust_ols_rms_residual",
             "robust_rms_residual",
         ] {
-            add_variable_with_units::<f64>(
-                output,
-                name,
-                series_dimensions,
-                "source velocity units",
-            )?;
+            add_variable_with_units::<f64>(output, name, series_dimensions, velocity_units)?;
         }
         for name in ["robust_weight", "robust_leverage"] {
             add_variable_with_units::<f64>(output, name, &["robust_observation"], "1")?;
@@ -5000,7 +5055,7 @@ fn define_incremental_vector_variables(
                 output,
                 name,
                 &["time", vertical_dimension, "element"],
-                "source velocity units",
+                velocity_units,
             )?;
         }
     }
@@ -5728,9 +5783,15 @@ fn write_vector_output(
 )]
 fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<(), AppError> {
     let input = data.input;
+    let velocity_units = input
+        .source_velocity_units
+        .as_deref()
+        .unwrap_or("source velocity units");
+    let velocity_variance_units = format!("{velocity_units} squared");
     let mut output = create_vector_output_base(
         path,
         &VectorOutputDefinition {
+            source_path: data.source_path,
             input,
             constituents: data.constituents,
             constituent_order: data.constituent_order,
@@ -5824,7 +5885,7 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
         data.constituents.len(),
         data.constituent_diagnostics,
         input.series_dimensions(),
-        "source velocity units squared",
+        &velocity_variance_units,
     )?;
     write_vector_solution_variables(
         &mut output,
@@ -5833,6 +5894,7 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
         data.analysis_method,
         data.confidence_interval,
         input.series_dimensions(),
+        velocity_units,
     )?;
     if let Some((filter, values)) = data.reconstruction {
         write_vector_reconstruction_variables(&mut output, input, filter, values)?;
@@ -5852,6 +5914,7 @@ fn write_vector_solution_variables(
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     series_dimensions: &[&str],
+    velocity_units: &str,
 ) -> Result<(), AppError> {
     let capacity = solutions.len() * constituent_count;
     let mut semi_major = Vec::with_capacity(capacity);
@@ -5891,8 +5954,8 @@ fn write_vector_solution_variables(
         northward_slope.push(solution.northward_slope_per_day);
     }
     for (name, values, units) in [
-        ("semi_major", &semi_major, "source velocity units"),
-        ("semi_minor", &semi_minor, "source velocity units"),
+        ("semi_major", &semi_major, velocity_units),
+        ("semi_minor", &semi_minor, velocity_units),
         ("inclination", &inclination, "degrees"),
         ("phase", &phase, "degrees"),
         ("percent_energy", &percent_energy, "percent"),
@@ -5917,13 +5980,13 @@ fn write_vector_solution_variables(
         write_variable(
             &mut output.add_variable::<f64>(name, &dimensions)?,
             values,
-            "source velocity units",
+            velocity_units,
         )?;
     }
     if confidence_interval != ConfidenceInterval::None {
         for (name, values, units) in [
-            ("semi_major_ci", &semi_major_ci, "source velocity units"),
-            ("semi_minor_ci", &semi_minor_ci, "source velocity units"),
+            ("semi_major_ci", &semi_major_ci, velocity_units),
+            ("semi_minor_ci", &semi_minor_ci, velocity_units),
             ("inclination_ci", &inclination_ci, "degrees"),
             ("phase_ci", &phase_ci, "degrees"),
             ("signal_to_noise", &signal_to_noise, "1"),
@@ -5937,18 +6000,19 @@ fn write_vector_solution_variables(
             )?;
         }
     }
+    let velocity_slope_units = format!("{velocity_units} per day");
     for (name, values, units) in [
-        ("eastward_mean", &eastward_mean, "source velocity units"),
-        ("northward_mean", &northward_mean, "source velocity units"),
+        ("eastward_mean", &eastward_mean, velocity_units),
+        ("northward_mean", &northward_mean, velocity_units),
         (
             "eastward_slope",
             &eastward_slope,
-            "source velocity units per day",
+            velocity_slope_units.as_str(),
         ),
         (
             "northward_slope",
             &northward_slope,
-            "source velocity units per day",
+            velocity_slope_units.as_str(),
         ),
     ] {
         write_variable(
@@ -5957,7 +6021,13 @@ fn write_vector_solution_variables(
             units,
         )?;
     }
-    write_vector_robust_variables(output, solutions, analysis_method, series_dimensions)?;
+    write_vector_robust_variables(
+        output,
+        solutions,
+        analysis_method,
+        series_dimensions,
+        velocity_units,
+    )?;
     Ok(())
 }
 
@@ -5970,6 +6040,7 @@ fn write_vector_robust_variables(
     solutions: &[VectorSolution],
     analysis_method: AnalysisMethod,
     series_dimensions: &[&str],
+    velocity_units: &str,
 ) -> Result<(), AppError> {
     if analysis_method == AnalysisMethod::Ols {
         if solutions.iter().any(|solution| solution.robust.is_some()) {
@@ -6050,21 +6121,9 @@ fn write_vector_robust_variables(
     }
     write_robust_schema_metadata(output, &termination, series_dimensions)?;
     for (name, values, units) in [
-        (
-            "robust_residual_scale",
-            &residual_scale,
-            "source velocity units",
-        ),
-        (
-            "robust_ols_rms_residual",
-            &ols_rms_residual,
-            "source velocity units",
-        ),
-        (
-            "robust_rms_residual",
-            &rms_residual,
-            "source velocity units",
-        ),
+        ("robust_residual_scale", &residual_scale, velocity_units),
+        ("robust_ols_rms_residual", &ols_rms_residual, velocity_units),
+        ("robust_rms_residual", &rms_residual, velocity_units),
     ] {
         write_variable(
             &mut output.add_variable::<f64>(name, series_dimensions)?,
@@ -6129,7 +6188,13 @@ fn write_vector_reconstruction_variables(
             vec!["time", "series"]
         };
         let mut variable = output.add_variable::<f64>(name, &dimensions)?;
-        variable.put_attribute("units", "source velocity units")?;
+        variable.put_attribute(
+            "units",
+            input
+                .source_velocity_units
+                .as_deref()
+                .unwrap_or("source velocity units"),
+        )?;
         for (series, reconstruction) in values.iter().enumerate() {
             let component = if eastward {
                 &reconstruction.eastward
@@ -6165,8 +6230,9 @@ mod tests {
     use super::{
         AnalysisMethod, ConfidenceInterval, ConstituentOrder, ConstituentSelection, NodeSelection,
         VectorAnalyzeConfig, VectorInferenceConfig, analyze_vector, compact_bounded_span_values,
-        pipelined_vector_chunk_reader, read_fvcom_fixed_depth_element_chunk, read_fvcom_vector,
-        read_fvcom_vector_metadata, regular_vector_chunk_plan, temporary_sibling,
+        matching_velocity_units, pipelined_vector_chunk_reader,
+        read_fvcom_fixed_depth_element_chunk, read_fvcom_vector, read_fvcom_vector_metadata,
+        regular_vector_chunk_plan, temporary_sibling,
     };
 
     #[test]
@@ -6178,6 +6244,30 @@ mod tests {
         let compacted = compact_bounded_span_values(source, 3, 6, 2, &selected_indices)
             .expect("compact bounded time-major span");
         assert_eq!(compacted, [2, 4, 7, 102, 104, 107, 202, 204, 207]);
+    }
+
+    #[test]
+    fn vector_units_must_be_shared_or_jointly_absent() {
+        assert_eq!(
+            matching_velocity_units("u", None, "v", None).expect("jointly absent"),
+            None
+        );
+        assert_eq!(
+            matching_velocity_units("u", Some("m s-1".to_owned()), "v", Some("m s-1".to_owned()))
+                .expect("matching units")
+                .as_deref(),
+            Some("m s-1")
+        );
+        assert!(
+            matching_velocity_units(
+                "u",
+                Some("m s-1".to_owned()),
+                "v",
+                Some("cm s-1".to_owned())
+            )
+            .is_err()
+        );
+        assert!(matching_velocity_units("u", Some("m s-1".to_owned()), "v", None).is_err());
     }
 
     #[test]
@@ -6327,6 +6417,9 @@ mod tests {
                 .add_variable::<f32>(name, &["time", "siglay", "nele"])
                 .expect("add current component");
             variable.set_fill_value(fill).expect("set current fill");
+            variable
+                .put_attribute("units", "m s-1")
+                .expect("set current units");
             variable.put_values(values, ..).expect("write current");
         }
         dataset.close().expect("close fixed-depth fixture");
@@ -6449,6 +6542,7 @@ mod tests {
         assert_eq!(report.fixed_depths_meters, Some(vec![8.0, 12.0]));
         assert_eq!(report.series_count, 4);
         assert_eq!(report.result_output, "incremental");
+        assert_eq!(report.source_velocity_units.as_deref(), Some("m s-1"));
         assert!(report.profile.contains("prefilter"));
         assert_eq!(
             report.prefilter.as_ref().expect("prefilter report").gain,
@@ -6463,6 +6557,44 @@ mod tests {
         );
 
         let output = netcdf::open(&output_path).expect("open fixed-depth output");
+        assert_eq!(
+            output
+                .attribute("source_path")
+                .expect("source path")
+                .value()
+                .expect("read source path"),
+            netcdf::AttributeValue::Str(input_path.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            output
+                .attribute("source_file_bytes")
+                .expect("source file size")
+                .value()
+                .expect("read source file size"),
+            netcdf::AttributeValue::Ulonglong(
+                std::fs::metadata(&input_path)
+                    .expect("read source metadata")
+                    .len()
+            )
+        );
+        assert_eq!(
+            output
+                .attribute("source_velocity_units")
+                .expect("source velocity units")
+                .value()
+                .expect("read source velocity units"),
+            netcdf::AttributeValue::Str("m s-1".to_owned())
+        );
+        assert_eq!(
+            output
+                .variable("semi_major")
+                .expect("semi-major")
+                .attribute("units")
+                .expect("semi-major units")
+                .value()
+                .expect("read semi-major units"),
+            netcdf::AttributeValue::Str("m s-1".to_owned())
+        );
         assert_eq!(
             output
                 .variable("prefilter_gain")
@@ -7052,7 +7184,7 @@ mod tests {
             analyze_vector(&layered_config).expect("analyze native sigma-layer currents");
         assert_eq!(
             layered_report.result_sha256,
-            "f1bb727d48a36a3b81e9855aa8094f4c294d78ce6845c5bfdc393325f0d39894"
+            "8fdc7fa2de7e1ce5f23f1e27a55048fc8422374724350c184d75327ab4e57fc3"
         );
         let mut layered_chunked_config = layered_config.clone();
         layered_chunked_config.output = layered_chunked_output_path.clone();

@@ -104,7 +104,7 @@ record.
    integration, including batch and missing-value orchestration — done.
 4. Structured Rust and Python results plus compact human-readable presentation
    — done.
-5. Scalar NetCDF schema 17, vector schema 15, and backward-readable Python
+5. Scalar NetCDF schema 18, vector schema 17, and backward-readable Python
    coefficient snapshot schema 2 — done.
 6. MATLAB-derived equation fixtures and measured whole-field overhead — done.
 

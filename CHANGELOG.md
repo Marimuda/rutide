@@ -9,6 +9,18 @@ published API and file-schema contracts.
 
 ### Added
 
+- Typed real pre-filter transfer-function correction across Rust scalar/vector
+  solvers, ordinary/inferred models, reconstruction, batches, Python persistence,
+  and both FVCOM commands. Strict response validation is the default; an
+  explicit unity fallback preserves MATLAB UTide behavior.
+- Complete pre-filter response provenance in scalar NetCDF schema 18, vector
+  schema 17, JSON reports, profile names, and canonical result digests.
+- Source path, file size, and validated scalar/vector source units in FVCOM
+  NetCDF/JSON provenance. Declared vector component units must match; units also
+  participate in the result digest and replace generic coefficient-unit labels.
+- Domain-facing FVCOM/ADCP metadata and quality-control guidance covering
+  sampling, identifiability, residuals, robust fits, vertical semantics, and
+  reconstruction validation.
 - Public reconstruction-ready `CartesianVectorSolution`, compact
   `VectorCurrent`, and query-oriented per-timestep batch reconstruction with an
   explicit tide-only / mean / mean-and-trend policy.
@@ -38,13 +50,17 @@ published API and file-schema contracts.
   covering the enabled/disabled diagnostic time, memory, and storage costs.
 - An installed-wheel acceptance harness for a public NOAA/NDBC ADCP profile and
   a domain-spanning selection from the 25.78 GB FVCOM fixture, including
-  reconstruction and coefficient-persistence validation.
+  sampling/unit checks, constituent diagnostics, reconstruction,
+  coefficient-persistence validation, and a bitwise unity pre-filter control.
 - A matched Rust/Python benchmark profile for robust coupled-vector inference
   with irregular sampling, colored confidence, joint missing values, and
   isolated outliers.
 
 ### Changed
 
+- `SolverOptions` is now `Clone` rather than `Copy` because it can own an
+  immutable shared pre-filter response. This is a documented pre-1.0 Rust API
+  change; the unset response retains the previous numerical fast path.
 - Added native coefficient snapshot schema 2 for optional single and dense-batch
   identifiability diagnostics while retaining schema-1 reads from RUTide 0.2.
 - Coalesced schema-1 coefficient snapshot arrays into bounded typed NPZ blobs.

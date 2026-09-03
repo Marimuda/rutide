@@ -113,7 +113,7 @@ selections coalesce nearby elements and traverse classic NetCDF record variables
 in file order; requested layer and element order is still preserved. Chunk-local
 masks are grouped exactly as before, and global Monte Carlo stream offsets make
 results independent of chunk size and worker scheduling. JSON reports and
-scalar/vector NetCDF schemas v17/v15 record the input-pipeline mode, actual chunk
+scalar/vector NetCDF schemas v18/v17 record the input-pipeline mode, actual chunk
 count and series count, and maximum logical bytes across concurrent observation
 buffers. When input is overlapped, active stage durations are not additive;
 `total_seconds` remains the authoritative elapsed application time.
@@ -218,10 +218,11 @@ defined in [`HARMONIC_CURRENT_ATLAS.md`](HARMONIC_CURRENT_ATLAS.md). The
 records isolated direct-current throughput and its batch-size-dependent worker
 scaling; it does not include spatial interpolation or OpenDrift.
 
-The remaining optional MATLAB analysis restoration is the known
-[pre-filter transfer-function correction](PREFILTER_TRANSFER.md). It is useful
-for records passed through a documented filter and is not required for raw
-FVCOM fields.
+The optional MATLAB
+[pre-filter transfer-function correction](PREFILTER_TRANSFER.md) is supported
+through the Rust core, Python API, and both FVCOM commands. It is useful only
+for records passed through a documented filter and should remain disabled for
+raw FVCOM fields.
 
 `diagnostics=True` adds the full Codiga constituent-identifiability suite as
 structured `coef.diagn` arrays: adjacent RR/RNM/Corrmax, whole-basis `K` and
@@ -237,8 +238,8 @@ NPZ archive and restored without refitting or storing source observations.
 Packed typed-array blobs keep large batch archives compact and fast to restore;
 the retained 4,096-series profile improved load time by 72.28x. Native snapshot
 schema 2 stores optional diagnostic arrays densely while continuing to read
-original schema-1 snapshots from RUTide 0.2. The
-[real-data acceptance](benchmarks/results/real-data-acceptance-2026-09-03.md) and
+original schema-1 snapshots from RUTide 0.2. The current
+[real-data product acceptance](benchmarks/results/real-data-product-acceptance-2026-09-03.md) and
 [persistence profile](benchmarks/results/python-batch-persistence-2026-09-03.md)
 record the installed-wheel ADCP/FVCOM evidence.
 
@@ -347,6 +348,15 @@ metadata, result digests, profile names, and reconstruction. Existing default
 profile names keep their `nodal` component; alternatives use
 `nodal-linear-time` or `no-nodal`.
 
+Use `--prefilter-response response.json` only when the input was passed through
+a known temporal filter. The file supplies `frequency_cph`, `gain`,
+`acceptable_gain_range`, and an optional `fallback` (`error` by default).
+MATLAB-style `frq`, `P`, and `rng` names are accepted as aliases. Fitted
+coefficients estimate the pre-filter physical harmonics; reconstruction
+reapplies the response so it remains comparable with the filtered observations.
+The complete response is embedded in NetCDF/JSON provenance and the result
+digest. See [PREFILTER_TRANSFER.md](PREFILTER_TRANSFER.md) for the exact contract.
+
 Use `--order selection`, `--order pe`, `--order snr`, or `--order frequency`
 to choose a constituent presentation view. The default `selection` view retains
 the fitted-model order; PE and SNR rank from largest to smallest, while frequency
@@ -383,7 +393,7 @@ cargo run --release --bin rutide -- analyze-scalar \
   --workers 64
 ```
 
-Schemas 17/15 store the configuration as global attributes and the complete
+Schemas 18/17 store the configuration as global attributes and the complete
 per-series and per-constituent result arrays under descriptive
 `diagnostic_*` variable names. Missing neighbors and unavailable fixed-depth
 records use index `-1` and `NaN` floating fields. `K` and Corrmax use the actual
@@ -482,6 +492,10 @@ and full details for retained sample results. These diagnostics are always
 produced, including white-noise or no-confidence runs, so data adequacy can be
 reviewed before enabling colored confidence; they inform judgment but do not
 silently reject a fit.
+
+The practical review order, metadata checklist, and separate ADCP/FVCOM cautions
+are maintained in [QUALITY_CONTROL.md](QUALITY_CONTROL.md). A successful solve
+is not by itself evidence that the selected constituents are identifiable.
 
 ## FVCOM vector-current analysis
 

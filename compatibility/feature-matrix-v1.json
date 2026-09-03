@@ -201,11 +201,11 @@
     {
       "id": "prefilter-transfer-correction",
       "title": "Known preprocessing-filter response correction",
-      "support": "planned",
+      "support": "supported",
       "scopes": ["core", "python-api", "fvcom-scalar", "fvcom-vector", "output"],
       "parity": "matlab-restoration",
-      "evidence": ["PREFILTER_TRANSFER.md", "ROADMAP.md"],
-      "limitations": ["Not needed for unfiltered source fields; near-zero or unknown filter response cannot be corrected safely"]
+      "evidence": ["PREFILTER_TRANSFER.md", "crates/rutide-core/tests/matlab_prefilter_equations.rs", "python/tests/test_api.py", "crates/rutide-cli/src/lib.rs", "crates/rutide-cli/src/vector.rs"],
+      "limitations": ["One real response is supported; complex or component-specific vector filters require a future coupled formulation", "Not needed for unfiltered source fields; near-zero or unknown filter response cannot be corrected safely"]
     },
     {
       "id": "spatial-current-atlas",

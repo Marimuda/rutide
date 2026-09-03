@@ -24,12 +24,15 @@ The workspace and Python distribution share one Cargo-sourced version.
 
 The compiled schema constants are public as
 `rutide_cli::SCALAR_OUTPUT_SCHEMA_VERSION` and
-`rutide_cli::VECTOR_OUTPUT_SCHEMA_VERSION`. They currently identify scalar v17
-and vector v16. Scalar v17 and vector v15 added opt-in constituent-identifiability
+`rutide_cli::VECTOR_OUTPUT_SCHEMA_VERSION`. They currently identify scalar v18
+and vector v17. Scalar v17 and vector v15 added opt-in constituent-identifiability
 configuration and complete per-series/per-constituent diagnostic fields. Vector
-v16 additionally stores the four Cartesian eastward/northward cosine/sine
-coefficient fields required for phase-wrap-safe spatial products. When extended
-diagnostics are disabled, the application avoids their calculation.
+v16 added the four Cartesian eastward/northward cosine/sine coefficient fields.
+Scalar v18 and vector v17 add complete preprocessing-filter response provenance,
+source identity, and propagated source units. Declared vector-component units
+must match because ellipse coefficients require a shared physical scale. When
+extended diagnostics and pre-filtering are disabled, the application avoids
+their work.
 
 A schema version covers dimension names and order, required variables, variable
 meaning and units, enumerated flag values, required global attributes, and JSON
@@ -80,9 +83,9 @@ validated against
 and checked against compiled constants in the Rust test suite.
 
 Rows marked `planned` are intentionally outside the current supported contract.
-They currently comprise MATLAB's optional known-pre-filter response correction
-and the Rust-specific spatial current-atlas layer. The former is not required
-for raw FVCOM fields; its implementation contract is recorded in
+The remaining planned row is the separate spatial current-atlas/OpenDrift product
+layer. MATLAB's optional known pre-filter response correction is supported; its
+scope and limits are recorded in
 [`PREFILTER_TRANSFER.md`](PREFILTER_TRANSFER.md).
 
 The `rutide` Python distribution supports CPython 3.9 and newer through a
@@ -128,6 +131,7 @@ named and rejected during validation.
 The fundamental trend, phase, nodal, scope, and inference-mode cross-product is
 executed as a test. Dense seam tests additionally combine robust fitting,
 irregular missing observations, colored confidence, inference, alternative
-astronomical conventions, Monte Carlo propagation, ordering, and reconstruction.
+astronomical conventions, pre-filter correction, Monte Carlo propagation,
+ordering, and reconstruction.
 Where Python UTide has an executable path, values are frozen against the pinned
 oracle; otherwise the matrix identifies the path as a tested Rust extension.

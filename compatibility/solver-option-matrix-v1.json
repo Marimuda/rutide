@@ -28,6 +28,7 @@
     "trend": ["enabled", "disabled"],
     "phase_reference": ["greenwich", "linear-time", "raw"],
     "nodal_corrections": ["exact", "linear-time", "disabled"],
+    "prefilter": ["none", "real"],
     "confidence_method": ["none", "linear", "monte-carlo"],
     "confidence_noise": ["not-applicable", "white", "colored"],
     "constituent_diagnostics": ["disabled", "enabled"],
@@ -47,6 +48,13 @@
     ]
   },
   "rejection_constraints": [
+    {
+      "id": "prefilter-response-is-valid",
+      "status": "rejected",
+      "rule": "prefilter=real requires a finite increasing frequency grid, finite real gains, and an explicit positive acceptable magnitude range",
+      "reason": "Unknown, complex, out-of-grid, or near-zero responses cannot be silently converted into stable physical coefficients.",
+      "evidence": ["crates/rutide-core/src/prefilter.rs", "PREFILTER_TRANSFER.md"]
+    },
     {
       "id": "ols-has-no-robust-weight",
       "status": "rejected",
@@ -183,6 +191,7 @@
         "trend": ["enabled", "disabled"],
         "phase_reference": ["greenwich", "linear-time", "raw"],
         "nodal_corrections": ["exact", "linear-time", "disabled"],
+        "prefilter": ["none", "real"],
         "confidence_method": ["none"],
         "confidence_noise": ["not-applicable"],
         "constituent_diagnostics": ["disabled"],
@@ -190,6 +199,26 @@
         "reconstruction": ["none"]
       },
       "evidence": ["crates/rutide-core/tests/python_oracle_inference.rs"]
+    },
+    {
+      "id": "matlab-prefilter-restoration",
+      "kind": "application-integration",
+      "covers": {
+        "scope": ["scalar", "vector"],
+        "sampling": ["regular", "gappy-regular-grid", "irregular"],
+        "inference": ["none", "exact", "approximate"],
+        "analysis_method": ["ols", "robust"],
+        "prefilter": ["real"],
+        "confidence_method": ["none", "linear", "monte-carlo"],
+        "reconstruction": ["none", "all", "constituents"]
+      },
+      "evidence": [
+        "PREFILTER_TRANSFER.md",
+        "crates/rutide-core/tests/matlab_prefilter_equations.rs",
+        "python/tests/test_api.py",
+        "crates/rutide-cli/src/lib.rs",
+        "crates/rutide-cli/src/vector.rs"
+      ]
     },
     {
       "id": "robust-weight-family",

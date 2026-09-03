@@ -19,7 +19,7 @@ import rutide
 
 from .constants import REPOSITORY_ROOT
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 CONSTITUENTS = ["M2", "S2", "N2", "K2", "K1", "O1", "P1", "Q1"]
 FVCOM_CONSTITUENTS = ["M2", "S2", "N2", "K1", "O1"]
 DEFAULT_FVCOM = (
@@ -92,6 +92,145 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def shared_velocity_units(eastward: Any, northward: Any) -> str:
+    """Return matching, non-empty units for a vector-current variable pair."""
+    values = []
+    for variable in (eastward, northward):
+        value = getattr(variable, "units", None)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("vector-current variables must both declare non-empty text units")
+        values.append(value.strip())
+    if values[0] != values[1]:
+        raise ValueError(
+            f"vector-current units disagree: eastward={values[0]!r}, northward={values[1]!r}"
+        )
+    return values[0]
+
+
+def sampling_summary(time_values: np.ndarray) -> dict[str, Any]:
+    """Summarize the time axis and reject chronology errors before fitting."""
+    values = np.asarray(time_values, dtype=np.float64)
+    if values.ndim != 1 or values.size < 2 or not np.isfinite(values).all():
+        raise ValueError(
+            "the acceptance time axis must be finite, one-dimensional, and non-trivial"
+        )
+    steps_hours = np.diff(values) * 24.0
+    if np.any(steps_hours <= 0.0):
+        raise ValueError("the acceptance time axis must be strictly increasing")
+    median_step = float(np.median(steps_hours))
+    tolerance = max(1e-9, abs(median_step) * 1e-6)
+    return {
+        "record_span_days": float(values[-1] - values[0]),
+        "median_interval_hours": median_step,
+        "largest_gap_hours": float(np.max(steps_hours)),
+        "non_median_intervals": int(
+            np.count_nonzero(np.abs(steps_hours - median_step) > tolerance)
+        ),
+    }
+
+
+def finite_range(values: Any) -> dict[str, Any]:
+    """Return a JSON-safe finite-value count and range."""
+    array = np.asarray(values, dtype=np.float64)
+    finite = array[np.isfinite(array)]
+    if finite.size == 0:
+        raise RuntimeError("a required diagnostic field contains no finite values")
+    return {
+        "finite": int(finite.size),
+        "total": int(array.size),
+        "minimum": float(np.min(finite)),
+        "median": float(np.median(finite)),
+        "maximum": float(np.max(finite)),
+    }
+
+
+def diagnostic_summary(coefficient: Any) -> dict[str, Any]:
+    """Reduce dense constituent diagnostics to auditable release-gate evidence."""
+    diagnostics = coefficient.diagn
+    if diagnostics is None:
+        raise RuntimeError("constituent-selection diagnostics were not produced")
+    condition = np.asarray(diagnostics.K)
+    adjusted_snr = np.asarray(diagnostics.SNRallc_over_K)
+    percent_all = np.asarray(diagnostics.PTVallc)
+    if not (
+        np.isfinite(condition).all()
+        and np.isfinite(adjusted_snr).all()
+        and np.isfinite(percent_all).all()
+    ):
+        raise RuntimeError("whole-model diagnostic fields must be finite for every series")
+    higher_rr = np.asarray(diagnostics.hi.RR)
+    higher_rnm = np.asarray(diagnostics.hi.RNM)
+    higher_correlation = np.asarray(diagnostics.hi.CorMx)
+    return {
+        "basis_condition_number": finite_range(condition),
+        "condition_adjusted_signal_to_noise": finite_range(adjusted_snr),
+        "whole_model_condition_bound_pass_series": int(np.count_nonzero(adjusted_snr > 1.0)),
+        "percent_tidal_variance_all": finite_range(percent_all),
+        "percent_tidal_variance_significant": finite_range(diagnostics.PTVsnrc),
+        "significant_constituents": int(np.count_nonzero(np.asarray(coefficient.SNR) >= 2.0)),
+        "adjacent_pairs": int(np.count_nonzero(np.isfinite(higher_rr))),
+        "rayleigh_resolved_pairs": int(np.count_nonzero(higher_rr >= 1.0)),
+        "noise_modified_resolved_pairs": int(np.count_nonzero(higher_rnm >= 1.0)),
+        "correlation_at_most_0_2_pairs": int(np.count_nonzero(higher_correlation <= 0.2)),
+        "maximum_neighbor_parameter_correlation": finite_range(higher_correlation),
+    }
+
+
+def assert_unity_prefilter_control(
+    *,
+    time_values: np.ndarray,
+    eastward: np.ndarray,
+    northward: np.ndarray,
+    latitudes: float | np.ndarray,
+    options: dict[str, Any],
+    baseline: Any,
+) -> dict[str, Any]:
+    """Require unity correction to preserve representative fitted results bit-for-bit."""
+    series_count = min(4, eastward.shape[1])
+    control_latitudes = (
+        latitudes if np.isscalar(latitudes) else np.asarray(latitudes)[:series_count]
+    )
+    control_options = {
+        **options,
+        "lat": control_latitudes,
+        "prefilt": {"frq": [0.0, 0.2], "P": [1.0, 1.0], "rng": [0.01, 2.0]},
+    }
+    started = time.perf_counter()
+    corrected = rutide.solve_many(
+        time_values,
+        eastward[:, :series_count],
+        northward[:, :series_count],
+        **control_options,
+    )
+    elapsed = time.perf_counter() - started
+    checked_fields = ["Lsmaj", "Lsmin", "theta", "g", "Lsmaj_ci", "SNR"]
+    for field in checked_fields:
+        np.testing.assert_array_equal(
+            np.asarray(getattr(baseline, field))[:series_count],
+            np.asarray(getattr(corrected, field)),
+            err_msg=f"unity pre-filter correction changed {field}",
+        )
+    for field in ["K", "SNRallc", "SNRallc_over_K", "PTVallc", "PTVsnrc"]:
+        np.testing.assert_array_equal(
+            np.asarray(getattr(baseline.diagn, field))[:series_count],
+            np.asarray(getattr(corrected.diagn, field)),
+            err_msg=f"unity pre-filter correction changed diagnostic {field}",
+        )
+    return {
+        "series": series_count,
+        "seconds": elapsed,
+        "bitwise_equal": True,
+        "checked_coefficient_fields": checked_fields,
+        "checked_diagnostic_fields": [
+            "K",
+            "SNRallc",
+            "SNRallc_over_K",
+            "PTVallc",
+            "PTVsnrc",
+        ],
+    }
+
+
 def analyze_vector_batch(
     *,
     label: str,
@@ -127,6 +266,8 @@ def analyze_vector_batch(
         "phase": "Greenwich",
         "nodal": True,
         "white": False,
+        "diagnostics": True,
+        "diagnostic_min_SNR": 2.0,
         "epoch": epoch,
         "workers": workers,
         "memory_limit_mb": memory_limit_mb,
@@ -150,6 +291,15 @@ def analyze_vector_batch(
         raise RuntimeError(f"{label} reconstruction shape does not match its input")
     if not np.isfinite(coefficient.Lsmaj).all() or not np.isfinite(coefficient.g).all():
         raise RuntimeError(f"{label} produced non-finite primary coefficients")
+
+    prefilter_control = assert_unity_prefilter_control(
+        time_values=time_values,
+        eastward=eastward,
+        northward=northward,
+        latitudes=latitudes,
+        options=options,
+        baseline=coefficient,
+    )
 
     with tempfile.TemporaryDirectory(prefix=f"rutide-{label}-") as temporary:
         archive = Path(temporary) / "coefficients.rutide.npz"
@@ -180,6 +330,8 @@ def analyze_vector_batch(
         "analyzed_series": int(eastward.shape[1]),
         "samples": int(eastward.shape[0]),
         "joint_valid_observations": int(np.count_nonzero(joint[:, retained_columns])),
+        "missing_vector_fraction": float(1.0 - np.mean(joint[:, retained_columns])),
+        "sampling": sampling_summary(time_values),
         "constituents": constituents,
         "solve_seconds": solve_seconds,
         "solve_series_per_second": eastward.shape[1] / solve_seconds,
@@ -201,6 +353,8 @@ def analyze_vector_batch(
         "tidal_residual_rms": float(
             np.sqrt(np.mean(np.square(residual_eastward) + np.square(residual_northward)))
         ),
+        "diagnostics": diagnostic_summary(coefficient),
+        "unity_prefilter_control": prefilter_control,
         "persistence_bitwise_equal": True,
     }
 
@@ -212,8 +366,11 @@ def analyze_adcp(path: Path, workers: int, memory_limit_mb: float) -> dict[str, 
         times = numeric_array(dataset.variables["TIME"][:])
         depths = numeric_array(dataset.variables["DEPTH"][:])
         latitude = float(dataset.variables["LATITUDE"][0])
-        eastward = numeric_array(dataset.variables["UCUR"][:])
-        northward = numeric_array(dataset.variables["VCUR"][:])
+        eastward_variable = dataset.variables["UCUR"]
+        northward_variable = dataset.variables["VCUR"]
+        velocity_units = shared_velocity_units(eastward_variable, northward_variable)
+        eastward = numeric_array(eastward_variable[:])
+        northward = numeric_array(northward_variable[:])
         metadata = {
             "title": dataset.getncattr("title"),
             "institution": dataset.getncattr("institution"),
@@ -222,6 +379,7 @@ def analyze_adcp(path: Path, workers: int, memory_limit_mb: float) -> dict[str, 
             "latitude": latitude,
             "depth_min_metres": float(np.min(depths)),
             "depth_max_metres": float(np.max(depths)),
+            "velocity_units": velocity_units,
         }
     input_seconds = time.perf_counter() - started
     result = analyze_vector_batch(
@@ -258,8 +416,11 @@ def analyze_fvcom(
         times += numeric_array(dataset.variables["Itime2"][:]) / 86_400_000.0
         latitudes = numeric_array(dataset.variables["latc"][indices])
         input_budget_mb = min(128.0, memory_limit_mb / 2.0)
-        eastward = read_time_major_columns(dataset.variables["ua"], indices, input_budget_mb)
-        northward = read_time_major_columns(dataset.variables["va"], indices, input_budget_mb)
+        eastward_variable = dataset.variables["ua"]
+        northward_variable = dataset.variables["va"]
+        velocity_units = shared_velocity_units(eastward_variable, northward_variable)
+        eastward = read_time_major_columns(eastward_variable, indices, input_budget_mb)
+        northward = read_time_major_columns(northward_variable, indices, input_budget_mb)
         metadata = {
             "title": dataset.getncattr("title"),
             "source_model": dataset.getncattr("source"),
@@ -267,6 +428,7 @@ def analyze_fvcom(
             "elements": element_count,
             "selected_first_element": int(indices[0]),
             "selected_last_element": int(indices[-1]),
+            "velocity_units": velocity_units,
         }
     input_seconds = time.perf_counter() - started
     result = analyze_vector_batch(

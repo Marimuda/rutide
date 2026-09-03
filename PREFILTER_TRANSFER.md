@@ -1,63 +1,114 @@
 # Pre-filter transfer-function correction
 
-Pre-filter correction is the one scientifically useful MATLAB UTide analysis
-option that RUTide has deliberately not yet implemented. It is optional for raw
-FVCOM fields and most raw ADCP workflows; it matters when observations were
-filtered before harmonic analysis and the filter appreciably attenuates a
-selected tidal frequency.
+RUTide supports the real preprocessing-filter response correction described by
+MATLAB UTide. It is optional and should not be enabled for raw FVCOM fields or
+raw ADCP ensembles. It is intended for records that were passed through a known
+filter whose gain appreciably changes one or more fitted tidal frequencies.
 
-## Upstream behavior
+## Scientific meaning
 
-MATLAB UTide accepts frequency/gain pairs in cycles per hour, linearly
-interpolates one gain per fitted constituent, replaces an out-of-range or
-unacceptable interpolated gain with unity, and multiplies the astronomical
-basis by that gain during solve and reconstruction. The retained Python port
-still passes an always-empty legacy value through solve/reconstruction, but its
-harmonic implementation labels the option unimplemented and comments out the
-MATLAB interpolation.
+For a known response `P(f)`, RUTide linearly interpolates one real gain for each
+constituent and includes it in the astronomical design basis:
 
-This means the feature is a MATLAB restoration, not Python-UTide parity.
+```text
+observed harmonic(f) = P(f) * physical harmonic(f)
+```
 
-## Value and limits
+The fitted amplitudes and Cartesian coefficients therefore estimate the
+pre-filter physical harmonics. Reconstruction deliberately reapplies `P(f)` and
+returns the signal in the observation domain, matching the input and MATLAB
+UTide convention. This makes residuals and held-out comparisons internally
+consistent.
 
-If a known preprocessing filter has frequency response `P(f)`, incorporating
-that response in the design matrix can estimate pre-filter harmonic amplitudes
-without pretending that attenuated observations were raw. It does not recover
-information removed by a stop-band, correct an unknown processing chain, or
-repair aliasing. Near-zero response is intrinsically ill-conditioned and must
-be rejected rather than amplified into a plausible-looking result.
+The correction cannot restore information destroyed by a stop band, identify an
+unknown processing chain, repair aliasing, or compensate for undocumented ADCP
+averaging. A near-zero response makes physical coefficient recovery
+ill-conditioned. RUTide therefore requires an explicit acceptable gain-magnitude
+range and rejects values outside it by default.
 
-Raw FVCOM `zeta`, `ua`/`va`, and native `u`/`v` should continue to use the unity
-response. The feature is mainly useful for filtered instrument records and
-model products whose preprocessing response is known and documented.
+## Rust and Python APIs
 
-## RUTide implementation contract
+The Rust core uses `PreFilterCorrection` and `PreFilterFallback`. The response is
+validated once and the interpolated constituent gains are folded into cached
+bases outside the sample and spatial-series loops. Leaving the option unset
+retains the original fast path.
 
-The implementation should be a typed, opt-in frequency-response object rather
-than an unvalidated collection of arrays. It must:
+Python accepts `prefilt=` on `solve` and `solve_many`:
 
-1. validate finite, strictly increasing frequency samples and finite gains;
-2. define explicit interpolation and outside-range behavior;
-3. reject gains too close to zero with a constituent-specific error;
-4. precompute the response once per selected constituent, outside sample and
-   series loops;
-5. apply the same response to ordinary, exact/approximate inferred, scalar, and
-   vector design bases;
-6. retain enough response metadata to reconstruct in the fitted observation
-   domain and to make any de-filtered product explicit;
-7. serialize configuration and resolved constituent gains in Python snapshots
-   and FVCOM output provenance; and
-8. test synthetic known-filter recovery, reconstruction, inference, invalid
-   responses, and the unity fast path against the MATLAB equations.
+```python
+prefilt = {
+    "frequency_cph": [0.0, 0.04, 0.10, 0.20],
+    "gain": [1.0, 0.98, 0.74, 0.30],
+    "acceptable_gain_range": [0.05, 2.0],
+    "fallback": "error",
+}
 
-The unity path must remain allocation-free in the inner kernel. With a valid
-response, runtime overhead should be negligible because the selected-frequency
-gains are computed once and folded into existing cached bases.
+coef = rutide.solve(time, velocity, lat=62.0, prefilt=prefilt)
+```
 
-## Primary references
+MATLAB-style `frq`, `P`, and `rng` keys are aliases. `fallback="unity"`
+reproduces MATLAB's permissive behavior for a constituent outside the response
+grid or acceptable range; `fallback="error"` is the safer default. Complex
+responses are explicitly rejected. Saved coefficient objects retain the full
+response and reconstruct identically after loading.
 
-- MATLAB UTide `ut_solv.m`, revision `4a6354f`, option documentation and
-  `ut_E` implementation.
-- Python UTide `harmonics.py`, revision `9b60caf`, where the pre-filter argument
-  is explicitly marked unimplemented and the MATLAB interpolation is commented
-  out.
+## FVCOM command
+
+The scalar and vector commands accept `--prefilter-response PATH`. The JSON file
+uses the same descriptive or MATLAB-style keys:
+
+```json
+{
+  "frequency_cph": [0.0, 0.04, 0.10, 0.20],
+  "gain": [1.0, 0.98, 0.74, 0.30],
+  "acceptable_gain_range": [0.05, 2.0],
+  "fallback": "error"
+}
+```
+
+```console
+rutide analyze-vector \
+  --input filtered-currents.nc \
+  --output coefficients.nc \
+  --prefilter-response instrument-response.json
+```
+
+Scalar NetCDF schema 18 and vector schema 17 record the response samples,
+accepted range, fallback, interpolation method, and response convention. JSON
+reports contain the same values, profile names include `prefilter`, and result
+digests include the complete response. The path itself is not authoritative:
+the values used by the solve are embedded in the result.
+
+## Supported scope and limits
+
+- Scalar elevation or one-component velocity records are supported.
+- Vector records are supported when the same real response was applied to both
+  eastward and northward components.
+- Ordinary and inferred constituents, OLS and robust fits, complete and missing
+  batches, confidence intervals, diagnostics, persistence, and reconstruction
+  use the same corrected basis.
+- A complex response, or different component-specific responses, needs a
+  coupled formulation because phase-changing component filters alter the current
+  ellipse. RUTide rejects that unsupported representation instead of treating it
+  as a real gain.
+- Response frequencies are cycles per hour, finite, non-negative, and strictly
+  increasing. At least two response samples are required.
+- Gains may be signed but must be finite. Their magnitudes must lie within the
+  configured positive range at every fitted constituent unless the explicit
+  unity fallback is selected.
+
+Raw FVCOM `zeta`, `ua`/`va`, and native `u`/`v` normally require no correction.
+For ADCP products, only enable it when the exact temporal processing response is
+known and applies to the provided velocity series.
+
+## Validation
+
+Independent MATLAB-equation tests cover linear interpolation, strict rejection,
+and the legacy unity fallback. End-to-end scalar/vector tests cover physical
+coefficient recovery, observation-domain reconstruction, exact inference,
+complete/gappy batches, Python persistence, and FVCOM NetCDF provenance. The
+uncorrected control path remains separately exercised.
+
+Primary implementation references are MATLAB UTide `ut_solv.m`/`ut_E` revision
+`4a6354f` and Python UTide `harmonics.py` revision `9b60caf`, where the retained
+pre-filter argument is marked unimplemented.

@@ -1,8 +1,10 @@
-# Harmonic-current atlas contract
+# Future harmonic-current atlas product
 
-This document defines the temporal coefficient and prediction contract being
-built for spatial current atlases and particle-transport readers. It does not
-yet define FVCOM mesh interpolation or an OpenDrift adapter.
+This document defines a possible downstream spatial-current product. It is not
+part of the RUTide FVCOM/ADCP temporal harmonic-analysis release scope. The
+analysis engine already supplies its temporal coefficient and prediction
+foundation; this future product would add mesh interpolation and, optionally,
+an OpenDrift adapter.
 
 ## Cartesian representation
 
@@ -86,7 +88,7 @@ The first option is the canonical production profile.
 
 ## Serialized fields
 
-FVCOM vector NetCDF/JSON schema 16 adds the four Cartesian fields while retaining
+FVCOM vector NetCDF/JSON schema 17 contains the four Cartesian fields while retaining
 all ellipse, confidence, diagnostic, mean, trend, and per-series epoch fields.
 Python single and batch coefficient summaries expose the same descriptive names.
 The Cartesian arrays are derived from authoritative ellipse solutions, so

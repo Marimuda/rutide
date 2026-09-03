@@ -147,6 +147,7 @@ one native chunk. Both fitting and reconstruction release the GIL.
 | `MC_n`, `MC_seed` | Effective realization count and deterministic root seed |
 | `diagnostics` | Opt in to Codiga's extended constituent-identifiability suite; requires confidence/SNR |
 | `diagnostic_min_SNR` | Inclusive SNR threshold for the diagnostic significant-subset reconstruction; default `2.0` |
+| `prefilt` | Known real preprocessing-filter response with frequency, gain, acceptable range, and fallback |
 
 Automatic constituent selection and confidence estimation use only retained
 rows. NumPy/NetCDF4 masked arrays are normalized to NaN. NaN observations and
@@ -157,6 +158,34 @@ of being silently adjusted.
 
 Irregular colored confidence uses the implemented Lomb–Scargle path. It is not
 silently approximated with an FFT.
+
+### Pre-filter response correction
+
+Pass `prefilt=` only when a documented temporal filter was applied to the
+observations. Descriptive keys and MATLAB aliases are interchangeable:
+
+```python
+coef = solve(
+    time_mjd,
+    filtered_velocity,
+    lat=62.0,
+    prefilt={
+        "frequency_cph": [0.0, 0.04, 0.10, 0.20],  # alias: frq
+        "gain": [1.0, 0.98, 0.74, 0.30],           # alias: P
+        "acceptable_gain_range": [0.05, 2.0],      # alias: rng
+        "fallback": "error",
+    },
+)
+```
+
+Fitted amplitudes estimate the physical harmonics before filtering.
+`reconstruct` reapplies the response and returns the filtered observation-domain
+signal. `fallback="error"` rejects out-of-grid and unacceptable gains;
+`fallback="unity"` requests MATLAB-compatible substitution. Complex responses
+and different eastward/northward filters are rejected because they require a
+coupled phase-changing vector formulation. Single/batch saves retain the
+response and reconstruction behavior. See
+[PREFILTER_TRANSFER.md](PREFILTER_TRANSFER.md).
 
 ### Constituent identifiability
 

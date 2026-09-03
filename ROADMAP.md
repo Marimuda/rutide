@@ -362,14 +362,14 @@ reconstruction—reduced the ten-layer, 1,448,600-series OLS peak from 2.35 GiB 
   batch, Python, and FVCOM paths without slowing analysis profiles that do not
   request the extended suite.
 - Versioned the completed source surface as unreleased RUTide 0.3.0 with
-  scalar/vector NetCDF schemas 17/15 and backward-readable Python coefficient
+  scalar/vector NetCDF schemas 18/17 and backward-readable Python coefficient
   snapshot schema 2.
 
 The equation-level conventions are maintained in `DIAGNOSTICS.md`; the retained
 whole-field cost and demonstrated next optimization target are in
 `benchmarks/results/constituent-diagnostics-2026-09-03.md`.
 
-## 8. Harmonic-current forcing foundation — in progress
+## 8. Temporal harmonic-current foundation — complete
 
 - **Complete:** expose reconstruction-ready eastward/northward cosine/sine
   coefficients without phase or inclination wrap discontinuities.
@@ -379,47 +379,60 @@ whole-field cost and demonstrated next optimization target are in
 - **Complete:** evaluate many cached spatial solutions at one prepared timestep
   as compact currents, with explicit tide-only, mean, or mean-and-trend policy.
 - **Complete:** serialize the Cartesian fields through Python and FVCOM vector
-  NetCDF/JSON schema 16 while retaining ellipse outputs and backward-readable
+  NetCDF/JSON schema 17 while retaining ellipse outputs and backward-readable
   Python coefficient archives.
-- **Next:** define a common atlas epoch for non-harmonic terms and either
-  canonicalize or explicitly restrict non-exact phase/nodal modes.
-- **Planned:** add the self-contained FVCOM mesh/current-atlas schema, spatial
-  locator/interpolator, vectorized Python particle-query endpoint, and optional
-  OpenDrift reader.
 
 The temporal coefficient and prediction contract is documented in
 `HARMONIC_CURRENT_ATLAS.md`.
 
-## 9. Remaining MATLAB analysis restoration — planned, optional
+The self-contained mesh/current atlas, spatial locator/interpolator, particle
+query endpoint, and OpenDrift reader are a separate future product. They are not
+release blockers for the temporal FVCOM/ADCP tidal-analysis product.
 
-- **Planned:** implement MATLAB UTide's pre-filter response correction as the
-  typed and provenance-preserving contract in `PREFILTER_TRANSFER.md`.
+## 9. Pre-filter transfer correction — complete, optional
+
+- **Complete:** implement MATLAB UTide's real pre-filter response correction as
+  the typed and provenance-preserving contract in `PREFILTER_TRANSFER.md`.
 - Python UTide does not expose this through its public strict option surface and
   labels the retained harmonic argument unimplemented. Acceptance therefore
-  requires equation-level MATLAB fixtures plus synthetic recovery tests rather
+  uses equation-level MATLAB fixtures plus synthetic recovery tests rather
   than a pinned-Python oracle.
-- The unity response must retain the current fast path. Selected-frequency gains
-  will be precomputed once, so a valid correction should add no work inside the
-  time/series loops.
+- The unset response retains the original fast path. Selected-frequency gains
+  are precomputed per retained record and folded into existing cached bases, so
+  no interpolation occurs inside the time/series loops.
+- Rust, Python single/batch persistence, scalar/vector inference and
+  reconstruction, and FVCOM NetCDF/JSON schema 18/17 provenance are covered.
+- RUTide supports one real response for scalar records or both vector components.
+  It explicitly rejects complex or component-specific filters until their
+  coupled ellipse semantics are implemented and validated.
 - This is valuable for records with a known preprocessing filter, but it is not
-  a prerequisite for raw FVCOM fields and should not block the current-atlas
-  work.
+  a prerequisite for raw FVCOM or ADCP fields.
 
 ## Definition of a domain-ready FVCOM tidal-analysis product
 
 The harmonic-analysis engine is scientifically broad when every supported row
 in the machine-readable compatibility matrix remains oracle- or equation-tested.
-Product readiness additionally requires:
+Product readiness additionally requires the following hardening gates:
 
-- stable pre-1.0 Rust/Python and NetCDF contracts with migration notes;
-- real FVCOM and ADCP acceptance fixtures spanning scalar, depth-averaged,
-  sigma-layer, fixed-depth, missing, irregular, and robust cases;
-- explicit units, epochs, coordinate/vertical metadata, wet/dry semantics, and
-  analysis provenance in every domain output;
-- domain-facing QC guidance for constituent identifiability, residuals,
-  confidence assumptions, and safe extrapolation; and
-- profile-specific correctness, memory, and throughput gates on release
-  artifacts.
+- **Complete for 0.3:** pre-1.0 Rust/Python and NetCDF contracts are versioned
+  with migration notes, compiled schema checks, backward archive reads, and
+  clean-wheel installation tests;
+- **Complete for the release gate:** installed-wheel ADCP and depth-averaged
+  FVCOM acceptance plus real-fixture native sigma-layer and fixed-depth FVCOM
+  validation. Additional independent sites remain continuing scientific
+  validation rather than an implementation blocker;
+- **Complete for CLI domain outputs:** source identity and declared units,
+  epochs, source coordinates/indices, vertical definitions, wet/dry semantics,
+  analysis options, and canonical digests are serialized. In-memory Python
+  arrays remain caller-owned, so their external dataset metadata must be
+  preserved by the caller;
+- **Complete:** domain-facing QC guidance for constituent identifiability,
+  residuals, confidence assumptions, and safe extrapolation in
+  `QUALITY_CONTROL.md`; and
+- **Complete for the release gate:** clean-wheel smoke/field acceptance and the
+  retained regular, irregular, robust, Monte Carlo, depth-resolved, fixed-depth,
+  persistence, and temporal-query profiles provide separate correctness,
+  memory, and throughput evidence.
 
 Those are hardening and usability gates rather than missing harmonic equations.
 The spatial atlas and OpenDrift reader are a separate downstream product layer.
@@ -429,7 +442,7 @@ The spatial atlas and OpenDrift reader are a separate downstream product layer.
 RUTide has broad Python UTide *analysis* compatibility for the supported cases in
 the machine-readable feature and option matrices: items 1 through 5 have explicit
 behavior and pass their pinned oracles. This does not mean byte-for-byte API or
-archive interchangeability, nor that planned MATLAB restorations and downstream
-spatial products are complete. Performance claims remain profile-specific:
+archive interchangeability, nor that the downstream spatial product is
+complete. Performance claims remain profile-specific:
 regular FVCOM OLS, irregular Lomb–Scargle confidence, robust fitting, Monte Carlo
 intervals, and temporal current queries are reported separately.
