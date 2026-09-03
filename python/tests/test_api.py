@@ -35,7 +35,21 @@ class ScalarApiTests(unittest.TestCase):
     def test_prefilter_recovers_physical_amplitude_and_persists_reconstruction(self) -> None:
         time = 60_000.0 + np.arange(24 * 70, dtype=np.float64) / 24.0
         gain = 0.4
-        observations = 0.25 + gain * harmonic(time, M2_CPH, 1.2, 0.4)
+        common = {
+            "lat": 60.0,
+            "constit": ["M2"],
+            "conf_int": "none",
+            "trend": False,
+            "phase": "raw",
+            "nodal": False,
+            "verbose": False,
+        }
+        # Catalogue frequencies are computed from the astronomical arguments at
+        # the record epoch.  Use that exact frequency so this test measures the
+        # pre-filter path rather than drift from the rounded M2_CPH test constant.
+        frequency_probe = rutide.solve(time, np.zeros_like(time), **common)
+        frequency_cph = float(frequency_probe.aux.frq[0])
+        observations = 0.25 + gain * harmonic(time, frequency_cph, 1.2, 0.4)
         prefilt = {
             "frq": [0.0, 0.2],
             "P": [gain, gain],
@@ -44,14 +58,8 @@ class ScalarApiTests(unittest.TestCase):
         coefficients = rutide.solve(
             time,
             observations,
-            lat=60.0,
-            constit=["M2"],
-            conf_int="none",
-            trend=False,
-            phase="raw",
-            nodal=False,
             prefilt=prefilt,
-            verbose=False,
+            **common,
         )
         self.assertAlmostEqual(coefficients.A[0], 1.2, places=10)
         np.testing.assert_array_equal(coefficients.prefilt.frq, [0.0, 0.2])
@@ -60,18 +68,12 @@ class ScalarApiTests(unittest.TestCase):
         self.assertEqual(coefficients.prefilt.fallback, "error")
         self.assertFalse(coefficients.prefilt.P.flags.writeable)
         reconstructed = rutide.reconstruct(time, coefficients, min_SNR=None, verbose=False)
-        np.testing.assert_allclose(reconstructed.h, observations, rtol=0.0, atol=1e-7)
+        np.testing.assert_allclose(reconstructed.h, observations, rtol=0.0, atol=2e-11)
 
         uncorrected = rutide.solve(
             time,
             observations,
-            lat=60.0,
-            constit=["M2"],
-            conf_int="none",
-            trend=False,
-            phase="raw",
-            nodal=False,
-            verbose=False,
+            **common,
         )
         self.assertAlmostEqual(uncorrected.A[0], gain * 1.2, places=10)
         self.assertIsNone(uncorrected.prefilt)
