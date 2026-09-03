@@ -45,8 +45,9 @@ features = ["pyo3/extension-module"]
 strip = true
 include = [
   { path = "LICENSE", format = "sdist" },
-  { path = "PYTHON_API.md", format = "sdist" },
-  { path = "COMPATIBILITY.md", format = "sdist" },
+  { path = "*.md", format = "sdist" },
+  { path = "compatibility/*.json", format = "sdist" },
+  { path = "benchmarks/results/*.md", format = "sdist" },
   { path = "python/tests/*.py", format = "sdist" },
 ]
 
