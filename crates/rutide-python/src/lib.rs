@@ -14,9 +14,10 @@ use pyo3::{
 use rutide_core::{
     ConstituentDiagnosticsOptions, ConstituentSelectionDiagnostics, FitOptions, GreenwichNodalOls,
     InferenceMode, LinearConfidence, MonteCarloOptions, NodalCorrections, PhaseReference,
-    ReconstructionFilter, RobustOptions, RobustTermination, RobustWeightFunction,
-    ScalarInferenceOls, ScalarInferenceRelation, ScalarSolution, SolverOptions, TidalConstituent,
-    VectorInferenceOls, VectorInferenceRelation, VectorSolution, select_constituents_by_rayleigh,
+    PreFilterCorrection, PreFilterFallback, ReconstructionFilter, RobustOptions, RobustTermination,
+    RobustWeightFunction, ScalarInferenceOls, ScalarInferenceRelation, ScalarSolution,
+    SolverOptions, TidalConstituent, VectorInferenceOls, VectorInferenceRelation, VectorSolution,
+    select_constituents_by_rayleigh,
 };
 
 #[derive(Clone, Copy)]
@@ -87,6 +88,7 @@ impl Fit {
         output.set_item("confidence", &self.confidence)?;
         output.set_item("phase_reference", &self.phase_reference)?;
         output.set_item("nodal_corrections", &self.nodal_corrections)?;
+        add_prefilter_summary(py, &output, &self.config)?;
         output.set_item("trend", self.trend)?;
         output.set_item("nobs", self.retained_observations)?;
         output.set_item("nobs_original", self.original_observations)?;
@@ -147,6 +149,11 @@ fn solve(
     trend: bool,
     phase_name: &str,
     nodal_name: &str,
+    prefilter_frequency_cph: Vec<f64>,
+    prefilter_gain: Vec<f64>,
+    prefilter_minimum_gain: Option<f64>,
+    prefilter_maximum_gain: Option<f64>,
+    prefilter_fallback_name: &str,
     monte_carlo_realizations: usize,
     monte_carlo_seed: u64,
     robust_weight_name: &str,
@@ -179,6 +186,11 @@ fn solve(
         trend,
         phase_name: phase_name.to_owned(),
         nodal_name: nodal_name.to_owned(),
+        prefilter_frequency_cph,
+        prefilter_gain,
+        prefilter_minimum_gain,
+        prefilter_maximum_gain,
+        prefilter_fallback_name: prefilter_fallback_name.to_owned(),
         monte_carlo_realizations,
         monte_carlo_seed,
         robust_weight_name: robust_weight_name.to_owned(),
@@ -265,6 +277,11 @@ struct SolveConfig {
     trend: bool,
     phase_name: String,
     nodal_name: String,
+    prefilter_frequency_cph: Vec<f64>,
+    prefilter_gain: Vec<f64>,
+    prefilter_minimum_gain: Option<f64>,
+    prefilter_maximum_gain: Option<f64>,
+    prefilter_fallback_name: String,
     monte_carlo_realizations: usize,
     monte_carlo_seed: u64,
     robust_weight_name: String,
@@ -278,6 +295,87 @@ struct SolveConfig {
     approximate_inference: bool,
     order_name: String,
     order_names: Vec<String>,
+}
+
+fn solver_options(
+    config: &SolveConfig,
+    phase_reference: PhaseReference,
+    nodal_corrections: NodalCorrections,
+) -> Result<SolverOptions, String> {
+    let options = SolverOptions::new(
+        FitOptions {
+            trend: config.trend,
+        },
+        phase_reference,
+    )
+    .with_nodal_corrections(nodal_corrections);
+    if config.prefilter_frequency_cph.is_empty() && config.prefilter_gain.is_empty() {
+        if config.prefilter_minimum_gain.is_some() || config.prefilter_maximum_gain.is_some() {
+            return Err("prefilt gain bounds require frequency and gain arrays".to_owned());
+        }
+        return match config.prefilter_fallback_name.as_str() {
+            "error" => Ok(options),
+            name => Err(format!(
+                "prefilt fallback {name:?} requires a filter response"
+            )),
+        };
+    }
+    let minimum = config
+        .prefilter_minimum_gain
+        .ok_or("prefilt requires a two-value acceptable gain range")?;
+    let maximum = config
+        .prefilter_maximum_gain
+        .ok_or("prefilt requires a two-value acceptable gain range")?;
+    let fallback = match config.prefilter_fallback_name.as_str() {
+        "error" => PreFilterFallback::Error,
+        "unity" => PreFilterFallback::Unity,
+        name => {
+            return Err(format!(
+                "prefilt fallback must be 'error' or 'unity', not {name:?}"
+            ));
+        }
+    };
+    let correction = PreFilterCorrection::new(
+        config.prefilter_frequency_cph.clone(),
+        config.prefilter_gain.clone(),
+        minimum,
+        maximum,
+    )
+    .map_err(|error| error.to_string())?
+    .with_fallback(fallback);
+    Ok(options.with_prefilter_correction(correction))
+}
+
+fn add_prefilter_summary(
+    py: Python<'_>,
+    output: &Bound<'_, PyDict>,
+    config: &SolveConfig,
+) -> PyResult<()> {
+    if config.prefilter_frequency_cph.is_empty() {
+        output.set_item("prefilt", py.None())?;
+        output.set_item("prefilter", py.None())?;
+        return Ok(());
+    }
+    let summary = PyDict::new(py);
+    summary.set_item("frq", &config.prefilter_frequency_cph)?;
+    summary.set_item("frequency_cph", &config.prefilter_frequency_cph)?;
+    summary.set_item("P", &config.prefilter_gain)?;
+    summary.set_item("gain", &config.prefilter_gain)?;
+    summary.set_item(
+        "rng",
+        [
+            config
+                .prefilter_minimum_gain
+                .expect("validated pre-filter minimum"),
+            config
+                .prefilter_maximum_gain
+                .expect("validated pre-filter maximum"),
+        ],
+    )?;
+    summary.set_item("fallback", &config.prefilter_fallback_name)?;
+    output.set_item("prefilt", &summary)?;
+    output.set_item("prefilter", summary)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -300,13 +398,7 @@ fn solve_native(
     };
     let phase_reference = parse_phase_reference(&config.phase_name)?;
     let nodal_corrections = parse_nodal_corrections(&config.nodal_name)?;
-    let solver_options = SolverOptions::new(
-        FitOptions {
-            trend: config.trend,
-        },
-        phase_reference,
-    )
-    .with_nodal_corrections(nodal_corrections);
+    let solver_options = solver_options(config, phase_reference, nodal_corrections)?;
     let confidence = parse_confidence(
         &config.confidence_name,
         config.white,

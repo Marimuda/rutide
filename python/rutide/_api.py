@@ -280,6 +280,7 @@ def solve(
     trend: bool = True,
     phase: Literal["Greenwich", "linear_time", "raw"] = "Greenwich",
     nodal: bool | Literal["linear_time"] = True,
+    prefilt: Mapping[str, Any] | None = None,
     infer: Mapping[str, Any] | None = None,
     order_constit: Literal["PE", "SNR", "frequency"] | Sequence[str] | None = "PE",
     MC_n: int = 200,
@@ -300,6 +301,11 @@ def solve(
     rejected. Set ``diagnostics=True`` to add Codiga's RR, RNM, Corrmax,
     condition-number, and tidal-variance suite as ``coef.diagn``. This requires
     confidence intervals because RNM and the significant subset use SNR.
+    ``prefilt`` accepts MATLAB names ``frq``, ``P``, and ``rng`` or descriptive
+    aliases ``frequency_cph``, ``gain``, and ``acceptable_gain_range``. RUTide
+    rejects unsafe/out-of-band gains by default; set ``fallback='unity'`` for
+    MATLAB's legacy substitution behavior. The same real response is applied to
+    both components of a vector fit.
     ``verbose`` is accepted for source compatibility and is silent.
     """
 
@@ -326,6 +332,7 @@ def solve(
             trend,
             phase,
             nodal,
+            prefilt,
             infer,
             order_constit,
             MC_n,
@@ -353,6 +360,7 @@ def solve_many(
     trend: bool = True,
     phase: Literal["Greenwich", "linear_time", "raw"] = "Greenwich",
     nodal: bool | Literal["linear_time"] = True,
+    prefilt: Mapping[str, Any] | None = None,
     infer: Mapping[str, Any] | None = None,
     order_constit: Literal["PE", "SNR", "frequency"] | Sequence[str] | None = "PE",
     MC_n: int = 200,
@@ -409,6 +417,7 @@ def solve_many(
             trend,
             phase,
             nodal,
+            prefilt,
             infer,
             order_constit,
             MC_n,
@@ -636,6 +645,7 @@ def _solver_arguments(
     trend: bool,
     phase: Literal["Greenwich", "linear_time", "raw"],
     nodal: bool | Literal["linear_time"],
+    prefilt: Mapping[str, Any] | None,
     infer: Mapping[str, Any] | None,
     order_constit: Literal["PE", "SNR", "frequency"] | Sequence[str] | None,
     MC_n: int,
@@ -648,6 +658,7 @@ def _solver_arguments(
     vector: bool,
 ) -> tuple[Any, ...]:
     constituents = _constituent_selection(constit)
+    prefilter = _parse_prefilter(prefilt)
     inferred, references, ratios, phase_offsets, approximate = _parse_inference(infer, vector)
     robust = dict(robust_kw or {})
     robust_weight = str(_pop_alias(robust, "weight_function", "weight", "cauchy"))
@@ -670,6 +681,7 @@ def _solver_arguments(
         bool(trend),
         phase,
         _nodal_name(nodal),
+        *prefilter,
         int(MC_n),
         int(MC_seed),
         robust_weight,
@@ -694,6 +706,50 @@ def _constituent_selection(
     if isinstance(value, str):
         raise ValueError("constit must be 'auto' or a sequence of constituent names")
     return [str(name) for name in value]
+
+
+def _parse_prefilter(
+    value: Mapping[str, Any] | None,
+) -> tuple[list[float], list[float], float | None, float | None, str]:
+    if value is None:
+        return [], [], None, None, "error"
+    if not isinstance(value, Mapping):
+        raise TypeError("prefilt must be a mapping or None")
+    options = dict(value)
+
+    def take(primary: str, alias: str) -> Any:
+        if primary in options and alias in options:
+            raise TypeError(f"prefilt cannot contain both '{primary}' and '{alias}'")
+        if primary in options:
+            return options.pop(primary)
+        if alias in options:
+            return options.pop(alias)
+        raise ValueError(f"prefilt requires '{primary}' (or '{alias}')")
+
+    frequencies = np.asarray(take("frequency_cph", "frq"))
+    gains = np.asarray(take("gain", "P"))
+    gain_range = np.asarray(take("acceptable_gain_range", "rng"), dtype=np.float64)
+    fallback = str(options.pop("fallback", "error")).lower()
+    if options:
+        unknown = ", ".join(sorted(str(key) for key in options))
+        raise TypeError(f"unknown prefilt option(s): {unknown}")
+    if frequencies.ndim != 1 or gains.ndim != 1:
+        raise ValueError("prefilt frequencies and gains must be one-dimensional")
+    if np.iscomplexobj(frequencies) or np.iscomplexobj(gains):
+        raise ValueError(
+            "prefilt currently supports a real response shared by scalar or u/v components"
+        )
+    if gain_range.shape != (2,):
+        raise ValueError("prefilt acceptable gain range must contain exactly two values")
+    if fallback not in ("error", "unity"):
+        raise ValueError("prefilt fallback must be 'error' or 'unity'")
+    return (
+        [float(item) for item in frequencies],
+        [float(item) for item in gains],
+        float(gain_range[0]),
+        float(gain_range[1]),
+        fallback,
+    )
 
 
 def _time_to_mjd(value: ArrayLike, epoch: Epoch | None) -> npt.NDArray[np.float64]:

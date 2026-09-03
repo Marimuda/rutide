@@ -5,16 +5,16 @@ use std::collections::HashSet;
 use numpy::{IntoPyArray, PyReadonlyArray1};
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyDict};
 use rutide_core::{
-    ConstituentIndependenceDiagnostics, ConstituentSelectionDiagnostics, FitOptions,
-    GreenwichNodalOls, InferenceMode, NeighboringConstituentDiagnostics, RobustDiagnostics,
-    RobustTermination, ScalarInferenceOls, ScalarSolution, SolverOptions, TidalVarianceDiagnostics,
+    ConstituentIndependenceDiagnostics, ConstituentSelectionDiagnostics, GreenwichNodalOls,
+    InferenceMode, NeighboringConstituentDiagnostics, RobustDiagnostics, RobustTermination,
+    ScalarInferenceOls, ScalarSolution, SolverOptions, TidalVarianceDiagnostics,
     VectorInferenceOls, VectorSolution, WholeModelIndependenceDiagnostics,
 };
 
 use super::{
     Fit, FitState, FittedSolution, PreparedModel, SolveConfig, constituent_metadata,
     normalized_confidence_name, parse_confidence, parse_constituents, parse_method_and_robust,
-    parse_nodal_corrections, parse_phase_reference, scalar_inference_relations,
+    parse_nodal_corrections, parse_phase_reference, scalar_inference_relations, solver_options,
     validate_empty_inference, vector_inference_relations,
 };
 
@@ -70,13 +70,8 @@ pub(super) fn restore_fit(py: Python<'_>, snapshot: &Bound<'_, PyDict>) -> PyRes
     .map_err(snapshot_error)?;
     let phase_reference = parse_phase_reference(&config.phase_name).map_err(snapshot_error)?;
     let nodal_corrections = parse_nodal_corrections(&config.nodal_name).map_err(snapshot_error)?;
-    let solver_options = SolverOptions::new(
-        FitOptions {
-            trend: config.trend,
-        },
-        phase_reference,
-    )
-    .with_nodal_corrections(nodal_corrections);
+    let solver_options =
+        solver_options(&config, phase_reference, nodal_corrections).map_err(snapshot_error)?;
     let confidence = parse_confidence(
         &config.confidence_name,
         config.white,
@@ -317,6 +312,11 @@ pub(crate) fn config_snapshot<'py>(
     output.set_item("trend", config.trend)?;
     output.set_item("phase_name", &config.phase_name)?;
     output.set_item("nodal_name", &config.nodal_name)?;
+    output.set_item("prefilter_frequency_cph", &config.prefilter_frequency_cph)?;
+    output.set_item("prefilter_gain", &config.prefilter_gain)?;
+    output.set_item("prefilter_minimum_gain", config.prefilter_minimum_gain)?;
+    output.set_item("prefilter_maximum_gain", config.prefilter_maximum_gain)?;
+    output.set_item("prefilter_fallback_name", &config.prefilter_fallback_name)?;
     output.set_item("monte_carlo_realizations", config.monte_carlo_realizations)?;
     output.set_item("monte_carlo_seed", config.monte_carlo_seed)?;
     output.set_item("robust_weight_name", &config.robust_weight_name)?;
@@ -347,6 +347,13 @@ pub(crate) fn config_from_snapshot(input: &Bound<'_, PyDict>) -> PyResult<SolveC
         trend: required_extract(input, "trend")?,
         phase_name: required_extract(input, "phase_name")?,
         nodal_name: required_extract(input, "nodal_name")?,
+        prefilter_frequency_cph: optional_extract(input, "prefilter_frequency_cph")?
+            .unwrap_or_default(),
+        prefilter_gain: optional_extract(input, "prefilter_gain")?.unwrap_or_default(),
+        prefilter_minimum_gain: optional_float(input, "prefilter_minimum_gain")?,
+        prefilter_maximum_gain: optional_float(input, "prefilter_maximum_gain")?,
+        prefilter_fallback_name: optional_extract(input, "prefilter_fallback_name")?
+            .unwrap_or_else(|| "error".to_owned()),
         monte_carlo_realizations: required_extract(input, "monte_carlo_realizations")?,
         monte_carlo_seed: required_extract(input, "monte_carlo_seed")?,
         robust_weight_name: required_extract(input, "robust_weight_name")?,

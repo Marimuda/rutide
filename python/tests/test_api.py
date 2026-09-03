@@ -32,6 +32,100 @@ class BunchTests(unittest.TestCase):
 
 
 class ScalarApiTests(unittest.TestCase):
+    def test_prefilter_recovers_physical_amplitude_and_persists_reconstruction(self) -> None:
+        time = 60_000.0 + np.arange(24 * 70, dtype=np.float64) / 24.0
+        gain = 0.4
+        observations = 0.25 + gain * harmonic(time, M2_CPH, 1.2, 0.4)
+        prefilt = {
+            "frq": [0.0, 0.2],
+            "P": [gain, gain],
+            "rng": [0.01, 2.0],
+        }
+        coefficients = rutide.solve(
+            time,
+            observations,
+            lat=60.0,
+            constit=["M2"],
+            conf_int="none",
+            trend=False,
+            phase="raw",
+            nodal=False,
+            prefilt=prefilt,
+            verbose=False,
+        )
+        self.assertAlmostEqual(coefficients.A[0], 1.2, places=10)
+        np.testing.assert_array_equal(coefficients.prefilt.frq, [0.0, 0.2])
+        np.testing.assert_array_equal(coefficients.prefilter.gain, [gain, gain])
+        np.testing.assert_array_equal(coefficients.prefilt.rng, [0.01, 2.0])
+        self.assertEqual(coefficients.prefilt.fallback, "error")
+        self.assertFalse(coefficients.prefilt.P.flags.writeable)
+        reconstructed = rutide.reconstruct(time, coefficients, min_SNR=None, verbose=False)
+        np.testing.assert_allclose(reconstructed.h, observations, rtol=0.0, atol=1e-7)
+
+        uncorrected = rutide.solve(
+            time,
+            observations,
+            lat=60.0,
+            constit=["M2"],
+            conf_int="none",
+            trend=False,
+            phase="raw",
+            nodal=False,
+            verbose=False,
+        )
+        self.assertAlmostEqual(uncorrected.A[0], gain * 1.2, places=10)
+        self.assertIsNone(uncorrected.prefilt)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "prefiltered.rutide.npz"
+            coefficients.save(path)
+            restored = rutide.load(path)
+        np.testing.assert_array_equal(restored.prefilt.frq, coefficients.prefilt.frq)
+        np.testing.assert_array_equal(restored.prefilt.P, coefficients.prefilt.P)
+        actual = rutide.reconstruct(time, restored, min_SNR=None, verbose=False)
+        np.testing.assert_array_equal(actual.h, reconstructed.h)
+
+    def test_prefilter_validation_is_explicit(self) -> None:
+        time = 60_000.0 + np.arange(800, dtype=np.float64) / 24.0
+        observations = harmonic(time, M2_CPH, 1.0, 0.0)
+        common = {
+            "lat": 60.0,
+            "constit": ["M2"],
+            "conf_int": "none",
+            "trend": False,
+            "verbose": False,
+        }
+        with self.assertRaisesRegex(ValueError, "outside the pre-filter response range"):
+            rutide.solve(
+                time,
+                observations,
+                prefilt={"frq": [0.0, 0.05], "P": [1.0, 0.8], "rng": [0.01, 2.0]},
+                **common,
+            )
+        compatible = rutide.solve(
+            time,
+            observations,
+            prefilt={
+                "frequency_cph": [0.0, 0.05],
+                "gain": [1.0, 0.8],
+                "acceptable_gain_range": [0.01, 2.0],
+                "fallback": "unity",
+            },
+            **common,
+        )
+        self.assertEqual(compatible.prefilt.fallback, "unity")
+        with self.assertRaisesRegex(ValueError, "real response"):
+            rutide.solve(
+                time,
+                observations,
+                prefilt={
+                    "frq": [0.0, 0.2],
+                    "P": [1.0 + 0.0j, 0.5 + 0.1j],
+                    "rng": [0.01, 2.0],
+                },
+                **common,
+            )
+
     def test_opt_in_identifiability_diagnostics_and_table(self) -> None:
         time = 60_000.0 + np.arange(24 * 70, dtype=np.float64) / 24.0
         observations = harmonic(time, M2_CPH, 1.0, 0.2)
@@ -382,6 +476,48 @@ class VectorApiTests(unittest.TestCase):
 
 
 class BatchApiTests(unittest.TestCase):
+    def test_prefilter_batch_matches_single_fits_with_a_gappy_series(self) -> None:
+        time = 60_000.0 + np.arange(24 * 70, dtype=np.float64) / 24.0
+        gain = 0.55
+        observations = np.column_stack(
+            [
+                0.1 + gain * harmonic(time, M2_CPH, 0.8, 0.2),
+                -0.2 + gain * harmonic(time, M2_CPH, 1.1, -0.3),
+            ]
+        )
+        observations[17::43, 1] = np.nan
+        prefilt = {"frq": [0.0, 0.2], "P": [gain, gain], "rng": [0.01, 2.0]}
+        batch = rutide.solve_many(
+            time,
+            observations,
+            lat=[60.0, 61.0],
+            constit=["M2"],
+            conf_int="none",
+            trend=False,
+            phase="raw",
+            nodal=False,
+            prefilt=prefilt,
+            workers=2,
+            verbose=False,
+        )
+        np.testing.assert_allclose(batch.A[:, 0], [0.8, 1.1], rtol=0.0, atol=2e-10)
+        np.testing.assert_array_equal(batch.prefilt.P, [gain, gain])
+        for series in range(2):
+            single = rutide.solve(
+                time,
+                observations[:, series],
+                lat=60.0 + series,
+                constit=["M2"],
+                conf_int="none",
+                trend=False,
+                phase="raw",
+                nodal=False,
+                prefilt=prefilt,
+                verbose=False,
+            )
+            np.testing.assert_allclose(batch.A[series], single.A, rtol=0.0, atol=2e-11)
+            np.testing.assert_allclose(batch.g[series], single.g, rtol=0.0, atol=2e-10)
+
     def test_opt_in_batch_diagnostics_are_dense_and_gappy(self) -> None:
         count = 24 * 70
         time = 60_000.0 + np.arange(count, dtype=np.float64) / 24.0

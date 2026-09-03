@@ -13,15 +13,16 @@ use rayon::{ThreadPool, ThreadPoolBuilder};
 use rutide_core::{
     CartesianVectorSolution, ConstituentDiagnosticsOptions, ConstituentSelectionDiagnostics,
     GreenwichNodalBatch, GreenwichNodalReconstructor, InferenceMode, ReconstructionFilter,
-    RobustOptions, RobustTermination, ScalarInferenceBatch, ScalarSolution, SolverOptions,
-    TidalConstituent, VectorInferenceBatch, VectorSolution, select_constituents_by_rayleigh,
+    RobustOptions, RobustTermination, ScalarInferenceBatch, ScalarSolution, TidalConstituent,
+    VectorInferenceBatch, VectorSolution, select_constituents_by_rayleigh,
 };
 
 use super::{
-    Confidence, SolveConfig, constituent_order_from_diagnostics, normalized_confidence_name,
-    parse_confidence, parse_constituents, parse_method_and_robust, parse_nodal_corrections,
-    parse_phase_reference, reconstruction_filter, scalar_inference_relations,
-    validate_empty_inference, vector_inference_relations,
+    Confidence, SolveConfig, add_prefilter_summary, constituent_order_from_diagnostics,
+    normalized_confidence_name, parse_confidence, parse_constituents, parse_method_and_robust,
+    parse_nodal_corrections, parse_phase_reference, reconstruction_filter,
+    scalar_inference_relations, solver_options, validate_empty_inference,
+    vector_inference_relations,
 };
 
 enum PreparedBatchModel {
@@ -110,6 +111,11 @@ pub(super) fn solve_many(
     trend: bool,
     phase_name: &str,
     nodal_name: &str,
+    prefilter_frequency_cph: Vec<f64>,
+    prefilter_gain: Vec<f64>,
+    prefilter_minimum_gain: Option<f64>,
+    prefilter_maximum_gain: Option<f64>,
+    prefilter_fallback_name: &str,
     monte_carlo_realizations: usize,
     monte_carlo_seed: u64,
     robust_weight_name: &str,
@@ -150,6 +156,11 @@ pub(super) fn solve_many(
         trend,
         phase_name: phase_name.to_owned(),
         nodal_name: nodal_name.to_owned(),
+        prefilter_frequency_cph,
+        prefilter_gain,
+        prefilter_minimum_gain,
+        prefilter_maximum_gain,
+        prefilter_fallback_name: prefilter_fallback_name.to_owned(),
         monte_carlo_realizations,
         monte_carlo_seed,
         robust_weight_name: robust_weight_name.to_owned(),
@@ -304,13 +315,7 @@ fn solve_many_native(
     };
     let phase_reference = parse_phase_reference(&config.phase_name)?;
     let nodal_corrections = parse_nodal_corrections(&config.nodal_name)?;
-    let solver_options = SolverOptions::new(
-        rutide_core::FitOptions {
-            trend: config.trend,
-        },
-        phase_reference,
-    )
-    .with_nodal_corrections(nodal_corrections);
+    let solver_options = solver_options(config, phase_reference, nodal_corrections)?;
     let confidence = parse_confidence(
         &config.confidence_name,
         config.white,
@@ -954,6 +959,7 @@ impl BatchFitState {
         output.set_item("confidence", &self.confidence)?;
         output.set_item("phase_reference", &self.phase_reference)?;
         output.set_item("nodal_corrections", &self.nodal_corrections)?;
+        add_prefilter_summary(py, &output, &self.config)?;
         output.set_item("trend", self.trend)?;
         output.set_item("series_count", series_count)?;
         output.set_item("nobs_original", self.original_time_count)?;

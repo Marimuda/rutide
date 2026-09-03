@@ -9,8 +9,7 @@ use pyo3::{
 };
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
-    FitOptions, GreenwichNodalBatch, InferenceMode, ScalarInferenceBatch, SolverOptions,
-    VectorInferenceBatch,
+    GreenwichNodalBatch, InferenceMode, ScalarInferenceBatch, SolverOptions, VectorInferenceBatch,
 };
 
 use super::{BatchFit, BatchFitState, BatchSolutions, PreparedBatchModel, requested_worker_count};
@@ -24,7 +23,8 @@ use crate::{
         snapshot_error, snapshot_header, validate_header, validate_presentation_order,
         vector_solution_from_snapshot, vector_solution_snapshot,
     },
-    scalar_inference_relations, validate_empty_inference, vector_inference_relations,
+    scalar_inference_relations, solver_options, validate_empty_inference,
+    vector_inference_relations,
 };
 
 pub(super) fn batch_snapshot<'py>(
@@ -106,13 +106,8 @@ pub(super) fn restore_batch(
     .map_err(snapshot_error)?;
     let phase_reference = parse_phase_reference(&config.phase_name).map_err(snapshot_error)?;
     let nodal_corrections = parse_nodal_corrections(&config.nodal_name).map_err(snapshot_error)?;
-    let solver_options = SolverOptions::new(
-        FitOptions {
-            trend: config.trend,
-        },
-        phase_reference,
-    )
-    .with_nodal_corrections(nodal_corrections);
+    let solver_options =
+        solver_options(&config, phase_reference, nodal_corrections).map_err(snapshot_error)?;
     let confidence = parse_confidence(
         &config.confidence_name,
         config.white,
