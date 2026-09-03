@@ -7,6 +7,7 @@
 mod astronomy;
 mod catalog;
 mod corrected;
+mod diagnostics;
 mod error;
 mod monte_carlo;
 mod robust;
@@ -25,6 +26,11 @@ pub use corrected::{
     NodalCorrections, PhaseReference, ReconstructionFilter, ScalarInferenceBatch,
     ScalarInferenceOls, ScalarInferenceRelation, SolverOptions, VectorInferenceBatch,
     VectorInferenceOls, VectorInferenceRelation,
+};
+pub use diagnostics::{
+    ConstituentIndependenceDiagnostics, DiagnosticConstituentRole,
+    NeighboringConstituentDiagnostics, TidalVarianceDiagnostics, adjacent_constituent_diagnostics,
+    scalar_tidal_variance_diagnostics, vector_tidal_variance_diagnostics,
 };
 pub use error::AnalysisError;
 pub use monte_carlo::MonteCarloOptions;

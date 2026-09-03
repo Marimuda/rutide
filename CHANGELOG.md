@@ -9,6 +9,10 @@ published API and file-schema contracts.
 
 ### Added
 
+- Public Codiga equation-81 adjacent-frequency Rayleigh and equations-99–102
+  scalar/vector tidal-variance kernels as the first RUTide 0.3.0 constituent-
+  identifiability increment, with explicit inferred-constituent and zero-variance
+  behavior.
 - An installed-wheel acceptance harness for a public NOAA/NDBC ADCP profile and
   a domain-spanning selection from the 25.78 GB FVCOM fixture, including
   reconstruction and coefficient-persistence validation.

@@ -56,6 +56,15 @@ pub enum AnalysisError {
     EmptyConstituents,
     /// The Rayleigh criterion is not finite and strictly positive.
     InvalidRayleighMinimum,
+    /// The effective record length supplied to selection diagnostics is invalid.
+    InvalidDiagnosticEffectiveRecordLength,
+    /// A detrended value supplied to reconstructed-fit diagnostics is not finite.
+    NonFiniteDiagnosticValue {
+        /// Diagnostic input field containing the invalid value.
+        field: &'static str,
+        /// Position of the invalid value.
+        index: usize,
+    },
     /// A reconstruction threshold is negative or non-finite.
     InvalidReconstructionThreshold {
         /// Diagnostic whose threshold is invalid.
@@ -213,6 +222,13 @@ impl fmt::Display for AnalysisError {
             Self::InvalidRayleighMinimum => {
                 formatter.write_str("Rayleigh minimum must be finite and greater than zero")
             }
+            Self::InvalidDiagnosticEffectiveRecordLength => formatter.write_str(
+                "diagnostic effective record length must be finite and greater than zero",
+            ),
+            Self::NonFiniteDiagnosticValue { field, index } => write!(
+                formatter,
+                "diagnostic field {field:?} contains a non-finite value at index {index}"
+            ),
             Self::InvalidReconstructionThreshold { diagnostic } => write!(
                 formatter,
                 "{diagnostic} reconstruction threshold must be finite and non-negative"

@@ -2398,7 +2398,7 @@ fn usize_to_f64(value: usize) -> f64 {
     value as f64
 }
 
-fn validate_constituents(constituents: &[Constituent]) -> Result<(), AnalysisError> {
+pub(crate) fn validate_constituents(constituents: &[Constituent]) -> Result<(), AnalysisError> {
     if constituents.is_empty() {
         return Err(AnalysisError::EmptyConstituents);
     }

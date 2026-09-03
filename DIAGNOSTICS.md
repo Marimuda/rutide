@@ -1,0 +1,82 @@
+# Constituent-selection diagnostics
+
+RUTide 0.3.0 restores the constituent-selection diagnostics described in
+section II.D of Codiga (2011), *Unified Tidal Analysis and Prediction Using the
+UTide Matlab Functions*. Python UTide retains PE and SNR but not the broader
+independence and reconstructed-fit suite.
+
+The diagnostics are advisory. They explain whether a chosen model appears
+identifiable and how much detrended variance it captures; they do not silently
+change the fitted constituent set. A later caller can use the evidence to make an
+explicit second fit with a constituent removed or inferred.
+
+## Definitions and conventions
+
+For adjacent directly modeled constituents `q1` and `q2`, conventional Rayleigh
+resolution is Codiga equation 81:
+
+```text
+RR(q1, q2) = 24 * effective_record_length_days
+             * abs(frequency_q2_cph - frequency_q1_cph) / Rmin
+```
+
+Neighbor relationships are constructed in ascending frequency order and mapped
+back to stable fitted-constituent order. Reference constituents participate;
+inferred constituents do not, because their amplitudes are constrained rather
+than independently identified. A value of one is the conventional boundary, but
+RUTide reports the value instead of treating it as a new automatic-selection
+rule.
+
+Tidal variance follows equations 99–102 and the original MATLAB implementation.
+After subtracting the fitted mean and optional trend:
+
+```text
+TVraw   = mean(raw_east^2 + raw_north^2)
+TVallc  = mean(all_fit_east^2 + all_fit_north^2)
+TVsnrc  = mean(SNR_subset_east^2 + SNR_subset_north^2)
+PTV*    = 100 * TV* / TVraw
+```
+
+The northward terms are omitted for a scalar record. If `TVraw` is zero, the
+percentage is mathematically undefined and the typed API returns `None` rather
+than propagating an implicit NaN or infinity.
+
+RNM follows equation 82 by multiplying RR by the square root of the adjacent
+constituents' mean SNR. `K` is the two-norm condition number of the actual basis
+matrix, and `SNRallc / K > 1` is the report's whole-model error-bound criterion.
+Corrmax is the greatest absolute correlation among the two scalar or four vector
+Cartesian parameters belonging to an adjacent constituent pair. Those
+covariance-dependent quantities are the next implementation increment.
+
+## Irregular records
+
+The suite is evaluated for the retained record. Basis-derived `K` and `Corrmax`
+use its actual design matrix and therefore see the effects of gaps and clusters.
+RR and RNM instead reduce the sampling pattern to an effective record length,
+so the report warns that constituent selection for irregularly distributed
+timestamps is not rigorously characterized by these conventional thresholds.
+RUTide will serialize the existing sampling diagnostics beside these values and
+will not claim that RR or RNM alone proves identifiability for a heavily gapped
+record.
+
+## Planned 0.3.0 surface
+
+1. Public equation-81 neighbor and equation-99–102 tidal-variance kernels.
+2. Cached `K`, `SNRallc`, RNM, and Corrmax from the fitted design/covariance.
+3. Scalar, vector, ordinary, inferred, OLS, robust, complete, missing, and
+   irregular integration.
+4. Structured Rust and Python results plus compact human-readable presentation.
+5. Scalar NetCDF schema 17, vector schema 15, and backward-readable Python
+   coefficient snapshot schema 2.
+6. MATLAB-derived oracle fixtures and measured whole-field overhead before the
+   new diagnostics become a default application profile.
+
+## Sources
+
+- [Codiga, D. L. (2011), GSO Technical Report 2011-01](https://www.po.gso.uri.edu/~codiga/utide/2011Codiga-UTide-Report.pdf),
+  section II.D.
+- [MATLAB UTide `ut_diagntable`](https://github.com/OceanMetSEPA/utide_toolbox/blob/master/ut_solv.m),
+  used to resolve implementation details such as mean-square normalization,
+  effective record length, and inferred-neighbor exclusion.
+- [Python UTide `utide/diagnostics.py`](https://github.com/wesleybowman/UTide/blob/master/utide/diagnostics.py),
+  which computes PE and SNR only.
