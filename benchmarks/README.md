@@ -64,6 +64,29 @@ remain outside Git; the report retains provenance, source identity, separate
 input/solve/reconstruction timings, result digests, and a bitwise persistence/
 reconstruction check.
 
+Benchmark the native FVCOM read/solve pipeline against the same-width sequential
+vector control with separate complete processes. Automatic mode sizes both live
+input buffers inside the 512 MiB logical bound; an explicit chunk size disables
+overlap and preserves the sequential path:
+
+```console
+RUSTFLAGS="-C target-cpu=native" \
+  cargo run --release --bin rutide -- analyze-vector \
+  --input /path/to/frs2f_0001.nc --output automatic.nc \
+  --report automatic.json --workers 48
+
+RUSTFLAGS="-C target-cpu=native" \
+  cargo run --release --bin rutide -- analyze-vector \
+  --input /path/to/frs2f_0001.nc --output sequential.nc \
+  --report sequential.json --workers 48 --chunk-series 44992
+```
+
+The JSON `input_pipeline` field and matching NetCDF attribute distinguish
+`overlapped` from `sequential`. In overlapped mode, `input_seconds` is active
+reader time and coincides with solve/result work; compare `total_seconds` or
+whole-process wall rather than summing stage fields. Retained full-field results
+are in `benchmarks/results/input-pipeline-2026-09-03.md`.
+
 ## Workloads
 
 - `smoke`: one deterministic node;

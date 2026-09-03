@@ -7,6 +7,11 @@ use std::{
     fs::{self, File},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        mpsc::{Receiver, sync_channel},
+    },
+    thread::{self, JoinHandle},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -494,9 +499,13 @@ pub struct AnalyzeConfig {
 }
 
 /// Timings for the separately measured application stages.
+///
+/// With an overlapped input pipeline, active reader time can coincide with
+/// solving and result processing. Stage fields are then deliberately not
+/// additive; [`Self::total_seconds`] remains the elapsed application duration.
 #[derive(Clone, Debug, Serialize)]
 pub struct StageTimings {
-    /// Open, validate, and read selected `NetCDF` variables.
+    /// Open, validate, and actively read/convert selected `NetCDF` variables.
     pub input_seconds: f64,
     /// Prepare shared astronomical and satellite terms.
     pub preparation_seconds: f64,
@@ -766,7 +775,10 @@ pub struct RunReport {
     pub chunk_series: usize,
     /// Number of spatial chunks processed.
     pub chunk_count: usize,
-    /// Maximum logical bytes occupied by chunk-local promoted observation arrays.
+    /// Whether automatic input used a bounded reader/solver overlap.
+    pub input_pipeline: &'static str,
+    /// Maximum logical bytes occupied by all concurrently resident promoted
+    /// observation arrays.
     pub maximum_observation_buffer_bytes: u64,
     /// Least-squares method: `ols` or `robust`.
     pub analysis_method: &'static str,
@@ -949,6 +961,137 @@ struct ScalarInputChunk {
     observation_counts: Vec<usize>,
 }
 
+enum InputPipelineMessage<T> {
+    Item(T),
+    Error(AppError),
+    Finished,
+}
+
+/// A strict two-buffer producer/consumer pipeline.
+///
+/// Its zero-capacity channel allows the producer to construct one item while
+/// the caller owns another, but prevents it from beginning a third. Dropping
+/// the pipeline closes the receiver before joining so an early analysis error
+/// cannot leave the producer blocked in `send`.
+struct BoundedInputPipeline<T> {
+    receiver: Option<Receiver<InputPipelineMessage<T>>>,
+    thread: Option<JoinHandle<()>>,
+    finished: bool,
+}
+
+impl<T: Send + 'static> BoundedInputPipeline<T> {
+    fn spawn<F>(thread_name: &str, mut next: F) -> Result<Self, AppError>
+    where
+        F: FnMut() -> Result<Option<T>, AppError> + Send + 'static,
+    {
+        let (sender, receiver) = sync_channel(0);
+        let thread = thread::Builder::new()
+            .name(thread_name.to_owned())
+            .spawn(move || {
+                loop {
+                    match next() {
+                        Ok(Some(item)) => {
+                            if sender.send(InputPipelineMessage::Item(item)).is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => {
+                            let _ignored = sender.send(InputPipelineMessage::Finished);
+                            return;
+                        }
+                        Err(error) => {
+                            let _ignored = sender.send(InputPipelineMessage::Error(error));
+                            return;
+                        }
+                    }
+                }
+            })?;
+        Ok(Self {
+            receiver: Some(receiver),
+            thread: Some(thread),
+            finished: false,
+        })
+    }
+
+    fn next(&mut self) -> Result<Option<T>, AppError> {
+        if self.finished {
+            return Ok(None);
+        }
+        let message = self
+            .receiver
+            .as_ref()
+            .ok_or_else(|| AppError::Invalid("input pipeline receiver is closed".to_owned()))?
+            .recv()
+            .map_err(|_| AppError::Invalid("input pipeline terminated unexpectedly".to_owned()))?;
+        match message {
+            InputPipelineMessage::Item(item) => Ok(Some(item)),
+            InputPipelineMessage::Error(error) => Err(error),
+            InputPipelineMessage::Finished => {
+                self.finished = true;
+                Ok(None)
+            }
+        }
+    }
+
+    fn finish(mut self) -> Result<(), AppError> {
+        self.receiver.take();
+        self.join()
+    }
+
+    fn join(&mut self) -> Result<(), AppError> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        thread
+            .join()
+            .map_err(|_| AppError::Invalid("input pipeline reader panicked".to_owned()))
+    }
+}
+
+impl<T> Drop for BoundedInputPipeline<T> {
+    fn drop(&mut self) {
+        self.receiver.take();
+        if let Some(thread) = self.thread.take() {
+            let _ignored = thread.join();
+        }
+    }
+}
+
+struct PipelinedScalarChunk {
+    first_series: usize,
+    chunk: ScalarInputChunk,
+    input_seconds: f64,
+}
+
+fn pipelined_scalar_chunk_reader(
+    dataset: netcdf::File,
+    metadata: Arc<ScalarInputMetadata>,
+    series_per_chunk: usize,
+) -> Result<BoundedInputPipeline<PipelinedScalarChunk>, AppError> {
+    if series_per_chunk == 0 {
+        return Err(AppError::Invalid(
+            "pipelined scalar input requires a non-zero chunk size".to_owned(),
+        ));
+    }
+    let series_count = metadata.node_indices.len();
+    let mut first_series = 0;
+    BoundedInputPipeline::spawn("rutide-netcdf-reader", move || {
+        if first_series >= series_count {
+            return Ok(None);
+        }
+        let end_series = (first_series + series_per_chunk).min(series_count);
+        let input_start = Instant::now();
+        let chunk = read_fvcom_scalar_chunk(&dataset, &metadata, first_series..end_series)?;
+        let read = PipelinedScalarChunk {
+            first_series,
+            chunk,
+            input_seconds: input_start.elapsed().as_secs_f64(),
+        };
+        first_series = end_series;
+        Ok(Some(read))
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SpatialChunkPlan {
     series_per_chunk: usize,
@@ -994,6 +1137,25 @@ fn spatial_chunk_plan(
         chunk_count: series_count.div_ceil(series_per_chunk),
         maximum_observation_buffer_bytes,
     })
+}
+
+fn scalar_chunk_plan(
+    requested: Option<usize>,
+    series_count: usize,
+    source_time_count: usize,
+    workers: usize,
+) -> Result<(SpatialChunkPlan, bool), AppError> {
+    if requested.is_some() {
+        return spatial_chunk_plan(requested, series_count, source_time_count, 1, workers)
+            .map(|plan| (plan, false));
+    }
+    let pipelined = spatial_chunk_plan(None, series_count, source_time_count, 2, workers)?;
+    if pipelined.chunk_count > 1 {
+        Ok((pipelined, true))
+    } else {
+        spatial_chunk_plan(None, series_count, source_time_count, 1, workers)
+            .map(|plan| (plan, false))
+    }
 }
 
 enum ScalarAnalysisBatch {
@@ -1145,7 +1307,11 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
 
     let input_start = Instant::now();
     let dataset = netcdf::open(&config.input)?;
-    let metadata = read_fvcom_scalar_metadata(&config.input, &dataset, &config.nodes)?;
+    let metadata = Arc::new(read_fvcom_scalar_metadata(
+        &config.input,
+        &dataset,
+        &config.nodes,
+    )?);
     let mut input_seconds = input_start.elapsed().as_secs_f64();
 
     let preparation_start = Instant::now();
@@ -1165,11 +1331,10 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
     if let Some(filter) = &config.reconstruction {
         validate_reconstruction_filter(filter, batch.tidal_constituents())?;
     }
-    let chunk_plan = spatial_chunk_plan(
+    let (chunk_plan, input_pipeline) = scalar_chunk_plan(
         config.chunk_series,
         metadata.node_indices.len(),
         metadata.source_time_count,
-        1,
         config.workers,
     )?;
     let sampling_plan = SamplingDiagnosticsPlan::prepare(&metadata.modified_julian_days)?;
@@ -1195,11 +1360,46 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
     let mut solve_seconds = 0.0;
     let mut reconstruction_seconds = 0.0;
     let mut result_processing_seconds = 0.0;
-    for first_series in (0..series_count).step_by(chunk_plan.series_per_chunk) {
-        let end_series = (first_series + chunk_plan.series_per_chunk).min(series_count);
-        let read_start = Instant::now();
-        let chunk = read_fvcom_scalar_chunk(&dataset, &metadata, first_series..end_series)?;
-        input_seconds += read_start.elapsed().as_secs_f64();
+    let mut dataset = Some(dataset);
+    let mut pipelined_reader = if input_pipeline {
+        Some(pipelined_scalar_chunk_reader(
+            dataset.take().ok_or_else(|| {
+                AppError::Invalid("scalar input dataset is unavailable".to_owned())
+            })?,
+            Arc::clone(&metadata),
+            chunk_plan.series_per_chunk,
+        )?)
+    } else {
+        None
+    };
+    let mut next_series = 0;
+    loop {
+        let next = if let Some(reader) = pipelined_reader.as_mut() {
+            reader.next()?.map(|read| {
+                input_seconds += read.input_seconds;
+                (read.first_series, read.chunk)
+            })
+        } else if next_series < series_count {
+            let first_series = next_series;
+            let end_series = (first_series + chunk_plan.series_per_chunk).min(series_count);
+            next_series = end_series;
+            let read_start = Instant::now();
+            let chunk = read_fvcom_scalar_chunk(
+                dataset.as_ref().ok_or_else(|| {
+                    AppError::Invalid("scalar input dataset is unavailable".to_owned())
+                })?,
+                &metadata,
+                first_series..end_series,
+            )?;
+            input_seconds += read_start.elapsed().as_secs_f64();
+            Some((first_series, chunk))
+        } else {
+            None
+        };
+        let Some((first_series, chunk)) = next else {
+            break;
+        };
+        let end_series = first_series + chunk.observation_counts.len();
         let latitudes = &metadata.latitudes[first_series..end_series];
 
         let solve_start = Instant::now();
@@ -1249,8 +1449,14 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         solutions.extend(chunk_solutions);
         result_processing_seconds += result_start.elapsed().as_secs_f64();
     }
+    if let Some(reader) = pipelined_reader.take() {
+        reader.finish()?;
+    }
     drop(dataset);
 
+    let metadata = Arc::try_unwrap(metadata).map_err(|_| {
+        AppError::Invalid("scalar input metadata remains shared after reading".to_owned())
+    })?;
     let input = InputData {
         modified_julian_days: metadata.modified_julian_days,
         source_time_count: metadata.source_time_count,
@@ -1331,6 +1537,7 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
             analysis_method: config.analysis_method,
             confidence_interval: config.confidence_interval,
             chunk_plan,
+            input_pipeline,
             modified_julian_days: &input.modified_julian_days,
             reference_time_modified_julian_day: batch.reference_time_modified_julian_day(),
             reconstruction: config
@@ -1377,6 +1584,11 @@ pub fn analyze_scalar(config: &AnalyzeConfig) -> Result<RunReport, AppError> {
         workers: config.workers,
         chunk_series: chunk_plan.series_per_chunk,
         chunk_count: chunk_plan.chunk_count,
+        input_pipeline: if input_pipeline {
+            "overlapped"
+        } else {
+            "sequential"
+        },
         maximum_observation_buffer_bytes: chunk_plan.maximum_observation_buffer_bytes,
         analysis_method: config.analysis_method.name(),
         trend_enabled: config.fit_options.trend,
@@ -2720,6 +2932,7 @@ struct OutputData<'data> {
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     chunk_plan: SpatialChunkPlan,
+    input_pipeline: bool,
     modified_julian_days: &'data [f64],
     reference_time_modified_julian_day: f64,
     reconstruction: Option<(&'data ReconstructionFilter, &'data [Vec<f64>])>,
@@ -2766,6 +2979,7 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
         analysis_method,
         confidence_interval,
         chunk_plan,
+        input_pipeline,
         modified_julian_days,
         reference_time_modified_julian_day,
         reconstruction,
@@ -2808,6 +3022,14 @@ fn write_output_file(path: &Path, data: &OutputData<'_>) -> Result<(), AppError>
     output.add_attribute(
         "maximum_observation_buffer_bytes",
         chunk_plan.maximum_observation_buffer_bytes,
+    )?;
+    output.add_attribute(
+        "input_pipeline",
+        if input_pipeline {
+            "overlapped"
+        } else {
+            "sequential"
+        },
     )?;
     let profile = selection.profile(
         analysis_method,
@@ -3443,9 +3665,9 @@ mod tests {
         SOLVER_OPTION_MATRIX_JSON, SOLVER_OPTION_MATRIX_SCHEMA_JSON,
         SOLVER_OPTION_MATRIX_SCHEMA_VERSION, ScalarInferenceConfig, VECTOR_OUTPUT_SCHEMA_VERSION,
         constituent_order_indices, encode_hex, normalize_source_observation, read_fvcom_scalar,
-        resolve_node_selection, spatial_chunk_plan, summarize_sampling, temporary_sibling,
-        update_robust_options_digest, write_inference_metadata, write_reconstruction_variables,
-        write_sampling_diagnostics,
+        resolve_node_selection, scalar_chunk_plan, spatial_chunk_plan, summarize_sampling,
+        temporary_sibling, update_robust_options_digest, write_inference_metadata,
+        write_reconstruction_variables, write_sampling_diagnostics,
     };
     use rutide_core::{
         CATALOG_ORACLE_REVISION, Constituent, GreenwichNodalOls, InferenceMode, LinearConfidence,
@@ -3719,6 +3941,16 @@ mod tests {
         assert_eq!(explicit.series_per_chunk, 75_160);
         assert_eq!(explicit.chunk_count, 1);
         assert!(spatial_chunk_plan(Some(0), 1, 1, 1, 1).is_err());
+
+        let (scalar, pipelined) =
+            scalar_chunk_plan(None, 75_160, 745, 64).expect("valid scalar pipeline plan");
+        assert!(pipelined);
+        assert_eq!(scalar.chunk_count, 2);
+        assert!(scalar.maximum_observation_buffer_bytes <= 512 * 1024 * 1024);
+        let (explicit_scalar, pipelined) =
+            scalar_chunk_plan(Some(32_768), 75_160, 745, 64).expect("valid explicit scalar plan");
+        assert!(!pipelined);
+        assert_eq!(explicit_scalar.series_per_chunk, 32_768);
     }
 
     #[test]

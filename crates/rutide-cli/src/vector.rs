@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeSet, VecDeque},
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -22,20 +23,20 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    AnalysisMethod, AnalyzeConfig, AppError, ConfidenceInterval, ConstituentOrder,
-    ConstituentOrderMap, ConstituentSelection, ConstituentSelectionReport, CoreSamplingDiagnostics,
-    InferenceReport, NodeSelection, ReconstructionReport, ResolvedConstituentSelection,
-    RobustOptionsReport, SamplingSummary, SeriesSamplingDiagnostics, SpectralBandSummary,
-    StageTimings, VectorInferenceConfig, constituent_order_indices, diagnose_sampling, encode_hex,
-    nodal_profile_component, normalize_source_observation, order_profile_suffix,
-    read_fvcom_time_axis, read_selected_1d, read_selected_time_major, reconstruction_report,
-    required_dimension_length, required_variable, resolve_constituent_selection,
-    retain_time_major_rows, robust_termination_code, spatial_chunk_plan, summarize_sampling,
-    temporary_sibling, update_constituent_order_digest, update_inference_digest,
-    update_reconstruction_filter_digest, update_robust_options_digest, update_sampling_digest,
-    validate_config, validate_dimensions, validate_reconstruction_filter, validate_source_value,
-    write_constituent_order_indices, write_inference_metadata, write_json_report,
-    write_robust_schema_metadata, write_sampling_diagnostics, write_variable,
+    AnalysisMethod, AnalyzeConfig, AppError, BoundedInputPipeline, ConfidenceInterval,
+    ConstituentOrder, ConstituentOrderMap, ConstituentSelection, ConstituentSelectionReport,
+    CoreSamplingDiagnostics, InferenceReport, NodeSelection, ReconstructionReport,
+    ResolvedConstituentSelection, RobustOptionsReport, SamplingSummary, SeriesSamplingDiagnostics,
+    SpectralBandSummary, StageTimings, VectorInferenceConfig, constituent_order_indices,
+    diagnose_sampling, encode_hex, nodal_profile_component, normalize_source_observation,
+    order_profile_suffix, read_fvcom_time_axis, read_selected_1d, read_selected_time_major,
+    reconstruction_report, required_dimension_length, required_variable,
+    resolve_constituent_selection, retain_time_major_rows, robust_termination_code,
+    spatial_chunk_plan, summarize_sampling, temporary_sibling, update_constituent_order_digest,
+    update_inference_digest, update_reconstruction_filter_digest, update_robust_options_digest,
+    update_sampling_digest, validate_config, validate_dimensions, validate_reconstruction_filter,
+    validate_source_value, write_constituent_order_indices, write_inference_metadata,
+    write_json_report, write_robust_schema_metadata, write_sampling_diagnostics, write_variable,
 };
 
 /// `NetCDF` and JSON report schema emitted by vector-current analyses.
@@ -199,7 +200,10 @@ pub struct VectorRunReport {
     pub chunk_series: usize,
     /// Number of spatial chunks processed.
     pub chunk_count: usize,
-    /// Maximum logical bytes occupied by chunk-local promoted component arrays.
+    /// Whether automatic input used a bounded reader/solver overlap.
+    pub input_pipeline: &'static str,
+    /// Maximum logical bytes occupied by all concurrently resident promoted
+    /// component arrays.
     pub maximum_observation_buffer_bytes: u64,
     /// Least-squares method: `ols` or `robust`.
     pub analysis_method: &'static str,
@@ -302,6 +306,52 @@ struct VectorInputChunk {
     eastward: Vec<f64>,
     northward: Vec<f64>,
     observation_counts: Vec<usize>,
+}
+
+struct PipelinedVectorChunk {
+    first_series: usize,
+    chunk: VectorInputChunk,
+    input_seconds: f64,
+}
+
+/// Owns the only `NetCDF` handle used by the background input path.
+///
+/// The zero-capacity channel is intentional: while the caller processes chunk
+/// N, the reader may construct chunk N+1, but it cannot begin N+2 until N has
+/// been dropped and the caller receives N+1. That makes the pipeline a strict
+/// two-buffer bound even when solving is slower than input.
+fn pipelined_vector_chunk_reader(
+    dataset: netcdf::File,
+    metadata: Arc<VectorInputMetadata>,
+    series_per_chunk: usize,
+) -> Result<BoundedInputPipeline<PipelinedVectorChunk>, AppError> {
+    if metadata.is_fixed_depth() {
+        return Err(AppError::Invalid(
+            "fixed-depth input cannot use the regular vector reader pipeline".to_owned(),
+        ));
+    }
+    if series_per_chunk == 0 {
+        return Err(AppError::Invalid(
+            "pipelined vector input requires a non-zero chunk size".to_owned(),
+        ));
+    }
+    let series_count = metadata.series_count();
+    let mut first_series = 0;
+    BoundedInputPipeline::spawn("rutide-netcdf-reader", move || {
+        if first_series >= series_count {
+            return Ok(None);
+        }
+        let end_series = (first_series + series_per_chunk).min(series_count);
+        let input_start = Instant::now();
+        let chunk = read_fvcom_vector_chunk(&dataset, &metadata, first_series..end_series)?;
+        let read = PipelinedVectorChunk {
+            first_series,
+            chunk,
+            input_seconds: input_start.elapsed().as_secs_f64(),
+        };
+        first_series = end_series;
+        Ok(Some(read))
+    })
 }
 
 enum FixedDepthFloatBlock {
@@ -465,6 +515,48 @@ impl VectorInputMetadata {
         series_range
             .map(|series| self.latitudes[series % element_count])
             .collect()
+    }
+}
+
+fn regular_vector_chunk_plan(
+    requested: Option<usize>,
+    series_count: usize,
+    source_time_count: usize,
+    resident_component_count: usize,
+    workers: usize,
+) -> Result<(super::SpatialChunkPlan, bool), AppError> {
+    // Explicit chunk sizes remain an exact memory/reproducibility override.
+    if requested.is_some() {
+        return spatial_chunk_plan(
+            requested,
+            series_count,
+            source_time_count,
+            resident_component_count,
+            workers,
+        )
+        .map(|plan| (plan, false));
+    }
+    let double_buffer_components = resident_component_count
+        .checked_mul(2)
+        .ok_or_else(|| AppError::Invalid("vector pipeline buffer count overflows".to_owned()))?;
+    let pipelined = spatial_chunk_plan(
+        None,
+        series_count,
+        source_time_count,
+        double_buffer_components,
+        workers,
+    )?;
+    if pipelined.chunk_count > 1 {
+        Ok((pipelined, true))
+    } else {
+        spatial_chunk_plan(
+            None,
+            series_count,
+            source_time_count,
+            resident_component_count,
+            workers,
+        )
+        .map(|plan| (plan, false))
     }
 }
 
@@ -685,13 +777,13 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
 
     let input_start = Instant::now();
     let dataset = netcdf::open(&config.input)?;
-    let metadata = read_fvcom_vector_metadata(
+    let metadata = Arc::new(read_fvcom_vector_metadata(
         &config.input,
         &dataset,
         &config.elements,
         config.layers.as_ref(),
         config.fixed_depths_meters.as_deref(),
-    )?;
+    )?);
     let mut input_seconds = input_start.elapsed().as_secs_f64();
 
     let preparation_start = Instant::now();
@@ -729,7 +821,9 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
     // reconstruction can retain two more. Size automatic chunks by the largest
     // concurrently resident time-major result set, then report the actual two
     // promoted source-component buffers.
-    let (mut chunk_plan, fixed_depth_elements_per_chunk) = if metadata.is_fixed_depth() {
+    let (mut chunk_plan, fixed_depth_elements_per_chunk, input_pipeline) = if metadata
+        .is_fixed_depth()
+    {
         let depth_count = metadata.vertical_count();
         let source = metadata
             .fixed_depth_source
@@ -789,14 +883,12 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             .ok_or_else(|| {
                 AppError::Invalid("fixed-depth chunk series exceeds usize".to_owned())
             })?;
-        (
-            super::SpatialChunkPlan {
-                series_per_chunk,
-                chunk_count: element_plan.chunk_count,
-                maximum_observation_buffer_bytes: element_plan.maximum_observation_buffer_bytes,
-            },
-            Some(element_plan.series_per_chunk),
-        )
+        let plan = super::SpatialChunkPlan {
+            series_per_chunk,
+            chunk_count: element_plan.chunk_count,
+            maximum_observation_buffer_bytes: element_plan.maximum_observation_buffer_bytes,
+        };
+        (plan, Some(element_plan.series_per_chunk), false)
     } else {
         let resident_component_count =
             if metadata.layer_indices.is_some() && config.analysis_method != AnalysisMethod::Ols {
@@ -804,23 +896,23 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             } else {
                 2
             };
-        (
-            spatial_chunk_plan(
-                config.chunk_series,
-                metadata.series_count(),
-                metadata.source_time_count,
-                resident_component_count,
-                config.workers,
-            )?,
-            None,
-        )
+        let (plan, pipelined) = regular_vector_chunk_plan(
+            config.chunk_series,
+            metadata.series_count(),
+            metadata.source_time_count,
+            resident_component_count,
+            config.workers,
+        )?;
+        (plan, None, pipelined)
     };
     if !metadata.is_fixed_depth() {
+        let concurrent_chunks = 1 + usize::from(input_pipeline);
         chunk_plan.maximum_observation_buffer_bytes = u64::try_from(
             chunk_plan
                 .series_per_chunk
                 .checked_mul(metadata.source_time_count)
                 .and_then(|value| value.checked_mul(2 * std::mem::size_of::<f64>()))
+                .and_then(|value| value.checked_mul(concurrent_chunks))
                 .ok_or_else(|| {
                     AppError::Invalid("observation chunk size exceeds usize".to_owned())
                 })?,
@@ -910,6 +1002,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                 analysis_method: config.analysis_method,
                 confidence_interval: config.confidence_interval,
                 chunk_plan,
+                input_pipeline,
                 reference_time_modified_julian_day: batch.reference_time_modified_julian_day(),
                 reconstruction: config.reconstruction.as_ref(),
                 result_output: "incremental",
@@ -919,43 +1012,71 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         None
     };
     output_seconds += output_start.elapsed().as_secs_f64();
+    let mut dataset = Some(dataset);
+    let mut pipelined_reader = if input_pipeline {
+        Some(pipelined_vector_chunk_reader(
+            dataset.take().ok_or_else(|| {
+                AppError::Invalid("vector input dataset is unavailable".to_owned())
+            })?,
+            Arc::clone(&metadata),
+            chunk_plan.series_per_chunk,
+        )?)
+    } else {
+        None
+    };
     let mut next_regular_series = 0;
     let mut next_fixed_element = 0;
     let mut pending_fixed_depths = VecDeque::new();
     loop {
-        let read_start = Instant::now();
-        let next = if let Some(elements_per_chunk) = fixed_depth_elements_per_chunk {
-            if pending_fixed_depths.is_empty()
-                && next_fixed_element < metadata.element_indices.len()
-            {
-                let first_element = next_fixed_element;
-                let end_element =
-                    (first_element + elements_per_chunk).min(metadata.element_indices.len());
-                let chunks = read_fvcom_fixed_depth_element_chunk(
-                    &dataset,
-                    &metadata,
-                    first_element..end_element,
-                    &worker_pool,
-                )?;
-                for (depth, chunk) in chunks.into_iter().enumerate() {
-                    let first_series = depth * metadata.element_indices.len() + first_element;
-                    pending_fixed_depths.push_back((first_series, chunk));
-                }
-                next_fixed_element = end_element;
-            }
-            pending_fixed_depths.pop_front()
-        } else if next_regular_series < series_count {
-            let first_series = next_regular_series;
-            let end_series = (first_series + chunk_plan.series_per_chunk).min(series_count);
-            next_regular_series = end_series;
-            Some((
-                first_series,
-                read_fvcom_vector_chunk(&dataset, &metadata, first_series..end_series)?,
-            ))
+        let next = if let Some(reader) = pipelined_reader.as_mut() {
+            reader.next()?.map(|read| {
+                input_seconds += read.input_seconds;
+                (read.first_series, read.chunk)
+            })
         } else {
-            None
+            let read_start = Instant::now();
+            let next = if let Some(elements_per_chunk) = fixed_depth_elements_per_chunk {
+                if pending_fixed_depths.is_empty()
+                    && next_fixed_element < metadata.element_indices.len()
+                {
+                    let first_element = next_fixed_element;
+                    let end_element =
+                        (first_element + elements_per_chunk).min(metadata.element_indices.len());
+                    let chunks = read_fvcom_fixed_depth_element_chunk(
+                        dataset.as_ref().ok_or_else(|| {
+                            AppError::Invalid("vector input dataset is unavailable".to_owned())
+                        })?,
+                        &metadata,
+                        first_element..end_element,
+                        &worker_pool,
+                    )?;
+                    for (depth, chunk) in chunks.into_iter().enumerate() {
+                        let first_series = depth * metadata.element_indices.len() + first_element;
+                        pending_fixed_depths.push_back((first_series, chunk));
+                    }
+                    next_fixed_element = end_element;
+                }
+                pending_fixed_depths.pop_front()
+            } else if next_regular_series < series_count {
+                let first_series = next_regular_series;
+                let end_series = (first_series + chunk_plan.series_per_chunk).min(series_count);
+                next_regular_series = end_series;
+                Some((
+                    first_series,
+                    read_fvcom_vector_chunk(
+                        dataset.as_ref().ok_or_else(|| {
+                            AppError::Invalid("vector input dataset is unavailable".to_owned())
+                        })?,
+                        &metadata,
+                        first_series..end_series,
+                    )?,
+                ))
+            } else {
+                None
+            };
+            input_seconds += read_start.elapsed().as_secs_f64();
+            next
         };
-        input_seconds += read_start.elapsed().as_secs_f64();
         let Some((first_series, chunk)) = next else {
             break;
         };
@@ -1127,6 +1248,9 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
             }
         }
     }
+    if let Some(reader) = pipelined_reader.take() {
+        reader.finish()?;
+    }
     drop(dataset);
 
     let inference_report = config.inference.as_ref().map(VectorInferenceConfig::report);
@@ -1237,6 +1361,7 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
                 analysis_method: config.analysis_method,
                 confidence_interval: config.confidence_interval,
                 chunk_plan,
+                input_pipeline,
                 reference_time_modified_julian_day: batch.reference_time_modified_julian_day(),
                 reconstruction: config
                     .reconstruction
@@ -1310,6 +1435,11 @@ pub fn analyze_vector(config: &VectorAnalyzeConfig) -> Result<VectorRunReport, A
         workers: config.workers,
         chunk_series: chunk_plan.series_per_chunk,
         chunk_count: chunk_plan.chunk_count,
+        input_pipeline: if input_pipeline {
+            "overlapped"
+        } else {
+            "sequential"
+        },
         maximum_observation_buffer_bytes: chunk_plan.maximum_observation_buffer_bytes,
         analysis_method: config.analysis_method.name(),
         trend_enabled: config.fit_options.trend,
@@ -3951,6 +4081,7 @@ struct VectorOutputData<'data> {
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     chunk_plan: super::SpatialChunkPlan,
+    input_pipeline: bool,
     reference_time_modified_julian_day: f64,
     reconstruction: Option<(&'data ReconstructionFilter, &'data [VectorReconstruction])>,
 }
@@ -3967,6 +4098,7 @@ struct VectorOutputDefinition<'data> {
     analysis_method: AnalysisMethod,
     confidence_interval: ConfidenceInterval,
     chunk_plan: super::SpatialChunkPlan,
+    input_pipeline: bool,
     reference_time_modified_julian_day: f64,
     reconstruction: Option<&'data ReconstructionFilter>,
     result_output: &'static str,
@@ -4040,6 +4172,14 @@ fn create_vector_output_base(
     output.add_attribute(
         "maximum_observation_buffer_bytes",
         data.chunk_plan.maximum_observation_buffer_bytes,
+    )?;
+    output.add_attribute(
+        "input_pipeline",
+        if data.input_pipeline {
+            "overlapped"
+        } else {
+            "sequential"
+        },
     )?;
     let profile = vector_profile(
         data.selection,
@@ -5069,6 +5209,7 @@ fn write_vector_output_file(path: &Path, data: &VectorOutputData<'_>) -> Result<
             analysis_method: data.analysis_method,
             confidence_interval: data.confidence_interval,
             chunk_plan: data.chunk_plan,
+            input_pipeline: data.input_pipeline,
             reference_time_modified_julian_day: data.reference_time_modified_julian_day,
             reconstruction: data.reconstruction.map(|(filter, _)| filter),
             result_output: "buffered",
@@ -5449,7 +5590,7 @@ fn write_vector_reconstruction_variables(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, sync::Arc};
 
     use rayon::ThreadPoolBuilder;
     use rutide_core::{
@@ -5461,8 +5602,8 @@ mod tests {
     use super::{
         AnalysisMethod, ConfidenceInterval, ConstituentOrder, ConstituentSelection, NodeSelection,
         VectorAnalyzeConfig, VectorInferenceConfig, analyze_vector, compact_bounded_span_values,
-        read_fvcom_fixed_depth_element_chunk, read_fvcom_vector, read_fvcom_vector_metadata,
-        temporary_sibling,
+        pipelined_vector_chunk_reader, read_fvcom_fixed_depth_element_chunk, read_fvcom_vector,
+        read_fvcom_vector_metadata, regular_vector_chunk_plan, temporary_sibling,
     };
 
     #[test]
@@ -5474,6 +5615,27 @@ mod tests {
         let compacted = compact_bounded_span_values(source, 3, 6, 2, &selected_indices)
             .expect("compact bounded time-major span");
         assert_eq!(compacted, [2, 4, 7, 102, 104, 107, 202, 204, 207]);
+    }
+
+    #[test]
+    fn automatic_vector_pipeline_is_double_buffered_and_bounded() {
+        let (automatic, pipelined) = regular_vector_chunk_plan(None, 144_860, 745, 2, 64)
+            .expect("valid automatic vector plan");
+        assert!(pipelined);
+        assert!(automatic.series_per_chunk.is_multiple_of(64));
+        let concurrent_source_bytes = automatic.series_per_chunk * 745 * 2 * 8 * 2;
+        assert!(concurrent_source_bytes <= 512 * 1024 * 1024);
+        assert!(automatic.chunk_count > 4);
+
+        let (explicit, pipelined) = regular_vector_chunk_plan(Some(44_992), 144_860, 745, 2, 64)
+            .expect("valid explicit vector plan");
+        assert!(!pipelined);
+        assert_eq!(explicit.series_per_chunk, 44_992);
+
+        let (complete, pipelined) =
+            regular_vector_chunk_plan(None, 100, 745, 2, 64).expect("valid complete vector plan");
+        assert!(!pipelined);
+        assert_eq!(complete.chunk_count, 1);
     }
 
     #[test]
@@ -6001,6 +6163,50 @@ mod tests {
         assert!(input.eastward[3 * 2 + 1].is_nan());
         assert!(input.northward[3 * 2 + 1].is_nan());
 
+        let pipelined_dataset = netcdf::open(&input_path).expect("open pipelined vector fixture");
+        let pipelined_metadata = Arc::new(
+            read_fvcom_vector_metadata(
+                &input_path,
+                &pipelined_dataset,
+                &NodeSelection::Indices(vec![1, 0]),
+                None,
+                None,
+            )
+            .expect("read pipelined vector metadata"),
+        );
+        let mut pipelined =
+            pipelined_vector_chunk_reader(pipelined_dataset, Arc::clone(&pipelined_metadata), 1)
+                .expect("start pipelined reader");
+        for series in 0..2 {
+            let read = pipelined
+                .next()
+                .expect("read pipelined chunk")
+                .expect("pipelined chunk exists");
+            assert_eq!(read.first_series, series);
+            assert_eq!(read.chunk.observation_counts, [47]);
+            for time in 0..input.modified_julian_days.len() {
+                let expected = time * 2 + series;
+                for (actual, expected) in [
+                    (read.chunk.eastward[time], input.eastward[expected]),
+                    (read.chunk.northward[time], input.northward[expected]),
+                ] {
+                    assert!(
+                        (actual.is_nan() && expected.is_nan())
+                            || actual.to_bits() == expected.to_bits()
+                    );
+                }
+            }
+        }
+        assert!(pipelined.next().expect("finish pipelined input").is_none());
+        pipelined.finish().expect("join pipelined reader");
+
+        // Dropping before receiving must cancel a reader blocked in the
+        // rendezvous send rather than leaking or deadlocking its thread.
+        let cancelled_dataset = netcdf::open(&input_path).expect("open cancelled vector fixture");
+        let cancelled = pipelined_vector_chunk_reader(cancelled_dataset, pipelined_metadata, 1)
+            .expect("start cancelled reader");
+        drop(cancelled);
+
         let config = VectorAnalyzeConfig {
             input: input_path.clone(),
             output: output_path.clone(),
@@ -6035,6 +6241,7 @@ mod tests {
         };
         let report = analyze_vector(&config).expect("analyze vector fixture");
         assert_eq!(report.result_output, "buffered");
+        assert_eq!(report.input_pipeline, "sequential");
         let mut chunked_config = config.clone();
         chunked_config.output = chunked_output_path.clone();
         chunked_config.chunk_series = Some(1);
@@ -6042,6 +6249,7 @@ mod tests {
             analyze_vector(&chunked_config).expect("analyze vector fixture in one-series chunks");
         assert_eq!(chunked_report.chunk_series, 1);
         assert_eq!(chunked_report.chunk_count, 2);
+        assert_eq!(chunked_report.input_pipeline, "sequential");
         assert_eq!(chunked_report.result_sha256, report.result_sha256);
         for name in [
             "semi_major",
@@ -6087,6 +6295,14 @@ mod tests {
         assert_eq!(report.monte_carlo_realizations, Some(64));
         assert_eq!(report.monte_carlo_seed, Some(42));
         let output = netcdf::open(&output_path).expect("open vector output");
+        assert_eq!(
+            output
+                .attribute("input_pipeline")
+                .expect("input pipeline metadata")
+                .value()
+                .expect("read input pipeline metadata"),
+            netcdf::AttributeValue::Str("sequential".to_owned())
+        );
         assert_eq!(
             output
                 .attribute("monte_carlo_realizations")

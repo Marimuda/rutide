@@ -39,6 +39,13 @@ when existing readers can ignore it safely. Removing or renaming data, changing
 dimension order, changing units or semantics, or making an optional field
 required always creates a new schema version.
 
+The additive `input_pipeline` report field and NetCDF attribute identify
+`overlapped` or `sequential` input. In overlapped mode, `input_seconds` measures
+active reader work that can coincide with solve and result processing, so stage
+durations are not additive; `total_seconds` remains elapsed time. The existing
+`maximum_observation_buffer_bytes` field covers all concurrently resident
+promoted input arrays.
+
 Scalar fields use a public `series` axis. Depth-averaged vector fields also use
 `series`; native sigma-layer vector fields use `siglay, element` and retain the
 requested source indices in coordinate variables. Native sigma layers are model

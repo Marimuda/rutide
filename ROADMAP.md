@@ -28,6 +28,9 @@ defined behavior, and representative oracle tests are versioned.
 - Bounded scalar/vector FVCOM spatial chunks with contiguous hyperslab reads,
   deterministic output order, mask grouping, and globally stable Monte Carlo
   streams across chunk sizes.
+- Bounded automatic NetCDF read/solve overlap for scalar, depth-averaged, and
+  native-layer fields, with one source-handle owner, a strict two-buffer limit,
+  explicit sequential overrides, and unchanged result digests.
 
 ## 1. Irregular colored-noise confidence — complete
 

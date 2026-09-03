@@ -28,6 +28,10 @@ published API and file-schema contracts.
 - Applied a lazily cached QR-derived least-squares projection to reusable fixed
   raw batches of at least 16 series, improving the retained 10,000-series
   throughput by 1.87–2.21x while preserving the direct QR path for small calls.
+- Overlapped bounded automatic FVCOM input with scalar and regular-vector solves
+  through a single-owner NetCDF reader and a strict two-buffer rendezvous. Full-
+  field scalar/vector process wall improves by 1.15x/1.41x at 64 workers without
+  changing result digests or exceeding the existing 512 MiB logical input bound.
 
 ## 0.2.0 - 2026-09-02
 

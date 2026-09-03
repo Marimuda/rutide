@@ -39,6 +39,13 @@ Exact corrected solves improve by 1.53–3.92x, fixed raw batches by 1.87–2.21
 and installed-binding reconstruction by 1.29–1.90x. The snapshot also records
 the current scaling ceiling and bounded cache costs.
 
+The subsequent [bounded input pipeline](benchmarks/results/input-pipeline-2026-09-03.md)
+overlaps one NetCDF read/conversion with the preceding chunk's solve while
+retaining the 512 MiB logical input bound. Current complete-field process medians
+are 0.91 seconds for scalar and 2.50 seconds for vector at their practical worker
+counts—approximately 71.1x and 50.8x faster than the retained tuned Python UTide
+processes.
+
 The focused [irregular-confidence snapshot](benchmarks/results/irregular-confidence-2026-09-01.md)
 records Lomb–Scargle scalar and vector parity and a 20.05–70.06x advantage over
 pinned Python UTide on its 100-series observational workload, depending on field
@@ -95,17 +102,21 @@ the corresponding analysis, diagnostics, observation counts, per-series
 reference epochs, and optional reconstruction to NetCDF.
 
 FVCOM observations are read and solved in bounded spatial chunks. By default,
-the application targets at most 512 MiB of promoted `f64` observation storage
-per chunk, rounds multi-chunk work to the requested worker count, and uses one
-chunk when the selected field already fits. `--chunk-series N` provides an
-explicit reproducibility or memory-control override. Contiguous selections use
-one NetCDF hyperslab per component. Sparse sigma-layer selections coalesce
-nearby elements and traverse classic NetCDF record variables in file order;
-requested layer and element order is still preserved. Chunk-local masks are
-grouped exactly as before, and global Monte Carlo stream offsets make results
-independent of chunk size and worker scheduling. JSON reports and scalar/vector
-NetCDF schemas v16/v14 record the actual chunk count, series count, and maximum
-logical observation-buffer bytes.
+the application targets at most 512 MiB across concurrently resident promoted
+`f64` observations. Sufficiently large scalar, depth-averaged, and native-layer
+inputs use a single-owner NetCDF reader to prepare chunk N+1 while the worker
+pool solves chunk N; a rendezvous permits at most those two chunks. Explicit
+`--chunk-series N` values remain sequential and provide an exact reproducibility
+or memory-control override. Fixed-depth interpolation also remains sequential.
+Contiguous selections use one NetCDF hyperslab per component. Sparse sigma-layer
+selections coalesce nearby elements and traverse classic NetCDF record variables
+in file order; requested layer and element order is still preserved. Chunk-local
+masks are grouped exactly as before, and global Monte Carlo stream offsets make
+results independent of chunk size and worker scheduling. JSON reports and
+scalar/vector NetCDF schemas v16/v14 record the input-pipeline mode, actual chunk
+count and series count, and maximum logical bytes across concurrent observation
+buffers. When input is overlapped, active stage durations are not additive;
+`total_seconds` remains the authoritative elapsed application time.
 
 Robust fitting is available for scalar and vector analyses with Andrews,
 bisquare, Cauchy, Fair, Huber, logistic, OLS, Talwar, or Welsch residual
