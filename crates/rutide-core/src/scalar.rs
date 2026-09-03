@@ -26,6 +26,11 @@ use crate::{
     vector::from_component_solutions,
 };
 
+// Applying a precomputed least-squares projection turns sufficiently wide
+// batches into one cache-friendly matrix product. Below this threshold the
+// projection's one-time construction costs more than applying the retained QR.
+const MIN_PROJECTED_BATCH_SERIES: usize = 16;
+
 /// A named tidal constituent with a fixed frequency.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Constituent {
@@ -182,6 +187,7 @@ pub struct FixedRawOls {
     fit_options: FitOptions,
     design: Mat<f64>,
     decomposition: ColPivQr<f64>,
+    batch_projection: OnceLock<Mat<f64>>,
 }
 
 impl FixedRawOls {
@@ -296,6 +302,7 @@ impl FixedRawOls {
             fit_options,
             design,
             decomposition,
+            batch_projection: OnceLock::new(),
         }
     }
 
@@ -631,7 +638,7 @@ impl FixedRawOls {
         let right_hand_sides = Mat::from_fn(self.time_count, series_count, |time, series| {
             observations[time * series_count + series]
         });
-        let coefficients = self.decomposition.solve_lstsq(right_hand_sides.as_ref());
+        let coefficients = self.solve_batch_coefficients(right_hand_sides.as_ref(), series_count);
         let normal_inverse = self.coefficient_normal_inverse(None);
         (0..series_count)
             .map(|series| {
@@ -724,7 +731,7 @@ impl FixedRawOls {
         let right_hand_sides = Mat::from_fn(self.time_count, series_count, |time, series| {
             observations[time * series_count + series]
         });
-        let coefficients = self.decomposition.solve_lstsq(right_hand_sides.as_ref());
+        let coefficients = self.solve_batch_coefficients(right_hand_sides.as_ref(), series_count);
         let variance_weights = confidence
             .is_enabled()
             .then(|| self.linear_variance_weights(None));
@@ -808,6 +815,21 @@ impl FixedRawOls {
             reference_time_days: self.reference_time_days,
             robust,
         }
+    }
+
+    fn solve_batch_coefficients(
+        &self,
+        right_hand_sides: faer::MatRef<'_, f64>,
+        series_count: usize,
+    ) -> Mat<f64> {
+        if series_count < MIN_PROJECTED_BATCH_SERIES {
+            return self.decomposition.solve_lstsq(right_hand_sides);
+        }
+        let projection = self.batch_projection.get_or_init(|| {
+            let identity = Mat::identity(self.time_count, self.time_count);
+            self.decomposition.solve_lstsq(identity.as_ref())
+        });
+        projection.as_ref() * right_hand_sides
     }
 
     fn observation_matrix(
@@ -2438,7 +2460,7 @@ pub(crate) fn validate_time_with_options(
 mod tests {
     use super::{
         Constituent, FitOptions, FixedRawOls, IrregularSpectrumSampling, LinearConfidence,
-        LombScarglePlan, band_averaged_fft_vector_residual_power,
+        LombScarglePlan, MIN_PROJECTED_BATCH_SERIES, band_averaged_fft_vector_residual_power,
         band_averaged_lomb_residual_power, band_averaged_lomb_vector_residual_power,
         lomb_frequencies, usize_to_f64,
     };
@@ -2611,6 +2633,52 @@ mod tests {
         assert_close(solutions[1].phase_degrees[1], 92.0, 1e-10);
         assert_close(solutions[1].mean, -0.2, 1e-12);
         assert_close(solutions[1].slope_per_day, -0.003, 1e-12);
+    }
+
+    #[test]
+    fn projected_batch_matches_individual_qr_solves() {
+        let constituents = constituents();
+        let times = times();
+        let series_count = MIN_PROJECTED_BATCH_SERIES;
+        let mut time_major = Vec::with_capacity(times.len() * series_count);
+        for (time_index, time) in times.iter().copied().enumerate() {
+            for series in 0..series_count {
+                let series = f64::from(u32::try_from(series).expect("small fixture"));
+                let time_index = f64::from(u32::try_from(time_index).expect("small fixture"));
+                time_major.push(
+                    0.03 * series
+                        + 0.4 * (time * 1.7 + series * 0.1).cos()
+                        + 0.07 * (time_index / (5.0 + series * 0.02)).sin(),
+                );
+            }
+        }
+
+        let model = FixedRawOls::prepare(&times, &constituents).expect("valid model");
+        let batch = model
+            .solve_many_time_major(&time_major, series_count)
+            .expect("valid projected batch");
+        for series in 0..series_count {
+            let observations = time_major
+                .chunks_exact(series_count)
+                .map(|row| row[series])
+                .collect::<Vec<_>>();
+            let individual = model.solve(&observations).expect("valid QR solve");
+            for (actual, expected) in batch[series]
+                .cosine_coefficient
+                .iter()
+                .zip(&individual.cosine_coefficient)
+                .chain(
+                    batch[series]
+                        .sine_coefficient
+                        .iter()
+                        .zip(&individual.sine_coefficient),
+                )
+            {
+                assert_close(*actual, *expected, 2e-12);
+            }
+            assert_close(batch[series].mean, individual.mean, 2e-12);
+            assert_close(batch[series].slope_per_day, individual.slope_per_day, 2e-12);
+        }
     }
 
     #[test]

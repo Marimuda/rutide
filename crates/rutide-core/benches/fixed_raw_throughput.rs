@@ -13,6 +13,13 @@ fn setting(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn nonnegative_setting(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
 fn times() -> Vec<f64> {
     (0_u32..745)
         .map(|index| {
@@ -51,7 +58,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let series_count = setting("RUTIDE_BENCH_SERIES", 1_000);
     let repetitions = setting("RUTIDE_BENCH_REPETITIONS", 5);
     let workers = setting("RUTIDE_BENCH_WORKERS", 1);
-    let warmups = setting("RUTIDE_BENCH_WARMUPS", 5);
+    let warmups = nonnegative_setting("RUTIDE_BENCH_WARMUPS", 5);
     let series_count_float = f64::from(u32::try_from(series_count)?);
     if workers == 1 {
         set_global_parallelism(Par::Seq);

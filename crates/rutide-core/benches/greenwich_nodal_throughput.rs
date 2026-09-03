@@ -4,7 +4,10 @@ use std::{env, error::Error, hint::black_box, time::Instant};
 
 use faer::{Par, set_global_parallelism};
 use rayon::ThreadPoolBuilder;
-use rutide_core::{GreenwichNodalBatch, TidalConstituent};
+use rutide_core::{
+    FitOptions, GreenwichNodalBatch, NodalCorrections, PhaseReference, SolverOptions,
+    TidalConstituent,
+};
 
 const CONSTITUENTS: [TidalConstituent; 5] = [
     TidalConstituent::M2,
@@ -21,6 +24,15 @@ fn setting(name: &str, default: usize) -> usize {
         .and_then(|value| value.parse().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
+}
+
+fn named_setting(name: &str, default: &str, allowed: &[&str]) -> Result<String, String> {
+    let value = env::var(name).unwrap_or_else(|_| default.to_owned());
+    if allowed.contains(&value.as_str()) {
+        Ok(value)
+    } else {
+        Err(format!("{name} must be one of {}", allowed.join(", ")))
+    }
 }
 
 fn times() -> Vec<f64> {
@@ -55,6 +67,28 @@ fn main() -> Result<(), Box<dyn Error>> {
     let repetitions = setting("RUTIDE_BENCH_REPETITIONS", 5);
     let warmups = setting("RUTIDE_BENCH_WARMUPS", 2);
     let workers = setting("RUTIDE_BENCH_WORKERS", 1);
+    let phase_name = named_setting(
+        "RUTIDE_BENCH_PHASE",
+        "greenwich",
+        &["greenwich", "linear-time", "raw"],
+    )?;
+    let phase_reference = match phase_name.as_str() {
+        "greenwich" => PhaseReference::Greenwich,
+        "linear-time" => PhaseReference::LinearTime,
+        "raw" => PhaseReference::Raw,
+        _ => unreachable!("named setting was validated"),
+    };
+    let nodal_name = named_setting(
+        "RUTIDE_BENCH_NODAL",
+        "exact",
+        &["exact", "linear-time", "disabled"],
+    )?;
+    let nodal_corrections = match nodal_name.as_str() {
+        "exact" => NodalCorrections::Exact,
+        "linear-time" => NodalCorrections::LinearTime,
+        "disabled" => NodalCorrections::Disabled,
+        _ => unreachable!("named setting was validated"),
+    };
     set_global_parallelism(Par::Seq);
 
     let time = times();
@@ -71,7 +105,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .collect::<Vec<_>>();
     let pool = ThreadPoolBuilder::new().num_threads(workers).build()?;
     let prepare_start = Instant::now();
-    let varying_batch = GreenwichNodalBatch::prepare_modified_julian_days(&time, &CONSTITUENTS)?;
+    let solver_options = SolverOptions::new(FitOptions::default(), phase_reference)
+        .with_nodal_corrections(nodal_corrections);
+    let varying_batch = GreenwichNodalBatch::prepare_modified_julian_days_with_solver_options(
+        &time,
+        &CONSTITUENTS,
+        solver_options,
+    )?;
     let prepare_seconds = prepare_start.elapsed().as_secs_f64();
     for _ in 0..warmups {
         black_box(pool.install(|| varying_batch.solve_time_major(&time_major, &latitudes))?);
@@ -88,7 +128,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let varying_median = median(&mut varying_seconds);
     println!(
-        "summary series={series_count} workers={workers} warmups={warmups} \
+        "summary series={series_count} workers={workers} phase={phase_name} nodal={nodal_name} \
+         warmups={warmups} \
          repetitions={repetitions} prepare_seconds={prepare_seconds:.9} \
          varying_median_seconds={varying_median:.9} varying_series_per_second={:.3}",
         series_count_float / varying_median,

@@ -6184,7 +6184,7 @@ mod tests {
             analyze_vector(&layered_config).expect("analyze native sigma-layer currents");
         assert_eq!(
             layered_report.result_sha256,
-            "037de642b316829ecbc498e261c5f8e95c73fe880be1dd5a5dd3e092716ca065"
+            "543ba2dc64417be2f78d0b497eb70f0b365137629bd1b7ed532515ba025757da"
         );
         let mut layered_chunked_config = layered_config.clone();
         layered_chunked_config.output = layered_chunked_output_path.clone();

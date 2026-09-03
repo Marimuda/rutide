@@ -25,9 +25,9 @@ use crate::{
     vector::{from_component_solutions, linearized_ellipse_sigmas},
 };
 
-// Plan construction costs enough to require a moderately reused mask, while
-// bounding the group count prevents many distinct repeated masks from turning
-// the speed optimization into unbounded batch memory growth.
+// Shared Lomb and astronomical-basis construction require a moderately reused
+// mask. Bounding the group count prevents distinct masks from turning either
+// optimization into unbounded batch memory growth.
 const MIN_SHARED_LOMB_SERIES: usize = 16;
 const MAX_SHARED_LOMB_PLANS_PER_BATCH: usize = 4;
 
@@ -2654,11 +2654,9 @@ pub enum ReconstructionFilter {
 #[derive(Debug)]
 pub struct GreenwichNodalReconstructor {
     tidal_constituents: Vec<TidalConstituent>,
-    constituent_frequency_cph: Vec<f64>,
     recipes: Vec<CorrectionRecipe>,
     phase_reference: PhaseReference,
     nodal_corrections: NodalCorrections,
-    reference_greenwich_phase: Vec<f64>,
     reference_base_nodal_terms: Vec<NodalTerms>,
     reference_time_modified_julian_day: f64,
     time_terms: Vec<ReconstructionTimeTerms>,
@@ -2756,7 +2754,7 @@ impl GreenwichNodalReconstructor {
         let constituent_frequency_cph = scalar_constituents
             .iter()
             .map(|constituent| constituent.frequency_cph)
-            .collect();
+            .collect::<Vec<_>>();
         let reference_greenwich_phase = greenwich_phases_at_time(
             base_constituents,
             &recipes,
@@ -2774,11 +2772,29 @@ impl GreenwichNodalReconstructor {
                     .copied()
                     .map(|constituent| base_greenwich_phase(constituent, astronomy.cycles))
                     .collect::<Vec<_>>();
+                let greenwich_phase = recipes
+                    .iter()
+                    .map(|recipe| recipe.combine_phase(&base_greenwich_phase))
+                    .collect::<Vec<_>>();
+                let astronomical_basis = greenwich_phase
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(constituent, greenwich_phase)| {
+                        let phase = phase_cycles(
+                            phase_reference,
+                            greenwich_phase,
+                            reference_greenwich_phase[constituent],
+                            time,
+                            reference_time_modified_julian_day,
+                            constituent_frequency_cph[constituent],
+                        );
+                        let angle = TAU * phase;
+                        c64::new(angle.cos(), angle.sin())
+                    })
+                    .collect();
                 ReconstructionTimeTerms {
-                    greenwich_phase: recipes
-                        .iter()
-                        .map(|recipe| recipe.combine_phase(&base_greenwich_phase))
-                        .collect(),
+                    astronomical_basis,
                     base_nodal_terms: if nodal_corrections == NodalCorrections::Exact {
                         base_constituents
                             .iter()
@@ -2796,11 +2812,9 @@ impl GreenwichNodalReconstructor {
             .collect();
         Ok(Self {
             tidal_constituents,
-            constituent_frequency_cph,
             recipes,
             phase_reference,
             nodal_corrections,
-            reference_greenwich_phase,
             reference_base_nodal_terms,
             reference_time_modified_julian_day,
             time_terms,
@@ -2851,8 +2865,20 @@ impl GreenwichNodalReconstructor {
     ) -> Result<Vec<f64>, AnalysisError> {
         validate_latitude(latitude_degrees_north)?;
         let selected = reconstruction_indices(&self.tidal_constituents, solution, filter)?;
+        let coefficients = selected
+            .iter()
+            .copied()
+            .map(|constituent| {
+                let phase = solution.phase_degrees[constituent].to_radians();
+                let amplitude = solution.amplitude[constituent];
+                (
+                    constituent,
+                    c64::new(amplitude * phase.cos(), -amplitude * phase.sin()),
+                )
+            })
+            .collect::<Vec<_>>();
         let latitude_factors = latitude_factors(latitude_degrees_north);
-        let mut base_corrections = base_nodal_corrections(
+        let mut base_corrections = cartesian_base_nodal_corrections(
             self.nodal_corrections,
             &self.time_terms[0].base_nodal_terms,
             &self.reference_base_nodal_terms,
@@ -2861,30 +2887,18 @@ impl GreenwichNodalReconstructor {
         let mut reconstruction = Vec::with_capacity(self.time_terms.len());
         for terms in &self.time_terms {
             if self.nodal_corrections == NodalCorrections::Exact {
-                for (correction, nodal_terms) in base_corrections
-                    .iter_mut()
-                    .zip(terms.base_nodal_terms.iter().copied())
-                {
-                    *correction = nodal_correction(nodal_terms, latitude_factors);
-                }
+                update_cartesian_base_nodal_corrections(
+                    &mut base_corrections,
+                    &terms.base_nodal_terms,
+                    latitude_factors,
+                );
             }
-            let harmonics = selected
+            let harmonics = coefficients
                 .iter()
-                .copied()
-                .map(|constituent| {
-                    let (nodal_amplitude, nodal_phase) =
-                        self.recipes[constituent].combine_nodal(&base_corrections);
-                    let astronomical_phase = phase_cycles(
-                        self.phase_reference,
-                        terms.greenwich_phase[constituent],
-                        self.reference_greenwich_phase[constituent],
-                        terms.modified_julian_day,
-                        self.reference_time_modified_julian_day,
-                        self.constituent_frequency_cph[constituent],
-                    );
-                    let angle = TAU * (nodal_phase + astronomical_phase)
-                        - solution.phase_degrees[constituent].to_radians();
-                    nodal_amplitude * solution.amplitude[constituent] * angle.cos()
+                .map(|(constituent, coefficient)| {
+                    let nodal =
+                        self.recipes[*constituent].combine_cartesian_nodal(&base_corrections);
+                    (nodal * terms.astronomical_basis[*constituent] * *coefficient).re
                 })
                 .sum::<f64>();
             reconstruction.push(
@@ -5343,39 +5357,33 @@ impl CorrectionBasis {
         let column_count = harmonic_columns + 1 + usize::from(self.fit_options.trend);
         let mut design = Mat::zeros(record.positions.len(), column_count);
         let latitude_factors = latitude_factors(latitude);
-        let constant_base_corrections = constant_base_nodal_corrections(
+        let constant_base_corrections = constant_cartesian_base_nodal_corrections(
             self.nodal_corrections,
             &record.reference_base_nodal_terms,
             latitude_factors,
         );
+        let mut exact_base_corrections =
+            vec![c64::new(0.0, 0.0); record.reference_base_nodal_terms.len()];
         for (time_index, position) in record.positions.iter().copied().enumerate() {
             let terms = &self.time_terms[position];
-            let exact_base_corrections;
             let base_corrections = if let Some(corrections) = &constant_base_corrections {
                 corrections
             } else {
-                exact_base_corrections = base_nodal_corrections(
-                    self.nodal_corrections,
+                update_cartesian_base_nodal_corrections(
+                    &mut exact_base_corrections,
                     &terms.base_nodal_terms,
-                    &record.reference_base_nodal_terms,
                     latitude_factors,
                 );
                 &exact_base_corrections
             };
             let basis_values = (0..self.tidal_constituents.len())
                 .map(|constituent_index| {
-                    let (nodal_amplitude, nodal_phase) =
-                        self.recipes[constituent_index].combine_nodal(base_corrections);
-                    let astronomical_phase = phase_cycles(
-                        self.phase_reference,
-                        terms.greenwich_phase[constituent_index],
-                        record.reference_greenwich_phase[constituent_index],
-                        terms.modified_julian_day,
-                        record.reference_time,
-                        record.scalar_constituents[constituent_index].frequency_cph,
-                    );
-                    let angle = TAU * (nodal_phase + astronomical_phase);
-                    (nodal_amplitude * angle.cos(), nodal_amplitude * angle.sin())
+                    let nodal =
+                        self.recipes[constituent_index].combine_cartesian_nodal(base_corrections);
+                    let astronomical =
+                        self.astronomical_basis_at(record, time_index, position, constituent_index);
+                    let corrected = nodal * astronomical;
+                    (corrected.re, corrected.im)
                 })
                 .collect::<Vec<_>>();
 
@@ -5426,39 +5434,32 @@ impl CorrectionBasis {
         let column_count = harmonic_columns + 1 + usize::from(self.fit_options.trend);
         let mut design = Mat::zeros(record.positions.len(), column_count);
         let latitude_factors = latitude_factors(latitude);
-        let constant_base_corrections = constant_base_nodal_corrections(
+        let constant_base_corrections = constant_cartesian_base_nodal_corrections(
             self.nodal_corrections,
             &record.reference_base_nodal_terms,
             latitude_factors,
         );
+        let mut exact_base_corrections =
+            vec![c64::new(0.0, 0.0); record.reference_base_nodal_terms.len()];
         for (time_index, position) in record.positions.iter().copied().enumerate() {
             let terms = &self.time_terms[position];
-            let exact_base_corrections;
             let base_corrections = if let Some(corrections) = &constant_base_corrections {
                 corrections
             } else {
-                exact_base_corrections = base_nodal_corrections(
-                    self.nodal_corrections,
+                update_cartesian_base_nodal_corrections(
+                    &mut exact_base_corrections,
                     &terms.base_nodal_terms,
-                    &record.reference_base_nodal_terms,
                     latitude_factors,
                 );
                 &exact_base_corrections
             };
             let basis_values = (0..self.tidal_constituents.len())
                 .map(|constituent_index| {
-                    let (nodal_amplitude, nodal_phase) =
-                        self.recipes[constituent_index].combine_nodal(base_corrections);
-                    let astronomical_phase = phase_cycles(
-                        self.phase_reference,
-                        terms.greenwich_phase[constituent_index],
-                        record.reference_greenwich_phase[constituent_index],
-                        terms.modified_julian_day,
-                        record.reference_time,
-                        record.scalar_constituents[constituent_index].frequency_cph,
-                    );
-                    let angle = TAU * (nodal_phase + astronomical_phase);
-                    c64::new(nodal_amplitude * angle.cos(), nodal_amplitude * angle.sin())
+                    let nodal =
+                        self.recipes[constituent_index].combine_cartesian_nodal(base_corrections);
+                    let astronomical =
+                        self.astronomical_basis_at(record, time_index, position, constituent_index);
+                    nodal * astronomical
                 })
                 .collect::<Vec<_>>();
 
@@ -5546,6 +5547,25 @@ impl CorrectionBasis {
             greenwich_phases_at_time(&self.base_constituents, &self.recipes, reference_time);
         let reference_base_nodal_terms =
             base_nodal_terms_at_time(&self.base_constituents, reference_time);
+        let astronomical_basis = share_irregular_plan.then(|| {
+            let mut basis = Vec::with_capacity(positions.len() * scalar_constituents.len());
+            for position in positions.iter().copied() {
+                let terms = &self.time_terms[position];
+                for (constituent_index, constituent) in scalar_constituents.iter().enumerate() {
+                    let astronomical_phase = phase_cycles(
+                        self.phase_reference,
+                        terms.greenwich_phase[constituent_index],
+                        reference_greenwich_phase[constituent_index],
+                        terms.modified_julian_day,
+                        reference_time,
+                        constituent.frequency_cph,
+                    );
+                    let angle = TAU * astronomical_phase;
+                    basis.push(c64::new(angle.cos(), angle.sin()));
+                }
+            }
+            basis
+        });
         Ok(RecordSubset {
             positions,
             scalar_constituents,
@@ -5554,7 +5574,32 @@ impl CorrectionBasis {
             reference_time,
             time_span_days,
             confidence_sampling,
+            astronomical_basis,
         })
+    }
+
+    #[inline]
+    fn astronomical_basis_at(
+        &self,
+        record: &RecordSubset,
+        time_index: usize,
+        position: usize,
+        constituent_index: usize,
+    ) -> c64 {
+        if let Some(basis) = &record.astronomical_basis {
+            return basis[time_index * self.tidal_constituents.len() + constituent_index];
+        }
+        let terms = &self.time_terms[position];
+        let astronomical_phase = phase_cycles(
+            self.phase_reference,
+            terms.greenwich_phase[constituent_index],
+            record.reference_greenwich_phase[constituent_index],
+            terms.modified_julian_day,
+            record.reference_time,
+            record.scalar_constituents[constituent_index].frequency_cph,
+        );
+        let angle = TAU * astronomical_phase;
+        c64::new(angle.cos(), angle.sin())
     }
 
     fn model_at_latitude_for_record(
@@ -5567,39 +5612,33 @@ impl CorrectionBasis {
         let column_count = harmonic_columns + 1 + usize::from(self.fit_options.trend);
         let mut design = Mat::zeros(record.positions.len(), column_count);
         let latitude_factors = latitude_factors(latitude);
-        let constant_base_corrections = constant_base_nodal_corrections(
+        let constant_base_corrections = constant_cartesian_base_nodal_corrections(
             self.nodal_corrections,
             &record.reference_base_nodal_terms,
             latitude_factors,
         );
+        let mut exact_base_corrections =
+            vec![c64::new(0.0, 0.0); record.reference_base_nodal_terms.len()];
         for (time_index, position) in record.positions.iter().copied().enumerate() {
             let terms = &self.time_terms[position];
-            let exact_base_corrections;
             let base_corrections = if let Some(corrections) = &constant_base_corrections {
                 corrections
             } else {
-                exact_base_corrections = base_nodal_corrections(
-                    self.nodal_corrections,
+                update_cartesian_base_nodal_corrections(
+                    &mut exact_base_corrections,
                     &terms.base_nodal_terms,
-                    &record.reference_base_nodal_terms,
                     latitude_factors,
                 );
                 &exact_base_corrections
             };
             for constituent_index in 0..self.tidal_constituents.len() {
-                let (nodal_amplitude, nodal_phase) =
-                    self.recipes[constituent_index].combine_nodal(base_corrections);
-                let astronomical_phase = phase_cycles(
-                    self.phase_reference,
-                    terms.greenwich_phase[constituent_index],
-                    record.reference_greenwich_phase[constituent_index],
-                    terms.modified_julian_day,
-                    record.reference_time,
-                    record.scalar_constituents[constituent_index].frequency_cph,
-                );
-                let angle = TAU * (nodal_phase + astronomical_phase);
-                design[(time_index, constituent_index * 2)] = nodal_amplitude * angle.cos();
-                design[(time_index, constituent_index * 2 + 1)] = nodal_amplitude * angle.sin();
+                let nodal =
+                    self.recipes[constituent_index].combine_cartesian_nodal(base_corrections);
+                let astronomical =
+                    self.astronomical_basis_at(record, time_index, position, constituent_index);
+                let corrected = nodal * astronomical;
+                design[(time_index, constituent_index * 2)] = corrected.re;
+                design[(time_index, constituent_index * 2 + 1)] = corrected.im;
             }
             design[(time_index, harmonic_columns)] = 1.0;
             if self.fit_options.trend {
@@ -5635,11 +5674,13 @@ struct RecordSubset {
     reference_time: f64,
     time_span_days: f64,
     confidence_sampling: ConfidenceSampling,
+    // Time-major, constituent-minor and present only for a bounded shared mask.
+    astronomical_basis: Option<Vec<c64>>,
 }
 
 #[derive(Debug)]
 struct ReconstructionTimeTerms {
-    greenwich_phase: Vec<f64>,
+    astronomical_basis: Vec<c64>,
     base_nodal_terms: Vec<NodalTerms>,
     modified_julian_day: f64,
 }
@@ -5665,18 +5706,19 @@ impl CorrectionRecipe {
         }
     }
 
-    fn combine_nodal(&self, base_corrections: &[(f64, f64)]) -> (f64, f64) {
+    fn combine_cartesian_nodal(&self, base_corrections: &[c64]) -> c64 {
         match self {
             Self::Base { base_index } => base_corrections[*base_index],
             Self::Shallow { terms } => {
                 let mut amplitude = 1.0;
                 let mut phase = 0.0;
                 for term in terms {
-                    let (parent_amplitude, parent_phase) = base_corrections[term.base_index];
-                    amplitude *= parent_amplitude.powf(term.coefficient.abs());
-                    phase += parent_phase * term.coefficient;
+                    let parent = base_corrections[term.base_index];
+                    amplitude *= parent.re.hypot(parent.im).powf(term.coefficient.abs());
+                    phase += parent.im.atan2(parent.re) / TAU * term.coefficient;
                 }
-                (amplitude, phase)
+                let angle = TAU * phase;
+                c64::new(amplitude * angle.cos(), amplitude * angle.sin())
             }
         }
     }
@@ -6020,52 +6062,63 @@ fn latitude_factors(latitude: f64) -> [f64; 3] {
     ]
 }
 
-fn nodal_correction(terms: NodalTerms, latitude_factors: [f64; 3]) -> (f64, f64) {
+fn cartesian_nodal_correction(terms: NodalTerms, latitude_factors: [f64; 3]) -> c64 {
     let mut real = 1.0;
     let mut imaginary = 0.0;
     for (class, factor) in latitude_factors.into_iter().enumerate() {
         real += factor * terms.real[class];
         imaginary += factor * terms.imaginary[class];
     }
-    (real.hypot(imaginary), imaginary.atan2(real) / TAU)
+    c64::new(real, imaginary)
 }
 
-fn base_nodal_corrections(
+fn update_cartesian_base_nodal_corrections(
+    corrections: &mut [c64],
+    terms: &[NodalTerms],
+    latitude_factors: [f64; 3],
+) {
+    debug_assert_eq!(corrections.len(), terms.len());
+    for (correction, terms) in corrections.iter_mut().zip(terms.iter().copied()) {
+        *correction = cartesian_nodal_correction(terms, latitude_factors);
+    }
+}
+
+fn cartesian_base_nodal_corrections(
     mode: NodalCorrections,
     exact_terms: &[NodalTerms],
     reference_terms: &[NodalTerms],
     latitude_factors: [f64; 3],
-) -> Vec<(f64, f64)> {
+) -> Vec<c64> {
     match mode {
         NodalCorrections::Exact => exact_terms
             .iter()
             .copied()
-            .map(|terms| nodal_correction(terms, latitude_factors))
+            .map(|terms| cartesian_nodal_correction(terms, latitude_factors))
             .collect(),
         NodalCorrections::LinearTime => reference_terms
             .iter()
             .copied()
-            .map(|terms| nodal_correction(terms, latitude_factors))
+            .map(|terms| cartesian_nodal_correction(terms, latitude_factors))
             .collect(),
-        NodalCorrections::Disabled => vec![(1.0, 0.0); reference_terms.len()],
+        NodalCorrections::Disabled => vec![c64::new(1.0, 0.0); reference_terms.len()],
     }
 }
 
-fn constant_base_nodal_corrections(
+fn constant_cartesian_base_nodal_corrections(
     mode: NodalCorrections,
     reference_terms: &[NodalTerms],
     latitude_factors: [f64; 3],
-) -> Option<Vec<(f64, f64)>> {
+) -> Option<Vec<c64>> {
     match mode {
         NodalCorrections::Exact => None,
         NodalCorrections::LinearTime => Some(
             reference_terms
                 .iter()
                 .copied()
-                .map(|terms| nodal_correction(terms, latitude_factors))
+                .map(|terms| cartesian_nodal_correction(terms, latitude_factors))
                 .collect(),
         ),
-        NodalCorrections::Disabled => Some(vec![(1.0, 0.0); reference_terms.len()]),
+        NodalCorrections::Disabled => Some(vec![c64::new(1.0, 0.0); reference_terms.len()]),
     }
 }
 
@@ -6141,15 +6194,19 @@ mod tests {
     }
 
     #[test]
-    fn varying_latitude_batch_matches_individual_models_in_input_order() {
+    fn shared_astronomical_basis_matches_individual_models_in_input_order() {
         let time = times();
-        let latitudes = [60.0, 61.0];
+        let latitudes = (0_u32..16)
+            .map(|series| 59.0 + f64::from(series) * 0.2)
+            .collect::<Vec<_>>();
         let constituents = [TidalConstituent::M2, TidalConstituent::K1];
         let mut observations = Vec::with_capacity(time.len() * latitudes.len());
         for index in 0..time.len() {
             let position = f64::from(u32::try_from(index).expect("fixture index fits u32"));
-            observations.push(0.2 + (position / 11.0).sin());
-            observations.push(-0.1 + (position / 7.0).cos());
+            for series in 0..latitudes.len() {
+                let series = f64::from(u32::try_from(series).expect("fixture series fits u32"));
+                observations.push(0.2 + 0.01 * series + (position / (7.0 + 0.25 * series)).sin());
+            }
         }
         let batch = GreenwichNodalBatch::prepare_modified_julian_days(&time, &constituents)
             .expect("valid batch");

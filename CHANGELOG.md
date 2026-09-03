@@ -21,6 +21,13 @@ published API and file-schema contracts.
 - Coalesced schema-1 coefficient snapshot arrays into bounded typed NPZ blobs.
   Existing schema-1 archives remain readable while large batch archives save
   and load with far fewer ZIP entries.
+- Removed per-timestamp corrected-basis allocations and polar round trips,
+  cached bounded shared-mask astronomical bases, and precomputed reconstruction
+  phasors. Exact corrected throughput improves by 1.53–3.92x in the retained
+  10,000-series worker matrix.
+- Applied a lazily cached QR-derived least-squares projection to reusable fixed
+  raw batches of at least 16 series, improving the retained 10,000-series
+  throughput by 1.87–2.21x while preserving the direct QR path for small calls.
 
 ## 0.2.0 - 2026-09-02
 

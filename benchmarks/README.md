@@ -222,6 +222,29 @@ corrections, and no confidence intervals. This deliberately isolates harmonic
 basis construction and least squares before the Greenwich/nodal machinery is
 ported.
 
+Run the reusable fixed-design and corrected-basis microbenchmarks with explicit
+worker, series, warm-up, and repetition settings:
+
+```console
+RUSTFLAGS="-C target-cpu=native" \
+  RUTIDE_BENCH_SERIES=10000 RUTIDE_BENCH_WORKERS=1 \
+  RUTIDE_BENCH_WARMUPS=5 RUTIDE_BENCH_REPETITIONS=5 \
+  cargo bench -p rutide-core --bench fixed_raw_throughput
+
+RUSTFLAGS="-C target-cpu=native" \
+  RUTIDE_BENCH_SERIES=10000 RUTIDE_BENCH_WORKERS=64 \
+  RUTIDE_BENCH_PHASE=greenwich RUTIDE_BENCH_NODAL=exact \
+  RUTIDE_BENCH_WARMUPS=2 RUTIDE_BENCH_REPETITIONS=5 \
+  cargo bench -p rutide-core --bench greenwich_nodal_throughput
+```
+
+`RUTIDE_BENCH_PHASE` accepts `greenwich`, `linear-time`, or `raw`;
+`RUTIDE_BENCH_NODAL` accepts `exact`, `linear-time`, or `disabled`. These knobs
+isolate correction costs without changing the fixture. The fixed-raw probe also
+accepts `RUTIDE_BENCH_WARMUPS=0` for measuring the lazy projection's cold first
+call. Retained before/after results and memory bounds are recorded in
+`benchmarks/results/compute-kernel-optimization-2026-09-03.md`.
+
 The `fixed-constituents` profile is the next Rust parity target. It keeps the same
 five constituents and OLS configuration while enabling exact Greenwich phase and
 nodal/satellite corrections. The corresponding Rust batch path shares only the

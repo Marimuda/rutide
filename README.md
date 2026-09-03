@@ -33,6 +33,12 @@ the same canonical digest. Its 5.40-second median is 9.5% slower than the
 one-chunk comparison and remains 23.5x faster than the previously measured
 126.97-second Python baseline.
 
+The focused [compute-kernel optimization](benchmarks/results/compute-kernel-optimization-2026-09-03.md)
+removes measured allocation, repeated trigonometry, and wide-batch QR costs.
+Exact corrected solves improve by 1.53–3.92x, fixed raw batches by 1.87–2.21x,
+and installed-binding reconstruction by 1.29–1.90x. The snapshot also records
+the current scaling ceiling and bounded cache costs.
+
 The focused [irregular-confidence snapshot](benchmarks/results/irregular-confidence-2026-09-01.md)
 records Lomb–Scargle scalar and vector parity and a 20.05–70.06x advantage over
 pinned Python UTide on its 100-series observational workload, depending on field
