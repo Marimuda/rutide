@@ -45,8 +45,25 @@ RNM follows equation 82 by multiplying RR by the square root of the adjacent
 constituents' mean SNR. `K` is the two-norm condition number of the actual basis
 matrix, and `SNRallc / K > 1` is the report's whole-model error-bound criterion.
 Corrmax is the greatest absolute correlation among the two scalar or four vector
-Cartesian parameters belonging to an adjacent constituent pair. Those
-covariance-dependent quantities are the next implementation increment.
+Cartesian parameters belonging to an adjacent constituent pair.
+
+The high-level Rust calculation is opt-in through
+`ConstituentDiagnosticsOptions`. Its defaults reproduce MATLAB UTide's
+`Rmin = 1` and inclusive `SNR >= 2` significant-subset threshold. Prepared raw
+and Greenwich/nodal models expose scalar diagnostics, while Greenwich/nodal
+models also expose vector diagnostics. Scalar inference is supported: ordinary
+and reference constituents participate in the neighbor graph, constrained
+inferred outputs remain aligned with the solution but have no independent
+neighbors.
+
+`K` does not refactor or copy the tall basis. RUTide applies the complex-basis
+normalization to the prepared pivoted QR's small triangular factor and caches
+its singular-value ratio. Unweighted coefficient normal inverses are likewise
+formed from and cached behind that QR factor. The reconstructed variance and
+whole-model energy calculations stream over the observations without retaining
+reconstruction arrays; vector inputs are not interleaved into a temporary copy.
+These choices keep the default solve path unchanged and bound opt-in diagnostic
+memory by the small coefficient matrices.
 
 ## Irregular records
 
@@ -59,12 +76,14 @@ RUTide will serialize the existing sampling diagnostics beside these values and
 will not claim that RR or RNM alone proves identifiability for a heavily gapped
 record.
 
-## Planned 0.3.0 surface
+## 0.3.0 implementation sequence
 
-1. Public equation-81 neighbor and equation-99–102 tidal-variance kernels.
-2. Cached `K`, `SNRallc`, RNM, and Corrmax from the fitted design/covariance.
-3. Scalar, vector, ordinary, inferred, OLS, robust, complete, missing, and
-   irregular integration.
+1. Public equation-81 neighbor and equation-99–102 tidal-variance kernels — done.
+2. Cached `K`, `SNRallc`, RNM, and Corrmax from the fitted design/covariance —
+   done for the real scalar/vector basis.
+3. Scalar/vector ordinary and scalar-inference OLS/robust integration — done for
+   complete prepared records; vector inference and batch/missing orchestration
+   remain.
 4. Structured Rust and Python results plus compact human-readable presentation.
 5. Scalar NetCDF schema 17, vector schema 15, and backward-readable Python
    coefficient snapshot schema 2.

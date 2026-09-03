@@ -65,6 +65,44 @@ pub enum AnalysisError {
         /// Position of the invalid value.
         index: usize,
     },
+    /// A constituent SNR supplied to independence diagnostics is NaN or negative.
+    InvalidDiagnosticSignalToNoise {
+        /// Position of the invalid constituent SNR.
+        index: usize,
+    },
+    /// A coefficient variance is non-finite or not strictly positive.
+    InvalidDiagnosticCoefficientVariance {
+        /// Position of the invalid harmonic parameter.
+        parameter: usize,
+    },
+    /// A coefficient covariance could not be normalized into a correlation.
+    InvalidDiagnosticCoefficientCorrelation {
+        /// Row parameter of the invalid covariance.
+        left: usize,
+        /// Column parameter of the invalid covariance.
+        right: usize,
+    },
+    /// A diagnostic basis condition number is NaN or not strictly positive.
+    InvalidDiagnosticBasisConditionNumber,
+    /// The small SVD used for a basis condition number did not converge.
+    DiagnosticDecompositionFailed,
+    /// A whole-model diagnostic energy is non-finite or negative.
+    InvalidDiagnosticEnergy {
+        /// Diagnostic energy field containing the invalid value.
+        field: &'static str,
+    },
+    /// A constituent-diagnostic threshold is negative or non-finite.
+    InvalidDiagnosticThreshold {
+        /// Diagnostic whose threshold is invalid.
+        diagnostic: &'static str,
+    },
+    /// A solution was not produced by the prepared model used for diagnostics.
+    DiagnosticSolutionModelMismatch,
+    /// A robust weight supplied to model diagnostics is negative or non-finite.
+    InvalidDiagnosticWeight {
+        /// Time position of the invalid weight.
+        time: usize,
+    },
     /// A reconstruction threshold is negative or non-finite.
     InvalidReconstructionThreshold {
         /// Diagnostic whose threshold is invalid.
@@ -79,7 +117,7 @@ pub enum AnalysisError {
         /// Number of values required by the reconstruction basis.
         expected: usize,
     },
-    /// SNR filtering was requested for coefficients without confidence intervals.
+    /// An SNR-dependent operation was requested without confidence intervals.
     MissingSignalToNoise,
     /// An explicit reconstruction constituent was not part of the fitted model.
     UnpreparedReconstructionConstituent {
@@ -229,6 +267,36 @@ impl fmt::Display for AnalysisError {
                 formatter,
                 "diagnostic field {field:?} contains a non-finite value at index {index}"
             ),
+            Self::InvalidDiagnosticSignalToNoise { index } => write!(
+                formatter,
+                "diagnostic signal-to-noise ratio at index {index} must be non-negative and not NaN"
+            ),
+            Self::InvalidDiagnosticCoefficientVariance { parameter } => write!(
+                formatter,
+                "diagnostic coefficient variance for parameter {parameter} must be finite and greater than zero"
+            ),
+            Self::InvalidDiagnosticCoefficientCorrelation { left, right } => write!(
+                formatter,
+                "diagnostic coefficient correlation for parameters {left} and {right} is not finite"
+            ),
+            Self::InvalidDiagnosticBasisConditionNumber => formatter
+                .write_str("diagnostic basis condition number must be positive and not NaN"),
+            Self::DiagnosticDecompositionFailed => formatter
+                .write_str("diagnostic basis singular-value decomposition did not converge"),
+            Self::InvalidDiagnosticEnergy { field } => write!(
+                formatter,
+                "diagnostic energy field {field:?} must be finite and non-negative"
+            ),
+            Self::InvalidDiagnosticThreshold { diagnostic } => write!(
+                formatter,
+                "{diagnostic} diagnostic threshold must be finite and non-negative"
+            ),
+            Self::DiagnosticSolutionModelMismatch => formatter
+                .write_str("diagnostic solution reference time does not match the prepared model"),
+            Self::InvalidDiagnosticWeight { time } => write!(
+                formatter,
+                "diagnostic robust weight at time {time} must be finite and non-negative"
+            ),
             Self::InvalidReconstructionThreshold { diagnostic } => write!(
                 formatter,
                 "{diagnostic} reconstruction threshold must be finite and non-negative"
@@ -242,7 +310,7 @@ impl fmt::Display for AnalysisError {
                 "solution field {field:?} contains {actual} values; expected {expected}"
             ),
             Self::MissingSignalToNoise => formatter.write_str(
-                "SNR reconstruction filtering requires a solution with confidence intervals",
+                "the requested SNR-dependent operation requires a solution with confidence intervals",
             ),
             Self::UnpreparedReconstructionConstituent { name } => write!(
                 formatter,

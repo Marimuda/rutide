@@ -2,11 +2,11 @@
 
 use rayon::ThreadPoolBuilder;
 use rutide_core::{
-    AnalysisError, FitOptions, GreenwichNodalOls, InferenceMode, LinearConfidence,
-    MonteCarloOptions, NodalCorrections, PhaseReference, ReconstructionFilter, RobustOptions,
-    RobustWeightFunction, ScalarInferenceBatch, ScalarInferenceOls, ScalarInferenceRelation,
-    SolverOptions, TidalConstituent, VectorInferenceBatch, VectorInferenceOls,
-    VectorInferenceRelation,
+    AnalysisError, ConstituentDiagnosticsOptions, FitOptions, GreenwichNodalOls, InferenceMode,
+    LinearConfidence, MonteCarloOptions, NodalCorrections, PhaseReference, ReconstructionFilter,
+    RobustOptions, RobustWeightFunction, ScalarInferenceBatch, ScalarInferenceOls,
+    ScalarInferenceRelation, SolverOptions, TidalConstituent, VectorInferenceBatch,
+    VectorInferenceOls, VectorInferenceRelation,
 };
 
 const LATITUDE: f64 = 60.957_717_895_507_81;
@@ -610,6 +610,47 @@ fn check_oracle(count: usize, mode: InferenceMode, expected: &Expected) {
             5e-10,
         );
     }
+}
+
+#[test]
+fn scalar_inference_diagnostics_exclude_constrained_outputs() {
+    let time = oracle_times(745);
+    let observations = oracle_observations(745);
+    let model = ScalarInferenceOls::prepare_modified_julian_days(
+        &time,
+        LATITUDE,
+        &requested(),
+        &RELATIONSHIPS,
+        InferenceMode::Exact,
+    )
+    .expect("valid inferred model");
+    let solution = model
+        .solve_with_linear_confidence(&observations, LinearConfidence::White)
+        .expect("valid inferred confidence solution");
+    let diagnostics = model
+        .diagnose_solution(
+            &observations,
+            &solution,
+            ConstituentDiagnosticsOptions::default(),
+        )
+        .expect("valid inferred diagnostics");
+
+    assert_eq!(diagnostics.constituents.len(), 5);
+    for inferred in [3, 4] {
+        assert!(diagnostics.constituents[inferred].lower.is_none());
+        assert!(diagnostics.constituents[inferred].higher.is_none());
+    }
+    for independence in &diagnostics.constituents[..3] {
+        for neighbor in [&independence.lower, &independence.higher]
+            .into_iter()
+            .flatten()
+        {
+            assert!(neighbor.index < 3);
+            assert!(neighbor.noise_modified_rayleigh_criterion.is_some());
+            assert!(neighbor.maximum_correlation.is_some());
+        }
+    }
+    assert!(diagnostics.tidal_variance.all_constituent_tidal_variance > 0.0);
 }
 
 #[test]

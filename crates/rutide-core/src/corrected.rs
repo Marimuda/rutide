@@ -13,7 +13,8 @@ use faer::{
 use rayon::prelude::*;
 
 use crate::{
-    AnalysisError, Constituent, FitOptions, FixedRawOls, LinearConfidence, MonteCarloOptions,
+    AnalysisError, Constituent, ConstituentDiagnosticsOptions, ConstituentIndependenceDiagnostics,
+    ConstituentSelectionDiagnostics, FitOptions, FixedRawOls, LinearConfidence, MonteCarloOptions,
     RobustDiagnostics, RobustOptions, ScalarSolution, TidalConstituent, VectorReconstruction,
     VectorSolution,
     astronomy::at_modified_julian_day,
@@ -886,6 +887,47 @@ impl GreenwichNodalOls {
         )
     }
 
+    /// Evaluate the extended constituent-selection diagnostics for a scalar fit.
+    ///
+    /// The supplied solution must come from this model and include confidence
+    /// intervals/SNR. Diagnostics are opt-in and do not alter constituent
+    /// selection or the fitted coefficients.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for incompatible observations, solution state,
+    /// options, or diagnostic matrix calculations.
+    pub fn diagnose_scalar_solution(
+        &self,
+        observations: &[f64],
+        solution: &ScalarSolution,
+        options: ConstituentDiagnosticsOptions,
+    ) -> Result<ConstituentSelectionDiagnostics, AnalysisError> {
+        self.model
+            .diagnose_scalar_solution(observations, solution, options)
+    }
+
+    /// Evaluate the extended constituent-selection diagnostics for a current fit.
+    ///
+    /// The supplied solution must come from this model and include confidence
+    /// intervals/SNR. The eastward and northward inputs are streamed directly;
+    /// this diagnostic pass does not allocate an interleaved copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for incompatible observations, solution state,
+    /// options, or diagnostic matrix calculations.
+    pub fn diagnose_vector_solution(
+        &self,
+        eastward: &[f64],
+        northward: &[f64],
+        solution: &VectorSolution,
+        options: ConstituentDiagnosticsOptions,
+    ) -> Result<ConstituentSelectionDiagnostics, AnalysisError> {
+        self.model
+            .diagnose_vector_solution(eastward, northward, solution, options)
+    }
+
     fn solve_vector_impl(
         &self,
         eastward: &[f64],
@@ -1241,6 +1283,104 @@ impl ScalarInferenceOls {
             noise,
             0,
         )
+    }
+
+    /// Evaluate extended diagnostics while keeping inferred outputs out of the
+    /// independently fitted neighbor graph.
+    ///
+    /// The fitted design, condition number, covariance, and reconstructed model
+    /// energy contain the constrained inference terms used by this model. The
+    /// returned constituent vector remains aligned with the expanded solution;
+    /// inferred entries have no lower/higher independent neighbors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for an incompatible expanded solution, absent
+    /// confidence/SNR, invalid observations or options, or diagnostic matrix
+    /// failures.
+    pub fn diagnose_solution(
+        &self,
+        observations: &[f64],
+        solution: &ScalarSolution,
+        options: ConstituentDiagnosticsOptions,
+    ) -> Result<ConstituentSelectionDiagnostics, AnalysisError> {
+        let output_count = self.output_mappings.len();
+        for (field, values) in [
+            ("cosine_coefficient", &solution.cosine_coefficient),
+            ("sine_coefficient", &solution.sine_coefficient),
+        ] {
+            if values.len() != output_count {
+                return Err(AnalysisError::InvalidSolutionShape {
+                    field,
+                    actual: values.len(),
+                    expected: output_count,
+                });
+            }
+        }
+        let expanded_signal_to_noise = solution
+            .signal_to_noise
+            .as_deref()
+            .ok_or(AnalysisError::MissingSignalToNoise)?;
+        if expanded_signal_to_noise.len() != output_count {
+            return Err(AnalysisError::InvalidSolutionShape {
+                field: "signal_to_noise",
+                actual: expanded_signal_to_noise.len(),
+                expected: output_count,
+            });
+        }
+
+        let mut direct_outputs = vec![usize::MAX; self.model.constituents().len()];
+        for (output, mapping) in self.output_mappings.iter().copied().enumerate() {
+            if !mapping.inferred {
+                direct_outputs[mapping.source_fit_index] = output;
+            }
+        }
+        debug_assert!(direct_outputs.iter().all(|output| *output != usize::MAX));
+        let mut direct_solution = solution.clone();
+        direct_solution.cosine_coefficient = direct_outputs
+            .iter()
+            .map(|output| solution.cosine_coefficient[*output])
+            .collect();
+        direct_solution.sine_coefficient = direct_outputs
+            .iter()
+            .map(|output| solution.sine_coefficient[*output])
+            .collect();
+        direct_solution.signal_to_noise = Some(
+            direct_outputs
+                .iter()
+                .map(|output| expanded_signal_to_noise[*output])
+                .collect(),
+        );
+        let direct =
+            self.model
+                .diagnose_scalar_solution(observations, &direct_solution, options)?;
+        let mut constituents = vec![
+            ConstituentIndependenceDiagnostics {
+                lower: None,
+                higher: None,
+            };
+            output_count
+        ];
+        for (source, mut independence) in direct.constituents.into_iter().enumerate() {
+            for neighbor in [&mut independence.lower, &mut independence.higher]
+                .into_iter()
+                .flatten()
+            {
+                let output = direct_outputs[neighbor.index];
+                neighbor.index = output;
+                neighbor.name.clone_from(&self.constituents[output].name);
+                neighbor.frequency_cph = self.constituents[output].frequency_cph;
+            }
+            constituents[direct_outputs[source]] = independence;
+        }
+
+        Ok(ConstituentSelectionDiagnostics {
+            constituents,
+            whole_model: direct.whole_model,
+            tidal_variance: direct.tidal_variance,
+            rayleigh_minimum: direct.rayleigh_minimum,
+            minimum_signal_to_noise: direct.minimum_signal_to_noise,
+        })
     }
 
     /// Fit several complete time-major scalar series.
@@ -6145,7 +6285,10 @@ mod tests {
         GreenwichNodalBatch, GreenwichNodalOls, NodalCorrections, PhaseReference, SolverOptions,
         shared_lomb_plan_groups, usize_to_f64,
     };
-    use crate::{AnalysisError, FitOptions, LinearConfidence, MonteCarloOptions, TidalConstituent};
+    use crate::{
+        AnalysisError, ConstituentDiagnosticsOptions, FitOptions, LinearConfidence,
+        MonteCarloOptions, TidalConstituent,
+    };
 
     fn times() -> Vec<f64> {
         (0_u32..745)
@@ -6171,6 +6314,51 @@ mod tests {
         .expect("valid corrected model");
         assert!((model.constituents()[0].frequency_cph - 0.080_511_400_671_577_2).abs() < 1e-15);
         assert!((model.constituents()[1].frequency_cph - 1.0 / 12.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn corrected_vector_extended_diagnostics_are_complete() {
+        let time = times();
+        let model = GreenwichNodalOls::prepare_modified_julian_days(
+            &time,
+            60.0,
+            &[TidalConstituent::M2, TidalConstituent::S2],
+        )
+        .expect("valid corrected model");
+        let eastward = (0..time.len())
+            .map(|index| {
+                let position = usize_to_f64(index);
+                0.2 + 0.4 * (position * 0.51).cos() + 0.01 * (position * 0.17).sin()
+            })
+            .collect::<Vec<_>>();
+        let northward = (0..time.len())
+            .map(|index| {
+                let position = usize_to_f64(index);
+                -0.1 + 0.25 * (position * 0.51).sin() + 0.008 * (position * 0.23).cos()
+            })
+            .collect::<Vec<_>>();
+        let solution = model
+            .solve_vector_with_linear_confidence(&eastward, &northward, LinearConfidence::White)
+            .expect("valid vector confidence fit");
+        let diagnostics = model
+            .diagnose_vector_solution(
+                &eastward,
+                &northward,
+                &solution,
+                ConstituentDiagnosticsOptions::default(),
+            )
+            .expect("valid vector diagnostics");
+
+        assert_eq!(diagnostics.constituents.len(), 2);
+        let pair = diagnostics.constituents[0]
+            .higher
+            .as_ref()
+            .expect("higher-frequency neighbor");
+        assert!(pair.noise_modified_rayleigh_criterion.is_some());
+        assert!(pair.maximum_correlation.is_some());
+        assert!(diagnostics.tidal_variance.raw_tidal_variance > 0.0);
+        assert!(diagnostics.tidal_variance.all_constituent_tidal_variance > 0.0);
+        assert!(diagnostics.whole_model.basis_condition_number >= 1.0);
     }
 
     #[test]

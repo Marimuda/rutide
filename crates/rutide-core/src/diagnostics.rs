@@ -9,6 +9,7 @@ use crate::{
     error::AnalysisError,
     scalar::{Constituent, validate_constituents},
 };
+use faer::Mat;
 
 /// How a fitted constituent participates in independence diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,6 +64,96 @@ pub struct TidalVarianceDiagnostics {
     /// This is `None` when no significant subset was supplied or the detrended
     /// raw input has zero variance.
     pub significant_constituent_percent_tidal_variance: Option<f64>,
+}
+
+/// Whole-model independence diagnostics from Codiga (2011), equations 84–86.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WholeModelIndependenceDiagnostics {
+    /// Two-norm condition number of the complete fitted basis, conventionally `K`.
+    pub basis_condition_number: f64,
+    /// Energy SNR of the complete model, conventionally `SNRallc`.
+    ///
+    /// This is `None` when both model energy and residual mean square are zero.
+    pub all_constituent_signal_to_noise: Option<f64>,
+    /// `SNRallc / K`, the report's whole-model error-bound diagnostic.
+    ///
+    /// This is `None` for an indeterminate infinite-over-infinite ratio or when
+    /// `all_constituent_signal_to_noise` is undefined.
+    pub condition_adjusted_signal_to_noise: Option<f64>,
+}
+
+/// Configuration for the extended constituent-selection diagnostic suite.
+///
+/// Defaults reproduce MATLAB `UTide`: `Rmin = 1` and an SNR significance
+/// threshold of 2. Fields are private so the suite can grow compatibly.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConstituentDiagnosticsOptions {
+    rayleigh_minimum: f64,
+    minimum_signal_to_noise: f64,
+}
+
+impl Default for ConstituentDiagnosticsOptions {
+    fn default() -> Self {
+        Self {
+            rayleigh_minimum: 1.0,
+            minimum_signal_to_noise: 2.0,
+        }
+    }
+}
+
+impl ConstituentDiagnosticsOptions {
+    /// Set the denominator of the conventional Rayleigh criterion.
+    #[must_use]
+    pub const fn with_rayleigh_minimum(mut self, rayleigh_minimum: f64) -> Self {
+        self.rayleigh_minimum = rayleigh_minimum;
+        self
+    }
+
+    /// Set the inclusive SNR threshold for significant-subset tidal variance.
+    #[must_use]
+    pub const fn with_minimum_signal_to_noise(mut self, minimum_signal_to_noise: f64) -> Self {
+        self.minimum_signal_to_noise = minimum_signal_to_noise;
+        self
+    }
+
+    /// Return the Rayleigh criterion denominator.
+    #[must_use]
+    pub const fn rayleigh_minimum(self) -> f64 {
+        self.rayleigh_minimum
+    }
+
+    /// Return the inclusive significant-constituent SNR threshold.
+    #[must_use]
+    pub const fn minimum_signal_to_noise(self) -> f64 {
+        self.minimum_signal_to_noise
+    }
+
+    pub(crate) fn validate(self) -> Result<(), AnalysisError> {
+        if !self.rayleigh_minimum.is_finite() || self.rayleigh_minimum <= 0.0 {
+            return Err(AnalysisError::InvalidRayleighMinimum);
+        }
+        if !self.minimum_signal_to_noise.is_finite() || self.minimum_signal_to_noise < 0.0 {
+            return Err(AnalysisError::InvalidDiagnosticThreshold {
+                diagnostic: "signal_to_noise",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Extended evidence for constituent identifiability and captured tidal variance.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConstituentSelectionDiagnostics {
+    /// Lower/higher directly modeled neighbor diagnostics in solution order.
+    pub constituents: Vec<ConstituentIndependenceDiagnostics>,
+    /// Condition-number and complete-model SNR diagnostics.
+    pub whole_model: WholeModelIndependenceDiagnostics,
+    /// Raw, complete-fit, and SNR-filtered reconstructed tidal variance.
+    pub tidal_variance: TidalVarianceDiagnostics,
+    /// Rayleigh denominator used for this calculation.
+    pub rayleigh_minimum: f64,
+    /// Inclusive SNR threshold used for the significant reconstruction.
+    pub minimum_signal_to_noise: f64,
 }
 
 /// Calculate conventional Rayleigh diagnostics for adjacent fitted frequencies.
@@ -245,6 +336,130 @@ pub fn vector_tidal_variance_diagnostics(
     ))
 }
 
+pub(crate) fn populate_noise_modified_rayleigh(
+    diagnostics: &mut [ConstituentIndependenceDiagnostics],
+    signal_to_noise: &[f64],
+) -> Result<(), AnalysisError> {
+    if signal_to_noise.len() != diagnostics.len() {
+        return Err(AnalysisError::InvalidSolutionShape {
+            field: "signal_to_noise",
+            actual: signal_to_noise.len(),
+            expected: diagnostics.len(),
+        });
+    }
+    if let Some((index, _)) = signal_to_noise
+        .iter()
+        .enumerate()
+        .find(|(_, value)| value.is_nan() || **value < 0.0)
+    {
+        return Err(AnalysisError::InvalidDiagnosticSignalToNoise { index });
+    }
+
+    for (constituent, independence) in diagnostics.iter_mut().enumerate() {
+        for neighbor in [&mut independence.lower, &mut independence.higher]
+            .into_iter()
+            .flatten()
+        {
+            let mean_signal_to_noise =
+                signal_to_noise[constituent].midpoint(signal_to_noise[neighbor.index]);
+            neighbor.noise_modified_rayleigh_criterion =
+                Some(neighbor.rayleigh_criterion * mean_signal_to_noise.sqrt());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn populate_maximum_correlation(
+    diagnostics: &mut [ConstituentIndependenceDiagnostics],
+    coefficient_covariance: &Mat<f64>,
+) -> Result<(), AnalysisError> {
+    let harmonic_parameter_count = diagnostics.len().saturating_mul(2);
+    if coefficient_covariance.nrows() < harmonic_parameter_count {
+        return Err(AnalysisError::InvalidSolutionShape {
+            field: "diagnostic_coefficient_covariance_rows",
+            actual: coefficient_covariance.nrows(),
+            expected: harmonic_parameter_count,
+        });
+    }
+    if coefficient_covariance.ncols() < harmonic_parameter_count {
+        return Err(AnalysisError::InvalidSolutionShape {
+            field: "diagnostic_coefficient_covariance_columns",
+            actual: coefficient_covariance.ncols(),
+            expected: harmonic_parameter_count,
+        });
+    }
+    for parameter in 0..harmonic_parameter_count {
+        let variance = coefficient_covariance[(parameter, parameter)];
+        if !variance.is_finite() || variance <= 0.0 {
+            return Err(AnalysisError::InvalidDiagnosticCoefficientVariance { parameter });
+        }
+    }
+
+    for (constituent, independence) in diagnostics.iter_mut().enumerate() {
+        for neighbor in [&mut independence.lower, &mut independence.higher]
+            .into_iter()
+            .flatten()
+        {
+            let mut maximum: f64 = 0.0;
+            for left_offset in 0..2 {
+                let left = constituent * 2 + left_offset;
+                for right_offset in 0..2 {
+                    let right = neighbor.index * 2 + right_offset;
+                    let denominator = (coefficient_covariance[(left, left)]
+                        * coefficient_covariance[(right, right)])
+                        .sqrt();
+                    let correlation = coefficient_covariance[(left, right)] / denominator;
+                    if !correlation.is_finite() {
+                        return Err(AnalysisError::InvalidDiagnosticCoefficientCorrelation {
+                            left,
+                            right,
+                        });
+                    }
+                    maximum = maximum.max(correlation.abs());
+                }
+            }
+            neighbor.maximum_correlation = Some(maximum);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn whole_model_independence_diagnostics(
+    basis_condition_number: f64,
+    model_energy: f64,
+    residual_mean_square: f64,
+) -> Result<WholeModelIndependenceDiagnostics, AnalysisError> {
+    if basis_condition_number.is_nan() || basis_condition_number <= 0.0 {
+        return Err(AnalysisError::InvalidDiagnosticBasisConditionNumber);
+    }
+    for (field, value) in [
+        ("diagnostic_model_energy", model_energy),
+        ("diagnostic_residual_mean_square", residual_mean_square),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(AnalysisError::InvalidDiagnosticEnergy { field });
+        }
+    }
+
+    let all_constituent_signal_to_noise = match (model_energy, residual_mean_square) {
+        (0.0, 0.0) => None,
+        (_, 0.0) => Some(f64::INFINITY),
+        _ => Some(model_energy / residual_mean_square),
+    };
+    let condition_adjusted_signal_to_noise = all_constituent_signal_to_noise.and_then(|snr| {
+        if snr.is_infinite() && basis_condition_number.is_infinite() {
+            None
+        } else {
+            Some(snr / basis_condition_number)
+        }
+    });
+    Ok(WholeModelIndependenceDiagnostics {
+        basis_condition_number,
+        all_constituent_signal_to_noise,
+        condition_adjusted_signal_to_noise,
+    })
+}
+
 fn neighbor(
     index: usize,
     constituent: &Constituent,
@@ -303,7 +518,7 @@ fn mean_square_vector(eastward: &[f64], northward: &[f64]) -> f64 {
         / eastward.len() as f64
 }
 
-fn tidal_variance_diagnostics(
+pub(crate) fn tidal_variance_diagnostics(
     raw: f64,
     all: f64,
     significant: Option<f64>,
@@ -321,10 +536,12 @@ fn tidal_variance_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::{
-        DiagnosticConstituentRole, adjacent_constituent_diagnostics,
-        scalar_tidal_variance_diagnostics, vector_tidal_variance_diagnostics,
+        DiagnosticConstituentRole, adjacent_constituent_diagnostics, populate_maximum_correlation,
+        populate_noise_modified_rayleigh, scalar_tidal_variance_diagnostics,
+        vector_tidal_variance_diagnostics, whole_model_independence_diagnostics,
     };
     use crate::{AnalysisError, Constituent};
+    use faer::Mat;
 
     fn assert_close(actual: f64, expected: f64) {
         assert!(
@@ -482,5 +699,103 @@ mod tests {
                 index: 0,
             })
         );
+    }
+
+    #[test]
+    fn noise_modified_rayleigh_uses_adjacent_mean_snr() {
+        let constituents = [
+            Constituent::new("left", 0.04),
+            Constituent::new("right", 0.05),
+        ];
+        let roles = [
+            DiagnosticConstituentRole::Direct,
+            DiagnosticConstituentRole::Direct,
+        ];
+        let mut diagnostics = adjacent_constituent_diagnostics(&constituents, &roles, 10.0, 1.0)
+            .expect("valid neighbors");
+        populate_noise_modified_rayleigh(&mut diagnostics, &[8.0, 10.0]).expect("valid SNR");
+
+        assert_close(
+            diagnostics[0]
+                .higher
+                .as_ref()
+                .and_then(|neighbor| neighbor.noise_modified_rayleigh_criterion)
+                .expect("higher RNM"),
+            7.2,
+        );
+        assert_eq!(
+            diagnostics[1]
+                .lower
+                .as_ref()
+                .and_then(|neighbor| neighbor.noise_modified_rayleigh_criterion),
+            diagnostics[0]
+                .higher
+                .as_ref()
+                .and_then(|neighbor| neighbor.noise_modified_rayleigh_criterion)
+        );
+        assert_eq!(
+            populate_noise_modified_rayleigh(&mut diagnostics, &[-1.0, 2.0]),
+            Err(AnalysisError::InvalidDiagnosticSignalToNoise { index: 0 })
+        );
+    }
+
+    #[test]
+    fn maximum_correlation_scans_each_adjacent_parameter_block() {
+        let constituents = [
+            Constituent::new("left", 0.04),
+            Constituent::new("right", 0.05),
+        ];
+        let roles = [
+            DiagnosticConstituentRole::Direct,
+            DiagnosticConstituentRole::Direct,
+        ];
+        let mut diagnostics = adjacent_constituent_diagnostics(&constituents, &roles, 10.0, 1.0)
+            .expect("valid neighbors");
+        let covariance = Mat::from_fn(4, 4, |row, column| match (row, column) {
+            (0, 0) => 4.0,
+            (1, 1) => 9.0,
+            (2, 2) => 16.0,
+            (3, 3) => 25.0,
+            (0, 2) | (2, 0) => 6.0,
+            (1, 3) | (3, 1) => -3.0,
+            _ => 0.0,
+        });
+        populate_maximum_correlation(&mut diagnostics, &covariance)
+            .expect("positive covariance diagonal");
+
+        assert_eq!(
+            diagnostics[0]
+                .higher
+                .as_ref()
+                .and_then(|neighbor| neighbor.maximum_correlation),
+            Some(0.75)
+        );
+        assert_eq!(
+            diagnostics[1]
+                .lower
+                .as_ref()
+                .and_then(|neighbor| neighbor.maximum_correlation),
+            Some(0.75)
+        );
+    }
+
+    #[test]
+    fn whole_model_metrics_preserve_exact_and_undefined_limits() {
+        let finite = whole_model_independence_diagnostics(12.0, 240.0, 2.0)
+            .expect("valid whole-model diagnostics");
+        assert_eq!(finite.all_constituent_signal_to_noise, Some(120.0));
+        assert_eq!(finite.condition_adjusted_signal_to_noise, Some(10.0));
+
+        let exact = whole_model_independence_diagnostics(2.0, 1.0, 0.0).expect("valid exact fit");
+        assert_eq!(exact.all_constituent_signal_to_noise, Some(f64::INFINITY));
+        assert_eq!(
+            exact.condition_adjusted_signal_to_noise,
+            Some(f64::INFINITY)
+        );
+
+        let undefined = whole_model_independence_diagnostics(f64::INFINITY, 0.0, 0.0)
+            .expect("valid zero-energy fit");
+        assert_eq!(undefined.all_constituent_signal_to_noise, None);
+        assert_eq!(undefined.condition_adjusted_signal_to_noise, None);
     }
 }

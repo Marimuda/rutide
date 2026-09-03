@@ -28,8 +28,9 @@ pub use corrected::{
     VectorInferenceOls, VectorInferenceRelation,
 };
 pub use diagnostics::{
-    ConstituentIndependenceDiagnostics, DiagnosticConstituentRole,
-    NeighboringConstituentDiagnostics, TidalVarianceDiagnostics, adjacent_constituent_diagnostics,
+    ConstituentDiagnosticsOptions, ConstituentIndependenceDiagnostics,
+    ConstituentSelectionDiagnostics, DiagnosticConstituentRole, NeighboringConstituentDiagnostics,
+    TidalVarianceDiagnostics, WholeModelIndependenceDiagnostics, adjacent_constituent_diagnostics,
     scalar_tidal_variance_diagnostics, vector_tidal_variance_diagnostics,
 };
 pub use error::AnalysisError;

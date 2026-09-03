@@ -13,6 +13,11 @@ published API and file-schema contracts.
   scalar/vector tidal-variance kernels as the first RUTide 0.3.0 constituent-
   identifiability increment, with explicit inferred-constituent and zero-variance
   behavior.
+- Opt-in scalar and current diagnostic results containing RNM, maximum adjacent-
+  parameter correlation, cached whole-basis `K`, `SNRallc`, `SNRallc / K`, and
+  full/SNR-filtered tidal variance for raw, Greenwich/nodal, robust, and scalar-
+  inference fits. Condition numbers and unweighted normal inverses reuse the
+  prepared pivoted QR's small triangular factor.
 - An installed-wheel acceptance harness for a public NOAA/NDBC ADCP profile and
   a domain-spanning selection from the 25.78 GB FVCOM fixture, including
   reconstruction and coefficient-persistence validation.

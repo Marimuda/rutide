@@ -16,7 +16,13 @@ use rayon::prelude::*;
 use rustfft::{Fft, FftPlanner, num_complex::Complex};
 
 use crate::{
-    AnalysisError, MonteCarloOptions, RobustDiagnostics, RobustOptions, VectorSolution,
+    AnalysisError, ConstituentDiagnosticsOptions, ConstituentSelectionDiagnostics,
+    DiagnosticConstituentRole, MonteCarloOptions, RobustDiagnostics, RobustOptions, VectorSolution,
+    diagnostics::{
+        adjacent_constituent_diagnostics, populate_maximum_correlation,
+        populate_noise_modified_rayleigh, tidal_variance_diagnostics,
+        whole_model_independence_diagnostics,
+    },
     monte_carlo::{scalar_intervals as scalar_monte_carlo_intervals, vector_intervals},
     robust::{RobustFit, fit_with_initial as robust_fit_with_initial},
     sampling::{
@@ -188,6 +194,8 @@ pub struct FixedRawOls {
     design: Mat<f64>,
     decomposition: ColPivQr<f64>,
     batch_projection: OnceLock<Mat<f64>>,
+    diagnostic_basis_condition_number: OnceLock<Result<f64, AnalysisError>>,
+    unweighted_coefficient_normal_inverse: OnceLock<Mat<f64>>,
 }
 
 impl FixedRawOls {
@@ -303,6 +311,8 @@ impl FixedRawOls {
             design,
             decomposition,
             batch_projection: OnceLock::new(),
+            diagnostic_basis_condition_number: OnceLock::new(),
+            unweighted_coefficient_normal_inverse: OnceLock::new(),
         }
     }
 
@@ -322,6 +332,312 @@ impl FixedRawOls {
     #[must_use]
     pub const fn fit_options(&self) -> FitOptions {
         self.fit_options
+    }
+
+    /// Return Codiga's two-norm condition number for the complete fitted basis.
+    ///
+    /// The calculation reuses the small triangular factor from the prepared
+    /// pivoted QR. Harmonic columns are scaled by `sqrt(2)` so this real-valued
+    /// representation has the same singular values as Codiga's conjugate
+    /// positive/negative-frequency basis. The result is cached after first use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError::DiagnosticDecompositionFailed`] if the small
+    /// singular-value decomposition does not converge.
+    pub fn diagnostic_basis_condition_number(&self) -> Result<f64, AnalysisError> {
+        self.diagnostic_basis_condition_number
+            .get_or_init(|| {
+                let triangular = self.decomposition.thin_R();
+                let (permutation, _) = self.decomposition.P().arrays();
+                let harmonic_columns = self.constituents.len() * 2;
+                let codiga_triangular =
+                    Mat::from_fn(triangular.nrows(), triangular.ncols(), |row, column| {
+                        let scale = if permutation[column] < harmonic_columns {
+                            std::f64::consts::SQRT_2
+                        } else {
+                            1.0
+                        };
+                        triangular[(row, column)] * scale
+                    });
+                let singular_values = codiga_triangular
+                    .singular_values()
+                    .map_err(|_| AnalysisError::DiagnosticDecompositionFailed)?;
+                let largest = singular_values[0];
+                let smallest = singular_values[singular_values.len() - 1];
+                Ok(if smallest == 0.0 {
+                    f64::INFINITY
+                } else {
+                    largest / smallest
+                })
+            })
+            .clone()
+    }
+
+    /// Evaluate Codiga's extended diagnostics for a fitted scalar solution.
+    ///
+    /// The solution must have confidence intervals so its constituent SNR values
+    /// are available. This opt-in pass performs no new least-squares solve. It
+    /// reuses the prepared basis and QR, evaluates reconstructed energies in one
+    /// streaming pass, and constructs only the small coefficient normal inverse
+    /// required by adjacent-parameter correlations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AnalysisError`] for invalid options or observations, a solution
+    /// from an incompatible model, absent/invalid SNR, invalid robust weights, or
+    /// a failed condition-number calculation.
+    pub fn diagnose_scalar_solution(
+        &self,
+        observations: &[f64],
+        solution: &ScalarSolution,
+        options: ConstituentDiagnosticsOptions,
+    ) -> Result<ConstituentSelectionDiagnostics, AnalysisError> {
+        options.validate()?;
+        validate_diagnostic_observations(&[observations], self.time_count)?;
+        let constituent_count = self.constituents.len();
+        for (field, values) in [
+            ("cosine_coefficient", &solution.cosine_coefficient),
+            ("sine_coefficient", &solution.sine_coefficient),
+        ] {
+            validate_diagnostic_values(field, values, constituent_count)?;
+        }
+        let signal_to_noise = solution
+            .signal_to_noise
+            .as_deref()
+            .ok_or(AnalysisError::MissingSignalToNoise)?;
+        if solution.reference_time_days.to_bits() != self.reference_time_days.to_bits() {
+            return Err(AnalysisError::DiagnosticSolutionModelMismatch);
+        }
+        for (field, value) in [
+            ("mean", solution.mean),
+            ("slope_per_day", solution.slope_per_day),
+        ] {
+            if !value.is_finite() {
+                return Err(AnalysisError::NonFiniteDiagnosticValue { field, index: 0 });
+            }
+        }
+        let weights = diagnostic_weights(solution.robust.as_ref(), self.time_count)?;
+
+        let roles = vec![DiagnosticConstituentRole::Direct; constituent_count];
+        let mut constituents = adjacent_constituent_diagnostics(
+            &self.constituents,
+            &roles,
+            self.effective_record_length_days,
+            options.rayleigh_minimum(),
+        )?;
+        populate_noise_modified_rayleigh(&mut constituents, signal_to_noise)?;
+        let coefficient_covariance = self.coefficient_normal_inverse(weights);
+        populate_maximum_correlation(&mut constituents, coefficient_covariance.as_ref())?;
+
+        let harmonic_columns = constituent_count * 2;
+        let trend_column = harmonic_columns + 1;
+        let mut raw_tidal_energy = 0.0;
+        let mut all_constituent_tidal_energy = 0.0;
+        let mut significant_constituent_tidal_energy = 0.0;
+        let mut model_energy = 0.0;
+        let mut residual_mean_square_numerator = 0.0;
+        for time in 0..self.time_count {
+            let non_harmonic = solution.mean
+                + if self.fit_options.trend {
+                    solution.slope_per_day * self.time_span_days * self.design[(time, trend_column)]
+                } else {
+                    0.0
+                };
+            let mut all_tidal = 0.0;
+            let mut significant_tidal = 0.0;
+            for (constituent, constituent_signal_to_noise) in
+                signal_to_noise.iter().copied().enumerate()
+            {
+                let tidal = self.design[(time, constituent * 2)]
+                    * solution.cosine_coefficient[constituent]
+                    + self.design[(time, constituent * 2 + 1)]
+                        * solution.sine_coefficient[constituent];
+                all_tidal += tidal;
+                if constituent_signal_to_noise >= options.minimum_signal_to_noise() {
+                    significant_tidal += tidal;
+                }
+            }
+            let raw_tidal = observations[time] - non_harmonic;
+            let fitted = non_harmonic + all_tidal;
+            let residual = observations[time] - fitted;
+            let weight = weights.map_or(1.0, |weights| weights[time]);
+            raw_tidal_energy += raw_tidal * raw_tidal;
+            all_constituent_tidal_energy += all_tidal * all_tidal;
+            significant_constituent_tidal_energy += significant_tidal * significant_tidal;
+            model_energy += weight * fitted * fitted;
+            residual_mean_square_numerator += weight * residual * residual;
+        }
+        let time_count = usize_to_f64(self.time_count);
+        let tidal_variance = tidal_variance_diagnostics(
+            raw_tidal_energy / time_count,
+            all_constituent_tidal_energy / time_count,
+            Some(significant_constituent_tidal_energy / time_count),
+        );
+        let residual_mean_square =
+            residual_mean_square_numerator / usize_to_f64(self.time_count - self.design.ncols());
+        let whole_model = whole_model_independence_diagnostics(
+            self.diagnostic_basis_condition_number()?,
+            model_energy,
+            residual_mean_square,
+        )?;
+
+        Ok(ConstituentSelectionDiagnostics {
+            constituents,
+            whole_model,
+            tidal_variance,
+            rayleigh_minimum: options.rayleigh_minimum(),
+            minimum_signal_to_noise: options.minimum_signal_to_noise(),
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeps validation and the allocation-free two-component energy pass together"
+    )]
+    pub(crate) fn diagnose_vector_solution(
+        &self,
+        eastward_observations: &[f64],
+        northward_observations: &[f64],
+        solution: &VectorSolution,
+        options: ConstituentDiagnosticsOptions,
+    ) -> Result<ConstituentSelectionDiagnostics, AnalysisError> {
+        options.validate()?;
+        validate_diagnostic_observations(
+            &[eastward_observations, northward_observations],
+            self.time_count,
+        )?;
+        let constituent_count = self.constituents.len();
+        if solution.semi_major.len() != constituent_count {
+            return Err(AnalysisError::InvalidSolutionShape {
+                field: "semi_major",
+                actual: solution.semi_major.len(),
+                expected: constituent_count,
+            });
+        }
+        let signal_to_noise = solution
+            .signal_to_noise
+            .as_deref()
+            .ok_or(AnalysisError::MissingSignalToNoise)?;
+        if solution.reference_time_days.to_bits() != self.reference_time_days.to_bits() {
+            return Err(AnalysisError::DiagnosticSolutionModelMismatch);
+        }
+        let (eastward, northward) = solution.component_solutions();
+        for (field, values) in [
+            ("eastward_cosine_coefficient", &eastward.cosine_coefficient),
+            ("eastward_sine_coefficient", &eastward.sine_coefficient),
+            (
+                "northward_cosine_coefficient",
+                &northward.cosine_coefficient,
+            ),
+            ("northward_sine_coefficient", &northward.sine_coefficient),
+        ] {
+            validate_diagnostic_values(field, values, constituent_count)?;
+        }
+        for (field, value) in [
+            ("eastward_mean", solution.eastward_mean),
+            ("northward_mean", solution.northward_mean),
+            ("eastward_slope_per_day", solution.eastward_slope_per_day),
+            ("northward_slope_per_day", solution.northward_slope_per_day),
+        ] {
+            if !value.is_finite() {
+                return Err(AnalysisError::NonFiniteDiagnosticValue { field, index: 0 });
+            }
+        }
+        let weights = diagnostic_weights(solution.robust.as_ref(), self.time_count)?;
+
+        let roles = vec![DiagnosticConstituentRole::Direct; constituent_count];
+        let mut constituents = adjacent_constituent_diagnostics(
+            &self.constituents,
+            &roles,
+            self.effective_record_length_days,
+            options.rayleigh_minimum(),
+        )?;
+        populate_noise_modified_rayleigh(&mut constituents, signal_to_noise)?;
+        let coefficient_covariance = self.coefficient_normal_inverse(weights);
+        // Both current components share the same temporal basis. Their residual
+        // cross-correlation can only reduce an inter-component coefficient
+        // correlation relative to the same-component entries, so the maximum of
+        // the full 4x4 pair block is the maximum of this temporal 2x2 block.
+        populate_maximum_correlation(&mut constituents, coefficient_covariance.as_ref())?;
+
+        let harmonic_columns = constituent_count * 2;
+        let trend_column = harmonic_columns + 1;
+        let mut raw_tidal_energy = 0.0;
+        let mut all_constituent_tidal_energy = 0.0;
+        let mut significant_constituent_tidal_energy = 0.0;
+        let mut model_energy = 0.0;
+        let mut residual_mean_square_numerator = 0.0;
+        for time in 0..self.time_count {
+            let trend_basis = if self.fit_options.trend {
+                self.time_span_days * self.design[(time, trend_column)]
+            } else {
+                0.0
+            };
+            let eastward_non_harmonic =
+                solution.eastward_mean + solution.eastward_slope_per_day * trend_basis;
+            let northward_non_harmonic =
+                solution.northward_mean + solution.northward_slope_per_day * trend_basis;
+            let mut eastward_all_tidal = 0.0;
+            let mut northward_all_tidal = 0.0;
+            let mut eastward_significant_tidal = 0.0;
+            let mut northward_significant_tidal = 0.0;
+            for (constituent, constituent_signal_to_noise) in
+                signal_to_noise.iter().copied().enumerate()
+            {
+                let cosine_basis = self.design[(time, constituent * 2)];
+                let sine_basis = self.design[(time, constituent * 2 + 1)];
+                let eastward_tidal = cosine_basis * eastward.cosine_coefficient[constituent]
+                    + sine_basis * eastward.sine_coefficient[constituent];
+                let northward_tidal = cosine_basis * northward.cosine_coefficient[constituent]
+                    + sine_basis * northward.sine_coefficient[constituent];
+                eastward_all_tidal += eastward_tidal;
+                northward_all_tidal += northward_tidal;
+                if constituent_signal_to_noise >= options.minimum_signal_to_noise() {
+                    eastward_significant_tidal += eastward_tidal;
+                    northward_significant_tidal += northward_tidal;
+                }
+            }
+            let eastward_raw_tidal = eastward_observations[time] - eastward_non_harmonic;
+            let northward_raw_tidal = northward_observations[time] - northward_non_harmonic;
+            let eastward_fitted = eastward_non_harmonic + eastward_all_tidal;
+            let northward_fitted = northward_non_harmonic + northward_all_tidal;
+            let eastward_residual = eastward_observations[time] - eastward_fitted;
+            let northward_residual = northward_observations[time] - northward_fitted;
+            let weight = weights.map_or(1.0, |weights| weights[time]);
+            raw_tidal_energy +=
+                eastward_raw_tidal * eastward_raw_tidal + northward_raw_tidal * northward_raw_tidal;
+            all_constituent_tidal_energy +=
+                eastward_all_tidal * eastward_all_tidal + northward_all_tidal * northward_all_tidal;
+            significant_constituent_tidal_energy += eastward_significant_tidal
+                * eastward_significant_tidal
+                + northward_significant_tidal * northward_significant_tidal;
+            model_energy +=
+                weight * (eastward_fitted * eastward_fitted + northward_fitted * northward_fitted);
+            residual_mean_square_numerator += weight
+                * (eastward_residual * eastward_residual + northward_residual * northward_residual);
+        }
+        let time_count = usize_to_f64(self.time_count);
+        let tidal_variance = tidal_variance_diagnostics(
+            raw_tidal_energy / time_count,
+            all_constituent_tidal_energy / time_count,
+            Some(significant_constituent_tidal_energy / time_count),
+        );
+        let residual_mean_square =
+            residual_mean_square_numerator / usize_to_f64(self.time_count - self.design.ncols());
+        let whole_model = whole_model_independence_diagnostics(
+            self.diagnostic_basis_condition_number()?,
+            model_energy,
+            residual_mean_square,
+        )?;
+
+        Ok(ConstituentSelectionDiagnostics {
+            constituents,
+            whole_model,
+            tidal_variance,
+            rayleigh_minimum: options.rayleigh_minimum(),
+            minimum_signal_to_noise: options.minimum_signal_to_noise(),
+        })
     }
 
     /// Fit one complete, finite scalar observation series.
@@ -461,7 +777,7 @@ impl FixedRawOls {
             1,
             0,
             coefficients.as_ref(),
-            &normal_inverse,
+            normal_inverse.as_ref(),
             noise,
             None,
         );
@@ -484,7 +800,7 @@ impl FixedRawOls {
             1,
             0,
             fit.coefficients.as_ref(),
-            &normal_inverse,
+            normal_inverse.as_ref(),
             noise,
             Some(&fit.diagnostics.weights),
         );
@@ -542,7 +858,7 @@ impl FixedRawOls {
         let covariances = self.vector_coefficient_covariances(
             observations.as_ref(),
             fit.coefficients.as_ref(),
-            &normal_inverse,
+            normal_inverse.as_ref(),
             noise,
             Some(&fit.diagnostics.weights),
         );
@@ -648,7 +964,7 @@ impl FixedRawOls {
                     series_count,
                     series,
                     coefficients.as_ref(),
-                    &normal_inverse,
+                    normal_inverse.as_ref(),
                     noise,
                     None,
                 );
@@ -683,7 +999,7 @@ impl FixedRawOls {
         let covariances = self.vector_coefficient_covariances(
             observations.as_ref(),
             coefficients.as_ref(),
-            &normal_inverse,
+            normal_inverse.as_ref(),
             noise,
             None,
         );
@@ -950,7 +1266,13 @@ impl FixedRawOls {
         }
     }
 
-    fn coefficient_normal_inverse(&self, weights: Option<&[f64]>) -> Mat<f64> {
+    fn coefficient_normal_inverse(&self, weights: Option<&[f64]>) -> Cow<'_, Mat<f64>> {
+        if weights.is_none() {
+            return Cow::Borrowed(
+                self.unweighted_coefficient_normal_inverse
+                    .get_or_init(|| self.unweighted_coefficient_normal_inverse_from_qr()),
+            );
+        }
         let column_count = self.design.ncols();
         let normal = Mat::from_fn(column_count, column_count, |row, column| {
             (0..self.time_count)
@@ -961,7 +1283,22 @@ impl FixedRawOls {
                 })
                 .sum::<f64>()
         });
-        normal.partial_piv_lu().inverse()
+        Cow::Owned(normal.partial_piv_lu().inverse())
+    }
+
+    fn unweighted_coefficient_normal_inverse_from_qr(&self) -> Mat<f64> {
+        let triangular = self.decomposition.thin_R();
+        let column_count = triangular.ncols();
+        let permuted_normal = Mat::from_fn(column_count, column_count, |row, column| {
+            (0..column_count)
+                .map(|inner| triangular[(inner, row)] * triangular[(inner, column)])
+                .sum::<f64>()
+        });
+        let permuted_inverse = permuted_normal.partial_piv_lu().inverse();
+        let (_, permutation_inverse) = self.decomposition.P().arrays();
+        Mat::from_fn(column_count, column_count, |row, column| {
+            permuted_inverse[(permutation_inverse[row], permutation_inverse[column])]
+        })
     }
 
     #[allow(
@@ -2398,6 +2735,75 @@ fn usize_to_f64(value: usize) -> f64 {
     value as f64
 }
 
+fn validate_diagnostic_values(
+    field: &'static str,
+    values: &[f64],
+    expected: usize,
+) -> Result<(), AnalysisError> {
+    if values.len() != expected {
+        return Err(AnalysisError::InvalidSolutionShape {
+            field,
+            actual: values.len(),
+            expected,
+        });
+    }
+    if let Some((index, _)) = values
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(AnalysisError::NonFiniteDiagnosticValue { field, index });
+    }
+    Ok(())
+}
+
+fn validate_diagnostic_observations(
+    components: &[&[f64]],
+    expected: usize,
+) -> Result<(), AnalysisError> {
+    for (series, observations) in components.iter().enumerate() {
+        if observations.len() != expected {
+            return Err(AnalysisError::ObservationShape {
+                actual: observations.len(),
+                expected,
+            });
+        }
+        if let Some((time, _)) = observations
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(AnalysisError::NonFiniteObservation { series, time });
+        }
+    }
+    Ok(())
+}
+
+fn diagnostic_weights(
+    robust: Option<&RobustDiagnostics>,
+    expected: usize,
+) -> Result<Option<&[f64]>, AnalysisError> {
+    let Some(robust) = robust else {
+        return Ok(None);
+    };
+    if robust.weights.len() != expected {
+        return Err(AnalysisError::InvalidSolutionShape {
+            field: "diagnostic_robust_weights",
+            actual: robust.weights.len(),
+            expected,
+        });
+    }
+    if let Some((time, _)) = robust
+        .weights
+        .iter()
+        .enumerate()
+        .find(|(_, weight)| !weight.is_finite() || **weight < 0.0)
+    {
+        return Err(AnalysisError::InvalidDiagnosticWeight { time });
+    }
+    Ok(Some(&robust.weights))
+}
+
 pub(crate) fn validate_constituents(constituents: &[Constituent]) -> Result<(), AnalysisError> {
     if constituents.is_empty() {
         return Err(AnalysisError::EmptyConstituents);
@@ -2464,7 +2870,8 @@ mod tests {
         band_averaged_lomb_residual_power, band_averaged_lomb_vector_residual_power,
         lomb_frequencies, usize_to_f64,
     };
-    use crate::AnalysisError;
+    use crate::{AnalysisError, ConstituentDiagnosticsOptions};
+    use faer::{Mat, c64};
     use std::f64::consts::TAU;
 
     fn constituents() -> Vec<Constituent> {
@@ -2498,6 +2905,49 @@ mod tests {
         assert_close(solution.sine_coefficient[0], 0.3, 1e-12);
         assert_close(solution.mean, 0.4, 1e-12);
         assert_close(solution.slope_per_day, 0.0, f64::EPSILON);
+    }
+
+    #[test]
+    fn cached_condition_number_matches_codiga_complex_basis() {
+        let times = [0.0, 0.08, 0.21, 0.37, 0.58, 0.82, 1.13, 1.49];
+        let constituents = [
+            Constituent::new("left", 0.04),
+            Constituent::new("right", 0.045),
+        ];
+        let model = FixedRawOls::prepare(&times, &constituents).expect("overdetermined model");
+        let reference = times[0].midpoint(times[times.len() - 1]);
+        let span = times[times.len() - 1] - times[0];
+        let complex_basis = Mat::from_fn(times.len(), 6, |row, column| match column {
+            0..=1 => {
+                let angle =
+                    TAU * 24.0 * (times[row] - reference) * constituents[column].frequency_cph;
+                c64::new(angle.cos(), angle.sin())
+            }
+            2..=3 => {
+                let constituent = column - 2;
+                let angle = -TAU
+                    * 24.0
+                    * (times[row] - reference)
+                    * constituents[constituent].frequency_cph;
+                c64::new(angle.cos(), angle.sin())
+            }
+            4 => c64::new(1.0, 0.0),
+            _ => c64::new((times[row] - reference) / span, 0.0),
+        });
+        let singular_values = complex_basis
+            .singular_values()
+            .expect("small reference SVD converges");
+        let expected = singular_values[0] / singular_values[singular_values.len() - 1];
+        let actual = model
+            .diagnostic_basis_condition_number()
+            .expect("small cached SVD converges");
+
+        assert_close(actual, expected, expected * 1e-12);
+        assert_eq!(
+            model.diagnostic_basis_condition_number(),
+            Ok(actual),
+            "cached result is stable"
+        );
     }
 
     fn times() -> Vec<f64> {
@@ -2596,6 +3046,64 @@ mod tests {
         assert!(solution.constituent_indices_by_signal_to_noise().is_none());
         assert_close(solution.mean, 0.09, 1e-12);
         assert_close(solution.slope_per_day, 0.0017, 1e-12);
+    }
+
+    #[test]
+    fn scalar_extended_diagnostics_are_complete_and_opt_in() {
+        let constituents = constituents();
+        let times = times();
+        let mut observations = signal(
+            &times,
+            &constituents,
+            &[0.7, 0.2, 0.11],
+            &[34.0, 229.0, 321.0],
+            0.09,
+            0.0017,
+        );
+        for (index, observation) in observations.iter_mut().enumerate() {
+            *observation += 0.015 * (usize_to_f64(index) * 0.37).sin();
+        }
+        let model = FixedRawOls::prepare(&times, &constituents).expect("valid model");
+        let plain = model.solve(&observations).expect("valid observations");
+        assert_eq!(
+            model.diagnose_scalar_solution(
+                &observations,
+                &plain,
+                ConstituentDiagnosticsOptions::default(),
+            ),
+            Err(AnalysisError::MissingSignalToNoise)
+        );
+
+        let solution = model
+            .solve_with_linear_confidence(&observations, LinearConfidence::White)
+            .expect("valid confidence solution");
+        let diagnostics = model
+            .diagnose_scalar_solution(
+                &observations,
+                &solution,
+                ConstituentDiagnosticsOptions::default(),
+            )
+            .expect("valid extended diagnostics");
+
+        assert_eq!(diagnostics.constituents.len(), constituents.len());
+        assert!(diagnostics.whole_model.basis_condition_number >= 1.0);
+        assert!(
+            diagnostics
+                .whole_model
+                .all_constituent_signal_to_noise
+                .is_some_and(|value| value > 0.0)
+        );
+        assert!(diagnostics.tidal_variance.raw_tidal_variance > 0.0);
+        assert!(diagnostics.tidal_variance.all_constituent_tidal_variance > 0.0);
+        assert!(diagnostics.constituents.iter().any(|independence| {
+            [&independence.lower, &independence.higher]
+                .into_iter()
+                .flatten()
+                .all(|neighbor| {
+                    neighbor.noise_modified_rayleigh_criterion.is_some()
+                        && neighbor.maximum_correlation.is_some()
+                })
+        }));
     }
 
     #[test]
