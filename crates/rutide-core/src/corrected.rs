@@ -16,8 +16,9 @@ use rayon::prelude::*;
 use crate::{
     AnalysisError, CartesianVectorSolution, Constituent, ConstituentDiagnosticsOptions,
     ConstituentIndependenceDiagnostics, ConstituentSelectionDiagnostics, DiagnosticConstituentRole,
-    FitOptions, FixedRawOls, LinearConfidence, MonteCarloOptions, RobustDiagnostics, RobustOptions,
-    ScalarSolution, TidalConstituent, VectorCurrent, VectorReconstruction, VectorSolution,
+    FitOptions, FixedRawOls, LinearConfidence, MonteCarloOptions, PreFilterCorrection,
+    RobustDiagnostics, RobustOptions, ScalarSolution, TidalConstituent, VectorCurrent,
+    VectorReconstruction, VectorSolution,
     astronomy::at_modified_julian_day,
     catalog::{CONSTITUENT_COUNT, Metadata},
     diagnostics::{
@@ -92,11 +93,12 @@ impl NodalCorrections {
 ///
 /// The fields are private so future solver choices can be added without
 /// requiring callers to update struct literals.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SolverOptions {
     fit_options: FitOptions,
     phase_reference: PhaseReference,
     nodal_corrections: NodalCorrections,
+    prefilter_correction: Option<PreFilterCorrection>,
 }
 
 impl SolverOptions {
@@ -107,18 +109,19 @@ impl SolverOptions {
             fit_options,
             phase_reference,
             nodal_corrections: NodalCorrections::Exact,
+            prefilter_correction: None,
         }
     }
 
     /// Return the fitted mean/trend configuration.
     #[must_use]
-    pub const fn fit_options(self) -> FitOptions {
+    pub const fn fit_options(&self) -> FitOptions {
         self.fit_options
     }
 
     /// Return the astronomical phase-reference convention.
     #[must_use]
-    pub const fn phase_reference(self) -> PhaseReference {
+    pub const fn phase_reference(&self) -> PhaseReference {
         self.phase_reference
     }
 
@@ -131,8 +134,21 @@ impl SolverOptions {
 
     /// Return the nodal/satellite correction convention.
     #[must_use]
-    pub const fn nodal_corrections(self) -> NodalCorrections {
+    pub const fn nodal_corrections(&self) -> NodalCorrections {
         self.nodal_corrections
+    }
+
+    /// Apply a known preprocessing-filter response to the harmonic basis.
+    #[must_use]
+    pub fn with_prefilter_correction(mut self, correction: PreFilterCorrection) -> Self {
+        self.prefilter_correction = Some(correction);
+        self
+    }
+
+    /// Return the configured preprocessing-filter response, when present.
+    #[must_use]
+    pub fn prefilter_correction(&self) -> Option<&PreFilterCorrection> {
+        self.prefilter_correction.as_ref()
     }
 }
 
@@ -313,6 +329,7 @@ pub struct GreenwichNodalOls {
     recipes: Vec<CorrectionRecipe>,
     phase_reference: PhaseReference,
     nodal_corrections: NodalCorrections,
+    prefilter_correction: Option<PreFilterCorrection>,
     model: FixedRawOls,
 }
 
@@ -376,6 +393,7 @@ pub struct ScalarInferenceOls {
     recipes: Vec<CorrectionRecipe>,
     phase_reference: PhaseReference,
     nodal_corrections: NodalCorrections,
+    prefilter_correction: Option<PreFilterCorrection>,
     model: FixedRawOls,
 }
 
@@ -442,6 +460,7 @@ pub struct VectorInferenceOls {
     fit_options: FitOptions,
     phase_reference: PhaseReference,
     nodal_corrections: NodalCorrections,
+    prefilter_correction: Option<PreFilterCorrection>,
     base_constituents: Vec<TidalConstituent>,
     recipes: Vec<CorrectionRecipe>,
     confidence_sampling: ConfidenceSampling,
@@ -557,6 +576,7 @@ impl GreenwichNodalOls {
             recipes: basis.recipes,
             phase_reference: basis.phase_reference,
             nodal_corrections: basis.nodal_corrections,
+            prefilter_correction: basis.prefilter_correction.clone(),
             model,
         })
     }
@@ -607,6 +627,12 @@ impl GreenwichNodalOls {
     #[must_use]
     pub const fn nodal_corrections(&self) -> NodalCorrections {
         self.nodal_corrections
+    }
+
+    /// Return the configured preprocessing-filter response, when present.
+    #[must_use]
+    pub const fn prefilter_correction(&self) -> Option<&PreFilterCorrection> {
+        self.prefilter_correction.as_ref()
     }
 
     /// Fit one complete, finite scalar observation series.
@@ -992,6 +1018,7 @@ impl GreenwichNodalOls {
             self.recipes.clone(),
             self.phase_reference,
             self.nodal_corrections,
+            self.prefilter_correction.clone(),
         )?
         .reconstruct_at_latitude(solution, self.latitude_degrees_north, filter)
     }
@@ -1016,6 +1043,7 @@ impl GreenwichNodalOls {
             self.recipes.clone(),
             self.phase_reference,
             self.nodal_corrections,
+            self.prefilter_correction.clone(),
         )?
         .reconstruct_vector_at_latitude(solution, self.latitude_degrees_north, filter)
     }
@@ -1134,6 +1162,7 @@ impl ScalarInferenceOls {
             recipes: basis.recipes.clone(),
             phase_reference: basis.phase_reference,
             nodal_corrections: basis.nodal_corrections,
+            prefilter_correction: basis.prefilter_correction.clone(),
             model,
         })
     }
@@ -1196,6 +1225,12 @@ impl ScalarInferenceOls {
     #[must_use]
     pub const fn nodal_corrections(&self) -> NodalCorrections {
         self.nodal_corrections
+    }
+
+    /// Return the configured preprocessing-filter response, when present.
+    #[must_use]
+    pub const fn prefilter_correction(&self) -> Option<&PreFilterCorrection> {
+        self.prefilter_correction.as_ref()
     }
 
     /// Fit one finite scalar series and expand inferred coefficients.
@@ -1450,6 +1485,7 @@ impl ScalarInferenceOls {
             self.recipes.clone(),
             self.phase_reference,
             self.nodal_corrections,
+            self.prefilter_correction.clone(),
         )?
         .reconstruct_at_latitude(solution, self.latitude_degrees_north, filter)
     }
@@ -1931,6 +1967,7 @@ impl VectorInferenceOls {
             fit_options: basis.fit_options,
             phase_reference: basis.phase_reference,
             nodal_corrections: basis.nodal_corrections,
+            prefilter_correction: basis.prefilter_correction.clone(),
             base_constituents: basis.base_constituents.clone(),
             recipes: basis.recipes.clone(),
             confidence_sampling: record.confidence_sampling.clone(),
@@ -1999,6 +2036,12 @@ impl VectorInferenceOls {
     #[must_use]
     pub const fn nodal_corrections(&self) -> NodalCorrections {
         self.nodal_corrections
+    }
+
+    /// Return the configured preprocessing-filter response, when present.
+    #[must_use]
+    pub const fn prefilter_correction(&self) -> Option<&PreFilterCorrection> {
+        self.prefilter_correction.as_ref()
     }
 
     /// Return the two-norm condition number of the fitted complex inference basis.
@@ -2421,6 +2464,7 @@ impl VectorInferenceOls {
             self.recipes.clone(),
             self.phase_reference,
             self.nodal_corrections,
+            self.prefilter_correction.clone(),
         )?
         .reconstruct_vector_at_latitude(solution, self.latitude_degrees_north, filter)
     }
@@ -3188,9 +3232,11 @@ pub enum NonHarmonicTerms {
 #[derive(Debug)]
 pub struct GreenwichNodalReconstructor {
     tidal_constituents: Vec<TidalConstituent>,
+    base_constituents: Vec<TidalConstituent>,
     recipes: Vec<CorrectionRecipe>,
     phase_reference: PhaseReference,
     nodal_corrections: NodalCorrections,
+    prefilter_correction: Option<PreFilterCorrection>,
     reference_base_nodal_terms: Vec<NodalTerms>,
     reference_time_modified_julian_day: f64,
     time_terms: Vec<ReconstructionTimeTerms>,
@@ -3257,17 +3303,28 @@ impl GreenwichNodalReconstructor {
     ) -> Result<Self, AnalysisError> {
         validate_tidal_constituents(constituents)?;
         let (base_constituents, recipes) = dependency_recipes(constituents);
+        let SolverOptions {
+            phase_reference,
+            nodal_corrections,
+            prefilter_correction,
+            ..
+        } = solver_options;
         Self::from_parts(
             modified_julian_days,
             reference_time_modified_julian_day,
             constituents.to_vec(),
             &base_constituents,
             recipes,
-            solver_options.phase_reference(),
-            solver_options.nodal_corrections(),
+            phase_reference,
+            nodal_corrections,
+            prefilter_correction,
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the internal constructor receives already-prepared astronomy plus the three orthogonal correction policies"
+    )]
     fn from_parts(
         modified_julian_days: &[f64],
         reference_time_modified_julian_day: f64,
@@ -3276,6 +3333,7 @@ impl GreenwichNodalReconstructor {
         recipes: Vec<CorrectionRecipe>,
         phase_reference: PhaseReference,
         nodal_corrections: NodalCorrections,
+        prefilter_correction: Option<PreFilterCorrection>,
     ) -> Result<Self, AnalysisError> {
         validate_reconstruction_times(modified_julian_days, reference_time_modified_julian_day)?;
         let scalar_constituents = scalar_constituents_at_reference(
@@ -3346,9 +3404,11 @@ impl GreenwichNodalReconstructor {
             .collect();
         Ok(Self {
             tidal_constituents,
+            base_constituents: base_constituents.to_vec(),
             recipes,
             phase_reference,
             nodal_corrections,
+            prefilter_correction,
             reference_base_nodal_terms,
             reference_time_modified_julian_day,
             time_terms,
@@ -3385,6 +3445,12 @@ impl GreenwichNodalReconstructor {
         self.nodal_corrections
     }
 
+    /// Return the preprocessing-filter correction used by this basis.
+    #[must_use]
+    pub const fn prefilter_correction(&self) -> Option<&PreFilterCorrection> {
+        self.prefilter_correction.as_ref()
+    }
+
     /// Reconstruct one scalar solution at a specified latitude.
     ///
     /// # Errors
@@ -3399,6 +3465,7 @@ impl GreenwichNodalReconstructor {
     ) -> Result<Vec<f64>, AnalysisError> {
         validate_latitude(latitude_degrees_north)?;
         let selected = reconstruction_indices(&self.tidal_constituents, solution, filter)?;
+        let prefilter_gains = self.prefilter_gains(solution.reference_time_days)?;
         let coefficients = selected
             .iter()
             .copied()
@@ -3432,7 +3499,10 @@ impl GreenwichNodalReconstructor {
                 .map(|(constituent, coefficient)| {
                     let nodal =
                         self.recipes[*constituent].combine_cartesian_nodal(&base_corrections);
-                    (nodal * terms.astronomical_basis[*constituent] * *coefficient).re
+                    let prefilter = prefilter_gains
+                        .as_ref()
+                        .map_or(1.0, |gains| gains[*constituent]);
+                    (nodal * terms.astronomical_basis[*constituent] * prefilter * *coefficient).re
                 })
                 .sum::<f64>();
             reconstruction.push(
@@ -3592,6 +3662,7 @@ impl GreenwichNodalReconstructor {
                     solution.signal_to_noise.as_deref(),
                     filter,
                 )?;
+                let prefilter_gains = self.prefilter_gains(solution.reference_time_days)?;
                 let base_corrections = cartesian_base_nodal_corrections(
                     self.nodal_corrections,
                     &terms.base_nodal_terms,
@@ -3603,7 +3674,10 @@ impl GreenwichNodalReconstructor {
                 for constituent in selected {
                     let nodal =
                         self.recipes[constituent].combine_cartesian_nodal(&base_corrections);
-                    let corrected = nodal * terms.astronomical_basis[constituent];
+                    let prefilter = prefilter_gains
+                        .as_ref()
+                        .map_or(1.0, |gains| gains[constituent]);
+                    let corrected = nodal * terms.astronomical_basis[constituent] * prefilter;
                     eastward_harmonics += corrected.re
                         * solution.eastward_cosine_coefficient[constituent]
                         + corrected.im * solution.eastward_sine_coefficient[constituent];
@@ -3652,6 +3726,7 @@ impl GreenwichNodalReconstructor {
             solution.signal_to_noise.as_deref(),
             filter,
         )?;
+        let prefilter_gains = self.prefilter_gains(solution.reference_time_days)?;
         let latitude_factors = latitude_factors(latitude_degrees_north);
         let mut base_corrections = cartesian_base_nodal_corrections(
             self.nodal_corrections,
@@ -3675,7 +3750,10 @@ impl GreenwichNodalReconstructor {
             let mut northward_harmonics = 0.0;
             for constituent in selected.iter().copied() {
                 let nodal = self.recipes[constituent].combine_cartesian_nodal(&base_corrections);
-                let corrected = nodal * terms.astronomical_basis[constituent];
+                let prefilter = prefilter_gains
+                    .as_ref()
+                    .map_or(1.0, |gains| gains[constituent]);
+                let corrected = nodal * terms.astronomical_basis[constituent] * prefilter;
                 eastward_harmonics += corrected.re
                     * solution.eastward_cosine_coefficient[constituent]
                     + corrected.im * solution.eastward_sine_coefficient[constituent];
@@ -3719,6 +3797,21 @@ impl GreenwichNodalReconstructor {
             filter,
             NonHarmonicTerms::MeanAndTrend,
         )
+    }
+
+    fn prefilter_gains(&self, reference_time: f64) -> Result<Option<Vec<f64>>, AnalysisError> {
+        self.prefilter_correction
+            .as_ref()
+            .map(|correction| {
+                let constituents = scalar_constituents_at_reference(
+                    &self.tidal_constituents,
+                    &self.base_constituents,
+                    &self.recipes,
+                    reference_time,
+                );
+                correction.resolve_constituent_gains(&constituents)
+            })
+            .transpose()
     }
 }
 
@@ -3818,6 +3911,12 @@ impl ScalarInferenceBatch {
         self.basis.nodal_corrections
     }
 
+    /// Return the configured preprocessing-filter response, when present.
+    #[must_use]
+    pub const fn prefilter_correction(&self) -> Option<&PreFilterCorrection> {
+        self.basis.prefilter_correction.as_ref()
+    }
+
     /// Return every reported constituent in coefficient order.
     #[must_use]
     pub fn tidal_constituents(&self) -> &[TidalConstituent] {
@@ -3877,6 +3976,7 @@ impl ScalarInferenceBatch {
             self.basis.recipes.clone(),
             self.basis.phase_reference,
             self.basis.nodal_corrections,
+            self.basis.prefilter_correction.clone(),
         )
     }
 
@@ -4424,6 +4524,12 @@ impl VectorInferenceBatch {
         self.basis.nodal_corrections
     }
 
+    /// Return the configured preprocessing-filter response, when present.
+    #[must_use]
+    pub const fn prefilter_correction(&self) -> Option<&PreFilterCorrection> {
+        self.basis.prefilter_correction.as_ref()
+    }
+
     /// Return every reported constituent in coefficient order.
     #[must_use]
     pub fn tidal_constituents(&self) -> &[TidalConstituent] {
@@ -4483,6 +4589,7 @@ impl VectorInferenceBatch {
             self.basis.recipes.clone(),
             self.basis.phase_reference,
             self.basis.nodal_corrections,
+            self.basis.prefilter_correction.clone(),
         )
     }
 
@@ -5087,6 +5194,12 @@ impl GreenwichNodalBatch {
         self.basis.nodal_corrections
     }
 
+    /// Return the configured preprocessing-filter response, when present.
+    #[must_use]
+    pub const fn prefilter_correction(&self) -> Option<&PreFilterCorrection> {
+        self.basis.prefilter_correction.as_ref()
+    }
+
     /// Return the prepared catalog constituents in coefficient order.
     #[must_use]
     pub fn tidal_constituents(&self) -> &[TidalConstituent] {
@@ -5145,6 +5258,7 @@ impl GreenwichNodalBatch {
             self.basis.recipes.clone(),
             self.basis.phase_reference,
             self.basis.nodal_corrections,
+            self.basis.prefilter_correction.clone(),
         )
     }
 
@@ -6007,6 +6121,7 @@ struct CorrectionBasis {
     fit_options: FitOptions,
     phase_reference: PhaseReference,
     nodal_corrections: NodalCorrections,
+    prefilter_correction: Option<PreFilterCorrection>,
     sample_interval_hours: Option<f64>,
 }
 
@@ -6273,8 +6388,12 @@ impl CorrectionBasis {
         model_constituent_count: usize,
         solver_options: SolverOptions,
     ) -> Result<Self, AnalysisError> {
-        let fit_options = solver_options.fit_options();
-        let nodal_corrections = solver_options.nodal_corrections();
+        let SolverOptions {
+            fit_options,
+            phase_reference,
+            nodal_corrections,
+            prefilter_correction,
+        } = solver_options;
         validate_tidal_constituents(constituents)?;
         let (reference_time, time_span_days) =
             validate_time_with_options(modified_julian_days, model_constituent_count, fit_options)?;
@@ -6326,8 +6445,9 @@ impl CorrectionBasis {
             reference_time_modified_julian_day: reference_time,
             time_span_days,
             fit_options,
-            phase_reference: solver_options.phase_reference(),
+            phase_reference,
             nodal_corrections,
+            prefilter_correction,
             sample_interval_hours: equidistant_sample_interval_hours(modified_julian_days),
         })
     }
@@ -6559,6 +6679,11 @@ impl CorrectionBasis {
             }
             basis
         });
+        let prefilter_gains = self
+            .prefilter_correction
+            .as_ref()
+            .map(|correction| correction.resolve_constituent_gains(&scalar_constituents))
+            .transpose()?;
         Ok(RecordSubset {
             positions,
             scalar_constituents,
@@ -6569,6 +6694,7 @@ impl CorrectionBasis {
             confidence_sampling,
             time_digest: diagnostic_time_digest(&modified_julian_days),
             astronomical_basis,
+            prefilter_gains,
         })
     }
 
@@ -6580,20 +6706,27 @@ impl CorrectionBasis {
         position: usize,
         constituent_index: usize,
     ) -> c64 {
-        if let Some(basis) = &record.astronomical_basis {
-            return basis[time_index * self.tidal_constituents.len() + constituent_index];
-        }
-        let terms = &self.time_terms[position];
-        let astronomical_phase = phase_cycles(
-            self.phase_reference,
-            terms.greenwich_phase[constituent_index],
-            record.reference_greenwich_phase[constituent_index],
-            terms.modified_julian_day,
-            record.reference_time,
-            record.scalar_constituents[constituent_index].frequency_cph,
-        );
-        let angle = TAU * astronomical_phase;
-        c64::new(angle.cos(), angle.sin())
+        let astronomical = if let Some(basis) = &record.astronomical_basis {
+            basis[time_index * self.tidal_constituents.len() + constituent_index]
+        } else {
+            let terms = &self.time_terms[position];
+            let astronomical_phase = phase_cycles(
+                self.phase_reference,
+                terms.greenwich_phase[constituent_index],
+                record.reference_greenwich_phase[constituent_index],
+                terms.modified_julian_day,
+                record.reference_time,
+                record.scalar_constituents[constituent_index].frequency_cph,
+            );
+            let angle = TAU * astronomical_phase;
+            c64::new(angle.cos(), angle.sin())
+        };
+        record
+            .prefilter_gains
+            .as_ref()
+            .map_or(astronomical, |gains| {
+                astronomical * gains[constituent_index]
+            })
     }
 
     fn model_at_latitude_for_record(
@@ -6671,6 +6804,8 @@ struct RecordSubset {
     time_digest: u64,
     // Time-major, constituent-minor and present only for a bounded shared mask.
     astronomical_basis: Option<Vec<c64>>,
+    // Constituent gains resolved at this record's fitted reference epoch.
+    prefilter_gains: Option<Vec<f64>>,
 }
 
 #[derive(Debug)]
@@ -7301,13 +7436,15 @@ fn usize_to_f64(value: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        GreenwichNodalBatch, GreenwichNodalOls, NodalCorrections, NonHarmonicTerms, PhaseReference,
-        ReconstructionFilter, SolverOptions, shared_lomb_plan_groups, usize_to_f64,
+        GreenwichNodalBatch, GreenwichNodalOls, InferenceMode, NodalCorrections, NonHarmonicTerms,
+        PhaseReference, ReconstructionFilter, ScalarInferenceOls, ScalarInferenceRelation,
+        SolverOptions, shared_lomb_plan_groups, usize_to_f64,
     };
     use crate::{
         AnalysisError, ConstituentDiagnosticsOptions, FitOptions, LinearConfidence,
-        MonteCarloOptions, TidalConstituent,
+        MonteCarloOptions, PreFilterCorrection, TidalConstituent,
     };
+    use std::f64::consts::TAU;
 
     fn times() -> Vec<f64> {
         (0_u32..745)
@@ -7448,6 +7585,234 @@ mod tests {
                     .abs()
                     < 1e-14
             );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one end-to-end fixture covers scalar, vector, gappy-batch, reconstruction, and uncorrected-control behavior"
+    )]
+    fn prefilter_correction_recovers_physical_coefficients_and_observation_domain_fit() {
+        let time = times();
+        let gain = 0.4;
+        let correction = PreFilterCorrection::new(vec![0.0, 0.2], vec![gain, gain], 0.01, 2.0)
+            .expect("valid response");
+        let solver_options = SolverOptions::new(FitOptions { trend: false }, PhaseReference::Raw)
+            .with_nodal_corrections(NodalCorrections::Disabled)
+            .with_prefilter_correction(correction.clone());
+        let model = GreenwichNodalOls::prepare_modified_julian_days_with_solver_options(
+            &time,
+            60.0,
+            &[TidalConstituent::M2],
+            solver_options.clone(),
+        )
+        .expect("valid filtered model");
+        assert_eq!(model.prefilter_correction(), Some(&correction));
+        let reference = model.reference_time_modified_julian_day();
+        let frequency = model.constituents()[0].frequency_cph;
+        let eastward_cosine = 1.2;
+        let eastward_sine = -0.35;
+        let northward_cosine = 0.25;
+        let northward_sine = 0.8;
+        let eastward_mean = 0.3;
+        let northward_mean = -0.2;
+        let component = |time: f64, cosine: f64, sine: f64, mean: f64| {
+            let angle = TAU * frequency * 24.0 * (time - reference);
+            mean + gain * (cosine * angle.cos() + sine * angle.sin())
+        };
+        let eastward = time
+            .iter()
+            .copied()
+            .map(|time| component(time, eastward_cosine, eastward_sine, eastward_mean))
+            .collect::<Vec<_>>();
+        let northward = time
+            .iter()
+            .copied()
+            .map(|time| component(time, northward_cosine, northward_sine, northward_mean))
+            .collect::<Vec<_>>();
+
+        let scalar = model.solve(&eastward).expect("filtered scalar fit");
+        assert!((scalar.cosine_coefficient[0] - eastward_cosine).abs() < 1e-12);
+        assert!((scalar.sine_coefficient[0] - eastward_sine).abs() < 1e-12);
+        assert!((scalar.mean - eastward_mean).abs() < 1e-12);
+        let reconstructed = model
+            .reconstruct_modified_julian_days(&time, &scalar, &ReconstructionFilter::All)
+            .expect("observation-domain reconstruction");
+        for (actual, expected) in reconstructed.iter().zip(&eastward) {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+
+        let vector = model
+            .solve_vector(&eastward, &northward)
+            .expect("filtered vector fit");
+        let cartesian = vector.cartesian().expect("valid fitted ellipse");
+        for (actual, expected) in [
+            (cartesian.eastward_cosine_coefficient[0], eastward_cosine),
+            (cartesian.eastward_sine_coefficient[0], eastward_sine),
+            (cartesian.northward_cosine_coefficient[0], northward_cosine),
+            (cartesian.northward_sine_coefficient[0], northward_sine),
+        ] {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+        let vector_reconstruction = model
+            .reconstruct_vector_modified_julian_days(&time, &vector, &ReconstructionFilter::All)
+            .expect("filtered vector reconstruction");
+        for (actual, expected) in vector_reconstruction.eastward.iter().zip(&eastward) {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+        for (actual, expected) in vector_reconstruction.northward.iter().zip(&northward) {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+
+        let batch = GreenwichNodalBatch::prepare_modified_julian_days_with_solver_options(
+            &time,
+            &[TidalConstituent::M2],
+            solver_options,
+        )
+        .expect("valid filtered batch");
+        let mut time_major = Vec::with_capacity(time.len() * 2);
+        for (index, (eastward, northward)) in eastward.iter().zip(&northward).enumerate() {
+            time_major.extend([
+                *eastward,
+                if index % 29 == 7 {
+                    f64::NAN
+                } else {
+                    *northward
+                },
+            ]);
+        }
+        let batch_solutions = batch
+            .solve_time_major_with_missing(&time_major, &[60.0, 61.0])
+            .expect("filtered complete and gappy batch");
+        for (solution, cosine, sine, mean) in [
+            (
+                &batch_solutions[0],
+                eastward_cosine,
+                eastward_sine,
+                eastward_mean,
+            ),
+            (
+                &batch_solutions[1],
+                northward_cosine,
+                northward_sine,
+                northward_mean,
+            ),
+        ] {
+            assert!((solution.cosine_coefficient[0] - cosine).abs() < 1e-11);
+            assert!((solution.sine_coefficient[0] - sine).abs() < 1e-11);
+            assert!((solution.mean - mean).abs() < 1e-11);
+        }
+        let batch_reconstruction = batch
+            .reconstructor_modified_julian_days(&time)
+            .expect("matching filtered reconstruction basis")
+            .reconstruct_many_series_major(
+                &batch_solutions,
+                &[60.0, 61.0],
+                &ReconstructionFilter::All,
+            )
+            .expect("filtered batch reconstruction");
+        for (actual, expected) in batch_reconstruction[0].iter().zip(&eastward) {
+            assert!((actual - expected).abs() < 1e-11);
+        }
+        for (actual, expected) in batch_reconstruction[1].iter().zip(&northward) {
+            assert!((actual - expected).abs() < 1e-11);
+        }
+
+        let uncorrected = GreenwichNodalOls::prepare_modified_julian_days_with_solver_options(
+            &time,
+            60.0,
+            &[TidalConstituent::M2],
+            SolverOptions::new(FitOptions { trend: false }, PhaseReference::Raw)
+                .with_nodal_corrections(NodalCorrections::Disabled),
+        )
+        .expect("valid uncorrected model")
+        .solve(&eastward)
+        .expect("uncorrected fit");
+        assert!((uncorrected.cosine_coefficient[0] - gain * eastward_cosine).abs() < 1e-12);
+        assert!((uncorrected.sine_coefficient[0] - gain * eastward_sine).abs() < 1e-12);
+    }
+
+    #[test]
+    fn exact_inference_applies_each_constituents_prefilter_gain() {
+        let time = times();
+        let correction = PreFilterCorrection::new(vec![0.0, 0.2], vec![1.0, 0.2], 0.01, 2.0)
+            .expect("valid response");
+        let amplitude_ratio = 0.3;
+        let phase_offset_degrees: f64 = 20.0;
+        let k2 = TidalConstituent::from_name("K2").expect("K2 in catalog");
+        let relationship = ScalarInferenceRelation::new(
+            k2,
+            TidalConstituent::S2,
+            amplitude_ratio,
+            phase_offset_degrees,
+        );
+        let model = ScalarInferenceOls::prepare_modified_julian_days_with_solver_options(
+            &time,
+            60.0,
+            &[TidalConstituent::S2, k2],
+            &[relationship],
+            InferenceMode::Exact,
+            SolverOptions::new(FitOptions { trend: false }, PhaseReference::Raw)
+                .with_nodal_corrections(NodalCorrections::Disabled)
+                .with_prefilter_correction(correction.clone()),
+        )
+        .expect("valid filtered inference model");
+        assert_eq!(model.prefilter_correction(), Some(&correction));
+        assert_eq!(model.tidal_constituents(), &[TidalConstituent::S2, k2]);
+        let gains = correction
+            .resolve_constituent_gains(model.constituents())
+            .expect("covered constituent gains");
+        assert!((gains[0] - gains[1]).abs() > 1e-5);
+        let reference = model.reference_time_modified_julian_day();
+        let ratio_real = amplitude_ratio * phase_offset_degrees.to_radians().cos();
+        let ratio_imaginary = amplitude_ratio * phase_offset_degrees.to_radians().sin();
+        let reference_cosine = 0.9;
+        let reference_sine = -0.25;
+        let mean = 0.15;
+        let observations = time
+            .iter()
+            .copied()
+            .map(|time| {
+                let reference_angle =
+                    TAU * model.constituents()[0].frequency_cph * 24.0 * (time - reference);
+                let inferred_angle =
+                    TAU * model.constituents()[1].frequency_cph * 24.0 * (time - reference);
+                let reference_basis = (
+                    gains[0] * reference_angle.cos(),
+                    gains[0] * reference_angle.sin(),
+                );
+                let inferred_basis = (
+                    gains[1] * inferred_angle.cos(),
+                    gains[1] * inferred_angle.sin(),
+                );
+                let cosine_column = reference_basis.0 + ratio_real * inferred_basis.0
+                    - ratio_imaginary * inferred_basis.1;
+                let sine_column = reference_basis.1
+                    + ratio_imaginary * inferred_basis.0
+                    + ratio_real * inferred_basis.1;
+                mean + reference_cosine * cosine_column + reference_sine * sine_column
+            })
+            .collect::<Vec<_>>();
+        let solution = model.solve(&observations).expect("filtered inference fit");
+        let expected_inferred_cosine =
+            ratio_real * reference_cosine + ratio_imaginary * reference_sine;
+        let expected_inferred_sine =
+            -ratio_imaginary * reference_cosine + ratio_real * reference_sine;
+        for (actual, expected) in [
+            (solution.cosine_coefficient[0], reference_cosine),
+            (solution.sine_coefficient[0], reference_sine),
+            (solution.cosine_coefficient[1], expected_inferred_cosine),
+            (solution.sine_coefficient[1], expected_inferred_sine),
+            (solution.mean, mean),
+        ] {
+            assert!((actual - expected).abs() < 1e-11);
+        }
+        let reconstructed = model
+            .reconstruct_modified_julian_days(&time, &solution, &ReconstructionFilter::All)
+            .expect("filtered inferred reconstruction");
+        for (actual, expected) in reconstructed.iter().zip(&observations) {
+            assert!((actual - expected).abs() < 1e-11);
         }
     }
 
@@ -7658,7 +8023,7 @@ mod tests {
                 let batch = GreenwichNodalBatch::prepare_modified_julian_days_with_solver_options(
                     &time,
                     &constituents,
-                    solver_options,
+                    solver_options.clone(),
                 )
                 .expect("valid irregular batch");
                 let actual = batch

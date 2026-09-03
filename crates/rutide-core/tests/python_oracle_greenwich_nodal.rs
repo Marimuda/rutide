@@ -588,7 +588,7 @@ fn matches_python_utide_linear_time_and_raw_phase_references() {
             &time,
             LATITUDE_DEGREES_NORTH,
             &CONSTITUENTS,
-            solver_options,
+            solver_options.clone(),
         )
         .expect("valid alternative-phase model");
         assert_eq!(model.phase_reference(), phase_reference);
@@ -652,7 +652,7 @@ fn matches_python_utide_linear_time_and_raw_phase_references() {
         let batch = GreenwichNodalBatch::prepare_modified_julian_days_with_solver_options(
             &time,
             &CONSTITUENTS,
-            solver_options,
+            solver_options.clone(),
         )
         .expect("valid alternative-phase batch");
         assert_eq!(batch.phase_reference(), phase_reference);
@@ -783,7 +783,7 @@ fn matches_python_utide_linearized_and_disabled_nodal_corrections() {
             &time,
             LATITUDE_DEGREES_NORTH,
             &CONSTITUENTS,
-            solver_options,
+            solver_options.clone(),
         )
         .expect("valid alternative-nodal model");
         assert_eq!(model.nodal_corrections(), mode);
@@ -831,7 +831,7 @@ fn matches_python_utide_linearized_and_disabled_nodal_corrections() {
         let batch = GreenwichNodalBatch::prepare_modified_julian_days_with_solver_options(
             &time,
             &CONSTITUENTS,
-            solver_options,
+            solver_options.clone(),
         )
         .expect("valid alternative-nodal batch");
         assert_eq!(batch.nodal_corrections(), mode);
@@ -872,7 +872,7 @@ fn matches_python_utide_linearized_and_disabled_nodal_corrections() {
                 &RECONSTRUCTION_TIMES,
                 model.reference_time_modified_julian_day(),
                 &CONSTITUENTS,
-                solver_options,
+                solver_options.clone(),
             )
             .expect("valid standalone alternative-nodal basis");
         assert_eq!(standalone.nodal_corrections(), mode);

@@ -21,6 +21,55 @@ pub enum AnalysisError {
     },
     /// A reconstruction fit-reference epoch is NaN or infinite.
     NonFiniteReferenceTime,
+    /// Pre-filter frequency and gain arrays have different lengths.
+    PreFilterShape {
+        /// Number of response frequencies.
+        frequencies: usize,
+        /// Number of response gains.
+        gains: usize,
+    },
+    /// A pre-filter response requires at least two interpolation samples.
+    InsufficientPreFilterSamples {
+        /// Number of supplied response samples.
+        actual: usize,
+    },
+    /// A pre-filter response frequency is negative, NaN, or infinite.
+    InvalidPreFilterFrequency {
+        /// Position of the invalid frequency.
+        index: usize,
+    },
+    /// Pre-filter response frequencies are not strictly increasing.
+    NonIncreasingPreFilterFrequency {
+        /// Position of the latter frequency in the invalid pair.
+        index: usize,
+    },
+    /// A pre-filter response gain is NaN or infinite.
+    InvalidPreFilterGain {
+        /// Position of the invalid gain.
+        index: usize,
+    },
+    /// Pre-filter acceptable gain bounds are invalid.
+    InvalidPreFilterGainRange,
+    /// A constituent frequency lies outside the supplied filter response grid.
+    PreFilterFrequencyOutOfRange {
+        /// Constituent frequency in cycles per hour.
+        frequency_cph: f64,
+        /// Lowest response frequency in cycles per hour.
+        minimum_cph: f64,
+        /// Highest response frequency in cycles per hour.
+        maximum_cph: f64,
+    },
+    /// An interpolated filter gain has an unacceptable magnitude.
+    PreFilterGainOutOfRange {
+        /// Constituent position in the prepared model.
+        constituent: usize,
+        /// Interpolated signed gain.
+        gain: f64,
+        /// Inclusive minimum acceptable magnitude.
+        minimum: f64,
+        /// Inclusive maximum acceptable magnitude.
+        maximum: f64,
+    },
     /// A requested prepared reconstruction timestamp does not exist.
     ReconstructionTimeIndexOutOfBounds {
         /// Requested target-time position.
@@ -239,6 +288,45 @@ impl fmt::Display for AnalysisError {
             Self::NonFiniteReferenceTime => {
                 formatter.write_str("reconstruction reference time must be finite")
             }
+            Self::PreFilterShape { frequencies, gains } => write!(
+                formatter,
+                "pre-filter response contains {frequencies} frequencies and {gains} gains"
+            ),
+            Self::InsufficientPreFilterSamples { actual } => write!(
+                formatter,
+                "pre-filter response requires at least two samples, received {actual}"
+            ),
+            Self::InvalidPreFilterFrequency { index } => write!(
+                formatter,
+                "pre-filter frequency at index {index} must be finite and non-negative"
+            ),
+            Self::NonIncreasingPreFilterFrequency { index } => write!(
+                formatter,
+                "pre-filter frequencies must be strictly increasing; violation at index {index}"
+            ),
+            Self::InvalidPreFilterGain { index } => {
+                write!(formatter, "pre-filter gain at index {index} must be finite")
+            }
+            Self::InvalidPreFilterGainRange => formatter.write_str(
+                "pre-filter acceptable gain bounds must be finite, positive, and ordered",
+            ),
+            Self::PreFilterFrequencyOutOfRange {
+                frequency_cph,
+                minimum_cph,
+                maximum_cph,
+            } => write!(
+                formatter,
+                "constituent frequency {frequency_cph} cph is outside the pre-filter response range {minimum_cph}..={maximum_cph} cph"
+            ),
+            Self::PreFilterGainOutOfRange {
+                constituent,
+                gain,
+                minimum,
+                maximum,
+            } => write!(
+                formatter,
+                "pre-filter gain {gain} for constituent {constituent} is outside the acceptable magnitude range {minimum}..={maximum}"
+            ),
             Self::ReconstructionTimeIndexOutOfBounds { index, time_count } => write!(
                 formatter,
                 "reconstruction time index {index} is outside the {time_count} prepared timestamps"

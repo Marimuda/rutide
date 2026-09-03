@@ -336,7 +336,7 @@ fn solver_option_cross_product_supports_standard_and_inferred_scalar_and_vector_
                     &time,
                     LATITUDE,
                     &requested(),
-                    options,
+                    options.clone(),
                 )
                 .expect("supported standard solver-option product");
                 let scalar = standard
@@ -356,7 +356,7 @@ fn solver_option_cross_product_supports_standard_and_inferred_scalar_and_vector_
                             &requested(),
                             &RELATIONSHIPS,
                             mode,
-                            options,
+                            options.clone(),
                         )
                         .expect("supported inferred scalar solver-option product");
                     let scalar = scalar_model
@@ -369,7 +369,7 @@ fn solver_option_cross_product_supports_standard_and_inferred_scalar_and_vector_
                             &requested(),
                             &VECTOR_RELATIONSHIPS,
                             mode,
-                            options,
+                            options.clone(),
                         )
                         .expect("supported inferred vector solver-option product");
                     let vector = vector_model
@@ -938,7 +938,7 @@ fn matches_python_utide_raw_phase_inference() {
             &requested(),
             &RELATIONSHIPS,
             mode,
-            solver_options,
+            solver_options.clone(),
         )
         .expect("valid raw-phase scalar inference model");
         assert_eq!(scalar_model.phase_reference(), PhaseReference::Raw);
@@ -971,7 +971,7 @@ fn matches_python_utide_raw_phase_inference() {
             &requested(),
             &VECTOR_RELATIONSHIPS,
             mode,
-            solver_options,
+            solver_options.clone(),
         )
         .expect("valid raw-phase vector inference model");
         assert_eq!(vector_model.phase_reference(), PhaseReference::Raw);

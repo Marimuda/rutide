@@ -10,6 +10,7 @@ mod corrected;
 mod diagnostics;
 mod error;
 mod monte_carlo;
+mod prefilter;
 mod robust;
 mod sampling;
 mod scalar;
@@ -35,6 +36,7 @@ pub use diagnostics::{
 };
 pub use error::AnalysisError;
 pub use monte_carlo::MonteCarloOptions;
+pub use prefilter::{PreFilterCorrection, PreFilterFallback};
 pub use robust::{RobustDiagnostics, RobustOptions, RobustTermination, RobustWeightFunction};
 pub use sampling::{
     COLORED_NOISE_FREQUENCY_BANDS_CPH, ResidualSpectrumMethod, SamplingDiagnostics,
