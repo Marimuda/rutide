@@ -1,10 +1,11 @@
 # RUTide roadmap
 
-This roadmap tracks the remaining work required to move from the validated,
-broadly Python-UTide-compatible analysis engine toward a domain-ready FVCOM and
-ADCP product. It is deliberately ordered by scientific dependency: each
-compatible increment must pass a pinned-Python oracle gate, while extensions
-require independent equation or synthetic validation.
+This roadmap records how the validated, broadly Python-UTide-compatible engine
+became the domain-ready temporal FVCOM and ADCP analysis product released in
+0.3.0, and separates later product layers from that completed scope. It is
+ordered by scientific dependency: each compatibility increment passes a
+pinned-Python oracle gate, while extensions require independent equation or
+synthetic validation.
 
 Status values are **complete**, **next**, and **planned**. A feature is complete
 only when its scalar and vector scope is stated explicitly, invalid inputs have
@@ -274,7 +275,7 @@ reported because the Python implementation rejects the combination.
 
 The supported-by-default Cartesian composition rule, all public axis values,
 explicit rejection constraints, parity exceptions, and evidence are frozen in
-`compatibility/solver-option-matrix-v1.json`. The fundamental scalar/vector,
+`crates/rutide-cli/compatibility/solver-option-matrix-v1.json`. The fundamental scalar/vector,
 ordinary/inferred, trend, phase, and nodal cross-product is executed directly.
 A dense pinned-Python scalar seam combines approximate inference, Welsch IRLS,
 no trend, linear-time phase, disabled nodal corrections, irregular missing
@@ -361,7 +362,7 @@ reconstruction—reduced the ten-layer, 1,448,600-series OLS peak from 2.35 GiB 
 - Covered scalar/vector, ordinary/inferred, OLS/robust, regular/irregular, missing,
   batch, Python, and FVCOM paths without slowing analysis profiles that do not
   request the extended suite.
-- Versioned the completed source surface as unreleased RUTide 0.3.0 with
+- Versioned the completed source surface as RUTide 0.3.0 with
   scalar/vector NetCDF schemas 18/17 and backward-readable Python coefficient
   snapshot schema 2.
 

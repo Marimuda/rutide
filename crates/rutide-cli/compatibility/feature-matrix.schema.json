@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://rutide.invalid/schemas/feature-matrix-v1.json",
+  "$id": "https://raw.githubusercontent.com/Marimuda/rutide/main/crates/rutide-cli/compatibility/feature-matrix.schema.json",
   "title": "RUTide compatibility feature matrix",
   "type": "object",
   "additionalProperties": false,

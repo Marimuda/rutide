@@ -45,18 +45,18 @@ pub const SCALAR_OUTPUT_SCHEMA_VERSION: u32 = 18;
 /// Schema version of the embedded machine-readable compatibility matrix.
 pub const FEATURE_MATRIX_SCHEMA_VERSION: u32 = 1;
 /// Machine-readable feature and Python-oracle compatibility status.
-pub const FEATURE_MATRIX_JSON: &str = include_str!("../../../compatibility/feature-matrix-v1.json");
+pub const FEATURE_MATRIX_JSON: &str = include_str!("../compatibility/feature-matrix-v1.json");
 /// JSON Schema describing [`FEATURE_MATRIX_JSON`].
 pub const FEATURE_MATRIX_SCHEMA_JSON: &str =
-    include_str!("../../../compatibility/feature-matrix.schema.json");
+    include_str!("../compatibility/feature-matrix.schema.json");
 /// Schema version of the embedded solver-option compatibility matrix.
 pub const SOLVER_OPTION_MATRIX_SCHEMA_VERSION: u32 = 1;
 /// Machine-readable solver-option composition, rejection, and evidence contract.
 pub const SOLVER_OPTION_MATRIX_JSON: &str =
-    include_str!("../../../compatibility/solver-option-matrix-v1.json");
+    include_str!("../compatibility/solver-option-matrix-v1.json");
 /// JSON Schema describing [`SOLVER_OPTION_MATRIX_JSON`].
 pub const SOLVER_OPTION_MATRIX_SCHEMA_JSON: &str =
-    include_str!("../../../compatibility/solver-option-matrix.schema.json");
+    include_str!("../compatibility/solver-option-matrix.schema.json");
 const DEFAULT_OBSERVATION_CHUNK_BYTES: usize = 512 * 1024 * 1024;
 /// Backward-compatible benchmark constituent set used when none is specified.
 pub const DEFAULT_CONSTITUENTS: [TidalConstituent; 5] = [

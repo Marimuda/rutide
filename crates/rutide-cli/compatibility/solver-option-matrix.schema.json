@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://rutide.invalid/schemas/solver-option-matrix-v1.json",
+  "$id": "https://raw.githubusercontent.com/Marimuda/rutide/main/crates/rutide-cli/compatibility/solver-option-matrix.schema.json",
   "title": "RUTide solver-option compatibility matrix",
   "type": "object",
   "additionalProperties": false,

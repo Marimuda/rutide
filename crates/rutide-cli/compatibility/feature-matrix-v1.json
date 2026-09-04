@@ -2,7 +2,7 @@
   "$schema": "./feature-matrix.schema.json",
   "matrix_schema_version": 1,
   "project_version": "0.3.0",
-  "last_reviewed": "2026-09-03",
+  "last_reviewed": "2026-09-04",
   "python_oracle": {
     "implementation": "UTide",
     "revision": "8fabe121752bc317931472a10a42e306715106de"
@@ -231,7 +231,7 @@
       "scopes": ["core", "fvcom-scalar", "fvcom-vector", "output"],
       "parity": "python-oracle",
       "evidence": [
-        "compatibility/solver-option-matrix-v1.json",
+        "crates/rutide-cli/compatibility/solver-option-matrix-v1.json",
         "crates/rutide-core/tests/python_oracle_inference.rs",
         "crates/rutide-cli/src/lib.rs",
         "crates/rutide-cli/src/vector.rs"

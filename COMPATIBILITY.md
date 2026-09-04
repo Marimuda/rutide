@@ -1,9 +1,9 @@
 # Compatibility and stability contracts
 
-The current source tree is the unreleased RUTide `0.3.0` line. The numerical and
+The current source tree is the RUTide `0.3.0` release line. The numerical and
 file-format contracts are explicitly versioned, but the Rust crates remain
 pre-1.0 and are not published to crates.io yet. This document defines what
-downstream users can rely on while the remaining product work is completed.
+downstream users can rely on in the 0.3 release line.
 
 ## Rust API
 
@@ -77,9 +77,9 @@ matrix means a pinned comparison exists and passes its documented tolerance.
 Python UTide has no complete executable path for direct end-to-end parity.
 
 The machine-readable status is
-[`compatibility/feature-matrix-v1.json`](compatibility/feature-matrix-v1.json),
+[`crates/rutide-cli/compatibility/feature-matrix-v1.json`](crates/rutide-cli/compatibility/feature-matrix-v1.json),
 validated against
-[`compatibility/feature-matrix.schema.json`](compatibility/feature-matrix.schema.json)
+[`crates/rutide-cli/compatibility/feature-matrix.schema.json`](crates/rutide-cli/compatibility/feature-matrix.schema.json)
 and checked against compiled constants in the Rust test suite.
 
 Rows marked `planned` are intentionally outside the current supported contract.
@@ -120,10 +120,10 @@ confidence with white or colored noise; every presentation order; and every
 reconstruction filter.
 
 The versioned
-[`compatibility/solver-option-matrix-v1.json`](compatibility/solver-option-matrix-v1.json)
+[`crates/rutide-cli/compatibility/solver-option-matrix-v1.json`](crates/rutide-cli/compatibility/solver-option-matrix-v1.json)
 is the normative list of axis values, explicit rejection constraints, Python
 parity exceptions, and retained evidence. Its schema is
-[`compatibility/solver-option-matrix.schema.json`](compatibility/solver-option-matrix.schema.json).
+[`crates/rutide-cli/compatibility/solver-option-matrix.schema.json`](crates/rutide-cli/compatibility/solver-option-matrix.schema.json).
 The matrix uses a supported-by-default composition rule: combinations are not
 silently omitted, and invalid combinations such as SNR without confidence are
 named and rejected during validation.

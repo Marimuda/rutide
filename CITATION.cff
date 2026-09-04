@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use RUTide in scientific work, please cite this software and the exact release version."
+title: "RUTide: high-performance tidal harmonic analysis"
+type: software
+authors:
+  - family-names: "Svodstein"
+    given-names: "Jakup"
+    email: "jakupsv@setur.fo"
+repository-code: "https://github.com/Marimuda/rutide"
+url: "https://github.com/Marimuda/rutide"
+license: MIT
+version: 0.3.0
+date-released: 2026-09-04

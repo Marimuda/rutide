@@ -1,7 +1,7 @@
 {
   "$schema": "./solver-option-matrix.schema.json",
   "matrix_schema_version": 1,
-  "last_reviewed": "2026-09-03",
+  "last_reviewed": "2026-09-04",
   "python_oracle_revision": "8fabe121752bc317931472a10a42e306715106de",
   "composition": {
     "default_status": "supported",

@@ -7,10 +7,16 @@ published API and file-schema contracts.
 
 ## Unreleased
 
-## 0.3.0 - 2026-09-03
+## 0.3.0 - 2026-09-04
 
 ### Added
 
+- Production-oriented onboarding with copyable Python and FVCOM examples, a
+  dedicated FVCOM application guide, absolute PyPI-safe documentation links,
+  explicit product boundaries, a scientific-use checklist, and citation
+  metadata.
+- Self-contained Cargo packaging for the CLI's embedded compatibility contracts,
+  with resolvable public JSON Schema identifiers.
 - Typed real pre-filter transfer-function correction across Rust scalar/vector
   solvers, ordinary/inferred models, reconstruction, batches, Python persistence,
   and both FVCOM commands. Strict response validation is the default; an

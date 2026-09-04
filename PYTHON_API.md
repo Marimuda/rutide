@@ -10,13 +10,21 @@ UTide field names where they are useful, adds descriptive aliases, rejects
 unknown or inconsistent options, and documents the few deliberate differences
 below.
 
-## Install and develop
+## Install
 
-Published releases will install with:
+Install the current release from PyPI:
 
 ```console
 python -m pip install rutide
 ```
+
+Confirm which native package is active before a reproducible analysis:
+
+```console
+python -c "import rutide; print(rutide.__version__)"
+```
+
+## Develop from source
 
 For a source checkout, `uv` creates an isolated environment and invokes maturin:
 
