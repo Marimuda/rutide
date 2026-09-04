@@ -50,6 +50,10 @@ TestPyPI, install that exact version from TestPyPI in a clean environment, then
 rerun the same tagged workflow with the PyPI target after approval. The default
 `none` target only builds and verifies artifacts.
 
+Release 0.3.0 is published without signed commits, signed tags, package
+attestations, or cosign artifacts. Changing that policy requires an explicit
+maintainer decision and a documented verification procedure.
+
 Python wheels target Linux x86-64/AArch64, macOS x86-64/Apple Silicon, and Windows
 x86-64 with the CPython 3.9 stable ABI. Adding another target requires a tested
 wheel job; it must not be inferred from a source distribution alone.
